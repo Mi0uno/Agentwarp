@@ -475,7 +475,10 @@ use crate::workspace::tab_settings::TabCloseButtonPosition;
 use crate::workspace::toast_stack::{
     ToastStack, ToastStack as WorkspaceToastStack, ToastStackEvent as WorkspaceToastStackEvent,
 };
-use crate::workspace::view::agent_sessions::{AgentSessionsModel, AgentSessionsView};
+use crate::workspace::view::agent_sessions::{
+    AgentSessionRecord, AgentSessionsModel, AgentSessionsView, HOSTED_TRANSCRIPT_END_MARKER,
+    HOSTED_TRANSCRIPT_HEADER_PREFIX,
+};
 use crate::workspace::view::build_plan_migration_modal::{
     BuildPlanMigrationModal, BuildPlanMigrationModalEvent,
 };
@@ -1116,6 +1119,112 @@ pub struct Workspace {
     /// orchestration cards' "New API key…" flow. Cloud mode renders the
     /// FTUX view inline and does not use this.
     create_auth_secret_modal: Option<ViewHandle<Modal<AuthSecretFtuxView>>>,
+}
+
+fn agent_session_launch_command(record: &AgentSessionRecord, base_command: &str) -> String {
+    let Some(transcript) = record.hosted_transcript_for_restore() else {
+        return base_command.to_owned();
+    };
+
+    format!(
+        "printf %s {}; {}",
+        shell_words::quote(&transcript),
+        base_command
+    )
+}
+
+fn hosted_transcript_from_terminal_view(terminal_view: &TerminalView) -> Option<String> {
+    let model = terminal_view.model.lock();
+    let mut transcript = String::new();
+
+    for block in model.block_list().blocks() {
+        let (command, output) = block.command_and_output_with_secret_obfuscated(false);
+        let command = command.trim();
+        let output = strip_hosted_transcript_echo(&output);
+        let output = output.trim();
+
+        if !command.is_empty() && !command.contains(HOSTED_TRANSCRIPT_HEADER_PREFIX) {
+            transcript.push_str("$ ");
+            transcript.push_str(command);
+            transcript.push_str("\n\n");
+        }
+        if !output.is_empty() {
+            transcript.push_str(output);
+            transcript.push_str("\n\n");
+        }
+    }
+
+    let transcript = transcript.trim();
+    if transcript.is_empty() {
+        None
+    } else {
+        Some(transcript.to_owned())
+    }
+}
+
+fn strip_hosted_transcript_echo(output: &str) -> String {
+    let Some((_, after_marker)) = output.split_once(HOSTED_TRANSCRIPT_END_MARKER) else {
+        return output.to_owned();
+    };
+
+    after_marker.trim_start().to_owned()
+}
+
+#[cfg(test)]
+mod agent_session_hosted_transcript_tests {
+    use super::*;
+
+    fn record_with_hosted_transcript(transcript: Option<&str>) -> AgentSessionRecord {
+        AgentSessionRecord {
+            id: "record-1".to_owned(),
+            project_path: PathBuf::from("/tmp/project"),
+            agent: CLIAgent::Codex,
+            title: "Fix parser".to_owned(),
+            status: crate::workspace::view::agent_sessions::AgentSessionStatus::Success,
+            agent_session_id: Some("agent-session".to_owned()),
+            updated_at_ms: 10,
+            is_pinned: false,
+            archived_at_ms: None,
+            title_overridden: false,
+            hosted_transcript: transcript.map(str::to_owned),
+            hosted_transcript_updated_at_ms: transcript.map(|_| 11),
+            terminal_view_id: None,
+        }
+    }
+
+    #[test]
+    fn agent_session_launch_command_prints_hosted_transcript_before_agent() {
+        let record = record_with_hosted_transcript(Some("User:\nhello"));
+
+        let command = agent_session_launch_command(&record, "codex resume agent-session");
+
+        assert!(command.starts_with("printf %s "));
+        assert!(command.contains("codex resume agent-session"));
+        assert!(command.contains("Agentwarp saved chat history"));
+    }
+
+    #[test]
+    fn agent_session_launch_command_uses_base_command_without_hosted_transcript() {
+        let record = record_with_hosted_transcript(None);
+
+        assert_eq!(
+            agent_session_launch_command(&record, "codex resume agent-session"),
+            "codex resume agent-session"
+        );
+    }
+
+    #[test]
+    fn strip_hosted_transcript_echo_keeps_output_after_saved_history_marker() {
+        let output = format!(
+            "{} (Codex) ---\nUser:\nhello\n{}\nCodex resumed",
+            HOSTED_TRANSCRIPT_HEADER_PREFIX, HOSTED_TRANSCRIPT_END_MARKER
+        );
+
+        assert_eq!(
+            strip_hosted_transcript_echo(&output),
+            "Codex resumed".to_owned()
+        );
+    }
 }
 
 impl Workspace {
@@ -3533,6 +3642,13 @@ impl Workspace {
         event: &CLIAgentSessionsModelEvent,
         ctx: &mut ViewContext<Self>,
     ) {
+        if let CLIAgentSessionsModelEvent::Ended {
+            terminal_view_id, ..
+        } = event
+        {
+            self.capture_agent_session_transcript(*terminal_view_id, ctx);
+        }
+
         if matches!(
             event,
             CLIAgentSessionsModelEvent::Started { .. }
@@ -3543,6 +3659,29 @@ impl Workspace {
         {
             ctx.notify();
         }
+    }
+
+    fn capture_agent_session_transcript(
+        &self,
+        terminal_view_id: EntityId,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let Some(terminal_view) =
+            ctx.view_with_id::<TerminalView>(ctx.window_id(), terminal_view_id)
+        else {
+            return;
+        };
+
+        let transcript = terminal_view.read(ctx, |terminal_view, _| {
+            hosted_transcript_from_terminal_view(terminal_view)
+        });
+        let Some(transcript) = transcript else {
+            return;
+        };
+
+        AgentSessionsModel::handle(ctx).update(ctx, |model, ctx| {
+            model.update_hosted_transcript_for_terminal(terminal_view_id, transcript, ctx);
+        });
     }
 
     /// Handle session settings changes.
@@ -12387,15 +12526,17 @@ impl Workspace {
             }
         }
 
-        let launch_command = record
+        let base_command = record
             .agent_session_id
             .as_deref()
-            .and_then(|session_id| record.agent.resume_command(session_id));
+            .and_then(|session_id| record.agent.resume_command(session_id))
+            .unwrap_or_else(|| record.agent.command_prefix().to_owned());
+        let launch_command = agent_session_launch_command(&record, &base_command);
         self.start_agent_session(
             record.project_path,
             record.agent,
             Some(record.id),
-            launch_command,
+            Some(launch_command),
             ctx,
         );
     }

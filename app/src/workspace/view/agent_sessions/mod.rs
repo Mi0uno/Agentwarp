@@ -41,6 +41,9 @@ use crate::workspace::WorkspaceAction;
 const AGENT_SESSION_RECORDS_PREF_KEY: &str = "agent_sessions.records.v1";
 const MAX_AGENT_SESSION_RECORDS: usize = 200;
 const MAX_TITLE_CHARS: usize = 96;
+const MAX_HOSTED_TRANSCRIPT_CHARS: usize = 60_000;
+pub(crate) const HOSTED_TRANSCRIPT_HEADER_PREFIX: &str = "--- Agentwarp saved chat history";
+pub(crate) const HOSTED_TRANSCRIPT_END_MARKER: &str = "--- End saved chat history ---";
 const AGENT_BUTTON_SIZE: f32 = 26.;
 const SESSION_ACTION_BUTTON_SIZE: f32 = 20.;
 const ICON_BUTTON_SIZE: f32 = 22.;
@@ -92,6 +95,10 @@ pub struct AgentSessionRecord {
     pub archived_at_ms: Option<i64>,
     #[serde(default)]
     pub title_overridden: bool,
+    #[serde(default)]
+    pub hosted_transcript: Option<String>,
+    #[serde(default)]
+    pub hosted_transcript_updated_at_ms: Option<i64>,
     #[serde(skip, default)]
     pub terminal_view_id: Option<EntityId>,
 }
@@ -99,6 +106,22 @@ pub struct AgentSessionRecord {
 impl AgentSessionRecord {
     fn is_archived(&self) -> bool {
         self.archived_at_ms.is_some()
+    }
+
+    pub fn hosted_transcript_for_restore(&self) -> Option<String> {
+        self.hosted_transcript
+            .as_deref()
+            .map(str::trim)
+            .filter(|transcript| !transcript.is_empty())
+            .map(|transcript| {
+                format!(
+                    "\n{} ({}) ---\n{}\n{}\n\n",
+                    HOSTED_TRANSCRIPT_HEADER_PREFIX,
+                    self.agent.display_name(),
+                    transcript.trim_end(),
+                    HOSTED_TRANSCRIPT_END_MARKER
+                )
+            })
     }
 }
 
@@ -158,6 +181,8 @@ impl AgentSessionsModel {
                 is_pinned: false,
                 archived_at_ms: None,
                 title_overridden: false,
+                hosted_transcript: None,
+                hosted_transcript_updated_at_ms: None,
                 terminal_view_id: None,
             },
         );
@@ -230,6 +255,31 @@ impl AgentSessionsModel {
         }
     }
 
+    pub fn update_hosted_transcript_for_terminal(
+        &mut self,
+        terminal_view_id: EntityId,
+        transcript: String,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let transcript = normalize_hosted_transcript(transcript);
+        let Some(record) = self
+            .records
+            .iter_mut()
+            .find(|record| record.terminal_view_id == Some(terminal_view_id))
+        else {
+            return;
+        };
+
+        if record.hosted_transcript == transcript {
+            return;
+        }
+
+        record.hosted_transcript = transcript;
+        record.hosted_transcript_updated_at_ms = Some(now_ms());
+        record.updated_at_ms = now_ms();
+        self.persist_and_emit(ctx);
+    }
+
     fn handle_cli_agent_sessions_event(
         &mut self,
         event: &CLIAgentSessionsModelEvent,
@@ -259,6 +309,7 @@ impl AgentSessionsModel {
                 if let Some(session_id) = &session_context.session_id {
                     record.agent_session_id = Some(session_id.clone());
                 }
+                record.capture_session_context(session_context);
             }),
             CLIAgentSessionsModelEvent::SessionUpdated { agent, .. } => {
                 let session = CLIAgentSessionsModel::as_ref(ctx)
@@ -273,9 +324,10 @@ impl AgentSessionsModel {
                                 record.title = truncate_title(title);
                             }
                         }
-                        if let Some(session_id) = session.session_context.session_id {
-                            record.agent_session_id = Some(session_id);
+                        if let Some(session_id) = &session.session_context.session_id {
+                            record.agent_session_id = Some(session_id.clone());
                         }
+                        record.capture_session_context(&session.session_context);
                     }
                 })
             }
@@ -1296,6 +1348,66 @@ fn truncate_title(title: String) -> String {
     }
 }
 
+fn normalize_hosted_transcript(transcript: String) -> Option<String> {
+    let trimmed = transcript.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    Some(tail_truncate_chars(trimmed, MAX_HOSTED_TRANSCRIPT_CHARS))
+}
+
+fn tail_truncate_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_owned();
+    }
+
+    let mut tail = text.chars().rev().take(max_chars).collect::<Vec<_>>();
+    tail.reverse();
+    format!(
+        "[Earlier saved history omitted]\n{}",
+        tail.into_iter().collect::<String>()
+    )
+}
+
+impl AgentSessionRecord {
+    fn capture_session_context(
+        &mut self,
+        session_context: &crate::terminal::cli_agent_sessions::CLIAgentSessionContext,
+    ) {
+        let mut transcript = self.hosted_transcript.clone().unwrap_or_default();
+        let original = transcript.clone();
+
+        if let Some(query) = session_context.query.as_deref() {
+            append_hosted_transcript_section(&mut transcript, "User", query);
+        }
+        if let Some(response) = session_context.response.as_deref() {
+            append_hosted_transcript_section(&mut transcript, "Agent", response);
+        }
+
+        if transcript != original {
+            self.hosted_transcript = normalize_hosted_transcript(transcript);
+            self.hosted_transcript_updated_at_ms = Some(now_ms());
+        }
+    }
+}
+
+fn append_hosted_transcript_section(transcript: &mut String, label: &str, text: &str) {
+    let text = text.trim();
+    if text.is_empty() {
+        return;
+    }
+
+    let section = format!("{label}:\n{text}\n\n");
+    if transcript.trim_end().ends_with(section.trim_end()) {
+        return;
+    }
+    if !transcript.trim().is_empty() && !transcript.ends_with('\n') {
+        transcript.push('\n');
+    }
+    transcript.push_str(&section);
+}
+
 fn now_ms() -> i64 {
     Utc::now().timestamp_millis()
 }
@@ -1317,11 +1429,14 @@ mod tests {
             is_pinned: true,
             archived_at_ms: Some(11),
             title_overridden: true,
+            hosted_transcript: Some("User:\nhello\n\nAgent:\nhi\n\n".to_owned()),
+            hosted_transcript_updated_at_ms: Some(12),
             terminal_view_id: None,
         };
 
         let serialized = serde_json::to_string(&record).unwrap();
         assert!(!serialized.contains("terminal_view_id"));
+        assert!(serialized.contains("hosted_transcript"));
 
         let restored = serde_json::from_str::<AgentSessionRecord>(&serialized).unwrap();
         assert_eq!(restored.id, "record-1");
@@ -1329,6 +1444,11 @@ mod tests {
         assert_eq!(restored.is_pinned, true);
         assert_eq!(restored.archived_at_ms, Some(11));
         assert_eq!(restored.title_overridden, true);
+        assert_eq!(
+            restored.hosted_transcript.as_deref(),
+            Some("User:\nhello\n\nAgent:\nhi\n\n")
+        );
+        assert_eq!(restored.hosted_transcript_updated_at_ms, Some(12));
         assert_eq!(restored.terminal_view_id, None);
     }
 
@@ -1350,6 +1470,31 @@ mod tests {
         assert!(!restored.is_pinned);
         assert_eq!(restored.archived_at_ms, None);
         assert!(!restored.title_overridden);
+        assert_eq!(restored.hosted_transcript, None);
+        assert_eq!(restored.hosted_transcript_updated_at_ms, None);
+    }
+
+    #[test]
+    fn hosted_transcript_is_trimmed_and_wrapped_for_restore() {
+        let record = AgentSessionRecord {
+            id: "record-1".to_owned(),
+            project_path: PathBuf::from("/tmp/project"),
+            agent: CLIAgent::Claude,
+            title: "Fix parser".to_owned(),
+            status: AgentSessionStatus::Success,
+            agent_session_id: None,
+            updated_at_ms: 10,
+            is_pinned: false,
+            archived_at_ms: None,
+            title_overridden: false,
+            hosted_transcript: normalize_hosted_transcript("  User:\nhello\n\n  ".to_owned()),
+            hosted_transcript_updated_at_ms: Some(12),
+            terminal_view_id: None,
+        };
+
+        let restore_text = record.hosted_transcript_for_restore().unwrap();
+        assert!(restore_text.contains("Agentwarp saved chat history (Claude Code)"));
+        assert!(restore_text.contains("User:\nhello"));
     }
 
     #[test]
@@ -1366,6 +1511,8 @@ mod tests {
                 is_pinned: true,
                 archived_at_ms: None,
                 title_overridden: false,
+                hosted_transcript: None,
+                hosted_transcript_updated_at_ms: None,
                 terminal_view_id: None,
             },
             AgentSessionRecord {
@@ -1379,6 +1526,8 @@ mod tests {
                 is_pinned: false,
                 archived_at_ms: None,
                 title_overridden: false,
+                hosted_transcript: None,
+                hosted_transcript_updated_at_ms: None,
                 terminal_view_id: None,
             },
             AgentSessionRecord {
@@ -1392,6 +1541,8 @@ mod tests {
                 is_pinned: true,
                 archived_at_ms: None,
                 title_overridden: false,
+                hosted_transcript: None,
+                hosted_transcript_updated_at_ms: None,
                 terminal_view_id: None,
             },
         ];
