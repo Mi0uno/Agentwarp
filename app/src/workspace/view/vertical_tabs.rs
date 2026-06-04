@@ -1409,7 +1409,7 @@ fn render_panel_mode_segment(
             segment
         }
     })
-    .on_click(move |ctx, _, _| {
+    .on_mouse_down(move |ctx, _, _| {
         ctx.dispatch_typed_action(WorkspaceAction::SetVerticalTabsPanelMode(mode));
     })
     .with_cursor(Cursor::PointingHand)

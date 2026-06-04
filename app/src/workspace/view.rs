@@ -2886,7 +2886,7 @@ impl Workspace {
         let working_directories_model =
             ctx.add_model(|_| pane_group::WorkingDirectoriesModel::new());
 
-        let agent_sessions_view = ctx.add_view(AgentSessionsView::new);
+        let agent_sessions_view = ctx.add_typed_action_view(AgentSessionsView::new);
 
         let left_panel_views = Self::compute_left_panel_views(ctx);
 
