@@ -1,3 +1,4 @@
+pub(crate) mod agent_sessions;
 mod build_plan_migration_modal;
 pub(crate) mod cloud_agent_capacity_modal;
 pub(crate) mod codex_modal;
@@ -405,7 +406,7 @@ use crate::terminal::view::{
     NOTIFICATIONS_TROUBLESHOOT_URL,
 };
 use crate::terminal::warpify::settings::WarpifySettings;
-use crate::terminal::{self, BlockListSettings, SizeInfo, TerminalModel, TerminalView};
+use crate::terminal::{self, BlockListSettings, CLIAgent, SizeInfo, TerminalModel, TerminalView};
 use crate::themes::theme::{AnsiColorIdentifier, RespectSystemTheme, ThemeKind};
 use crate::themes::theme_chooser::{ThemeChooser, ThemeChooserEvent, ThemeChooserMode};
 use crate::themes::theme_creator_modal::{ThemeCreatorModal, ThemeCreatorModalEvent};
@@ -474,6 +475,7 @@ use crate::workspace::tab_settings::TabCloseButtonPosition;
 use crate::workspace::toast_stack::{
     ToastStack, ToastStack as WorkspaceToastStack, ToastStackEvent as WorkspaceToastStackEvent,
 };
+use crate::workspace::view::agent_sessions::AgentSessionsModel;
 use crate::workspace::view::build_plan_migration_modal::{
     BuildPlanMigrationModal, BuildPlanMigrationModalEvent,
 };
@@ -3972,6 +3974,7 @@ impl Workspace {
             // Restore which panel tab was active
             let active_view = match left_panel_snapshot.left_panel_displayed_tab {
                 LeftPanelDisplayedTab::FileTree => ToolPanelView::ProjectExplorer,
+                LeftPanelDisplayedTab::AgentSessions => ToolPanelView::AgentSessions,
                 LeftPanelDisplayedTab::GlobalSearch => ToolPanelView::GlobalSearch {
                     entry_focus: GlobalSearchEntryFocus::Results,
                 },
@@ -5602,7 +5605,7 @@ impl Workspace {
         &self,
         terminal_view_id: EntityId,
         ctx: &mut ViewContext<Self>,
-    ) {
+    ) -> bool {
         let current_window = ctx.window_id();
         let result = WorkspaceRegistry::as_ref(ctx)
             .all_workspaces(ctx)
@@ -5633,6 +5636,9 @@ impl Workspace {
                     &locator,
                 );
             }
+            true
+        } else {
+            false
         }
     }
 
@@ -12274,6 +12280,102 @@ impl Workspace {
         });
     }
 
+    fn open_agent_session_project_picker(&mut self, ctx: &mut ViewContext<Self>) {
+        ctx.open_file_picker(
+            |result, ctx| match result {
+                Ok(paths) => {
+                    let Some(path) = paths.into_iter().next() else {
+                        return;
+                    };
+
+                    if let Some(handle) = ctx.handle().upgrade(ctx) {
+                        handle.update(ctx, |workspace, ctx| {
+                            workspace.add_agent_session_project(&path, ctx);
+                        });
+                    }
+                }
+                Err(err) => {
+                    let window_id = ctx.window_id();
+                    ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
+                        toast_stack.add_ephemeral_toast(
+                            DismissibleToast::error(format!("{err}")),
+                            window_id,
+                            ctx,
+                        );
+                    });
+                }
+            },
+            FilePickerConfiguration::new().folders_only(),
+        );
+    }
+
+    fn add_agent_session_project(&mut self, path: &str, ctx: &mut ViewContext<Self>) {
+        let path_buf = PathBuf::from(path);
+        ProjectManagementModel::handle(ctx).update(ctx, |projects, ctx| {
+            projects.upsert_project(path_buf, ctx);
+        });
+        self.open_left_panel_view(&LeftPanelAction::AgentSessions, ctx);
+        ctx.notify();
+    }
+
+    fn start_agent_session(
+        &mut self,
+        project_path: PathBuf,
+        agent: CLIAgent,
+        existing_session_id: Option<String>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        ProjectManagementModel::handle(ctx).update(ctx, |projects, ctx| {
+            projects.upsert_project(project_path.clone(), ctx);
+        });
+
+        let session_id = existing_session_id.unwrap_or_else(|| {
+            AgentSessionsModel::handle(ctx).update(ctx, |model, ctx| {
+                model.start_session(project_path.clone(), agent, ctx)
+            })
+        });
+
+        self.add_tab_with_pane_layout(
+            PanesLayout::SingleTerminal(Box::new(NewTerminalOptions {
+                initial_directory: Some(project_path),
+                hide_homepage: true,
+                ..Default::default()
+            })),
+            Arc::new(HashMap::new()),
+            None,
+            ctx,
+        );
+
+        self.active_tab_pane_group().update(ctx, |pane_group, ctx| {
+            if let Some(active_terminal) = pane_group.active_session_view(ctx) {
+                let terminal_view_id = active_terminal.id();
+                AgentSessionsModel::handle(ctx).update(ctx, |model, ctx| {
+                    model.attach_terminal(&session_id, terminal_view_id, ctx);
+                });
+                active_terminal.update(ctx, |terminal, ctx| {
+                    terminal.execute_command_or_set_pending(agent.command_prefix(), ctx);
+                });
+            }
+        });
+        ctx.notify();
+    }
+
+    fn restore_agent_session(&mut self, session_id: &str, ctx: &mut ViewContext<Self>) {
+        let Some(record) = AgentSessionsModel::as_ref(ctx).session(session_id).cloned() else {
+            return;
+        };
+
+        if let Some(terminal_view_id) = record.terminal_view_id {
+            if self.focus_terminal_view_locally(terminal_view_id, ctx)
+                || self.focus_terminal_view_in_other_window(terminal_view_id, ctx)
+            {
+                return;
+            }
+        }
+
+        self.start_agent_session(record.project_path, record.agent, Some(record.id), ctx);
+    }
+
     /// Navigate to an existing AI conversation, focusing on its terminal view, if it's open anywhere.
     /// If the conversation is not in an open pane, restore it based on the provided layout override
     /// or the user's setting.
@@ -18878,6 +18980,7 @@ impl Workspace {
                         .unwrap_or(ToolPanelView::WarpDrive)
                     {
                         ToolPanelView::ProjectExplorer => "Project explorer",
+                        ToolPanelView::AgentSessions => "Agent sessions",
                         ToolPanelView::GlobalSearch { .. } => "Global search",
                         ToolPanelView::WarpDrive => "Warp Drive",
                         ToolPanelView::ConversationListView => "Agent conversations",
@@ -18932,6 +19035,7 @@ impl Workspace {
                 .unwrap_or(ToolPanelView::WarpDrive)
             {
                 ToolPanelView::ProjectExplorer => "Project explorer",
+                ToolPanelView::AgentSessions => "Agent sessions",
                 ToolPanelView::GlobalSearch { .. } => "Global search",
                 ToolPanelView::WarpDrive => "Warp Drive",
                 ToolPanelView::ConversationListView => "Agent conversations",
@@ -22090,6 +22194,9 @@ impl Workspace {
         if cfg!(feature = "local_fs") && *CodeSettings::as_ref(ctx).show_project_explorer.value() {
             views.push(ToolPanelView::ProjectExplorer);
         }
+        if cfg!(feature = "local_fs") {
+            views.push(ToolPanelView::AgentSessions);
+        }
         if FeatureFlag::AgentViewConversationListView.is_enabled()
             && AISettings::as_ref(ctx).is_any_ai_enabled(ctx)
             && *AISettings::as_ref(ctx).show_conversation_history
@@ -23691,6 +23798,18 @@ impl TypedActionView for Workspace {
             }
             OpenRepository { path } => {
                 self.open_repository(path.as_deref(), ctx);
+            }
+            OpenAgentSessionProjectPicker => {
+                self.open_agent_session_project_picker(ctx);
+            }
+            StartAgentSession {
+                project_path,
+                agent,
+            } => {
+                self.start_agent_session(project_path.clone(), *agent, None, ctx);
+            }
+            RestoreAgentSession { session_id } => {
+                self.restore_agent_session(session_id, ctx);
             }
             OpenTabConfigRepoPicker { param_index } => {
                 self.open_repo_picker_for_tab_config_modal(*param_index, ctx);

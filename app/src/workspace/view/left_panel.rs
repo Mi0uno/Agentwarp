@@ -47,6 +47,7 @@ use crate::util::file::external_editor::EditorSettings;
 #[cfg(feature = "local_fs")]
 use crate::util::openable_file_type::resolve_file_target_with_editor_choice;
 use crate::util::openable_file_type::FileTarget;
+use crate::workspace::view::agent_sessions::AgentSessionsView;
 use crate::workspace::view::conversation_list::view::{
     ConversationListView, Event as ConversationListViewEvent,
 };
@@ -65,6 +66,7 @@ use crate::TelemetryEvent;
 #[derive(Default)]
 struct MouseStateHandles {
     project_explorer_button: MouseStateHandle,
+    agent_sessions_button: MouseStateHandle,
     conversation_list_view_button: MouseStateHandle,
     global_search_button: MouseStateHandle,
     warp_drive_button: MouseStateHandle,
@@ -73,6 +75,7 @@ struct MouseStateHandles {
 #[derive(Clone, Debug)]
 pub enum LeftPanelAction {
     ProjectExplorer,
+    AgentSessions,
     GlobalSearch { entry_focus: GlobalSearchEntryFocus },
     WarpDrive,
     ConversationListView,
@@ -100,6 +103,7 @@ pub enum LeftPanelEvent {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolPanelView {
     ProjectExplorer,
+    AgentSessions,
     GlobalSearch { entry_focus: GlobalSearchEntryFocus },
     WarpDrive,
     ConversationListView,
@@ -169,6 +173,7 @@ pub struct LeftPanelView {
     mouse_state_handles: MouseStateHandles,
     close_button_mouse_state: MouseStateHandle,
     warp_drive_view: ViewHandle<DrivePanel>,
+    agent_sessions_view: ViewHandle<AgentSessionsView>,
     conversation_list_view: ViewHandle<ConversationListView>,
     active_view: active_view_state::ActiveViewState,
     toolbelt_buttons: Vec<ToolbeltButtonConfig>,
@@ -213,6 +218,7 @@ impl LeftPanelView {
             }
         };
         let warp_drive_view = ctx.add_typed_action_view(DrivePanel::new);
+        let agent_sessions_view = ctx.add_view(AgentSessionsView::new);
         let conversation_list_view = ctx.add_typed_action_view(ConversationListView::new);
 
         ctx.subscribe_to_view(&warp_drive_view, |_me, _, event, ctx| {
@@ -326,6 +332,7 @@ impl LeftPanelView {
             mouse_state_handles: Default::default(),
             close_button_mouse_state: Default::default(),
             warp_drive_view,
+            agent_sessions_view,
             conversation_list_view,
             active_view: active_view_state::new(active_view),
             toolbelt_buttons,
@@ -406,6 +413,19 @@ impl LeftPanelView {
                     action: LeftPanelAction::ProjectExplorer,
                     render_with_active_state: false,
                     tooltip_keybinding: toolbelt_tooltip_keybinding(&tooltip_keybinding_names, ctx),
+                    tooltip_keybinding_names,
+                }
+            }
+            ToolPanelView::AgentSessions => {
+                let tooltip_keybinding_names = vec![];
+
+                ToolbeltButtonConfig {
+                    icon: Icon::Terminal,
+                    active_icon: None,
+                    tooltip_text: "Agent sessions".to_string(),
+                    action: LeftPanelAction::AgentSessions,
+                    render_with_active_state: false,
+                    tooltip_keybinding: None,
                     tooltip_keybinding_names,
                 }
             }
@@ -691,6 +711,9 @@ impl LeftPanelView {
                     ctx.focus(&file_tree_view);
                 }
             }
+            ToolPanelView::AgentSessions => {
+                ctx.focus(&self.agent_sessions_view);
+            }
             ToolPanelView::GlobalSearch { entry_focus } => {
                 if let Some(global_search_view) = self.active_global_search_view(ctx) {
                     global_search_view.update(ctx, |view, ctx| {
@@ -862,6 +885,9 @@ impl LeftPanelView {
                 LeftPanelAction::ProjectExplorer => {
                     self.active_view.get() == ToolPanelView::ProjectExplorer
                 }
+                LeftPanelAction::AgentSessions => {
+                    self.active_view.get() == ToolPanelView::AgentSessions
+                }
                 LeftPanelAction::GlobalSearch { .. } => {
                     matches!(self.active_view.get(), ToolPanelView::GlobalSearch { .. })
                 }
@@ -969,6 +995,9 @@ impl LeftPanelView {
                         ctx
                     );
                 }
+            }
+            LeftPanelAction::AgentSessions => {
+                active_view_state::set(self, ToolPanelView::AgentSessions, ctx);
             }
             LeftPanelAction::GlobalSearch { entry_focus } => {
                 let was_active = self.active_view.get()
@@ -1102,6 +1131,7 @@ impl View for LeftPanelView {
                         ctx.focus(&view);
                     }
                 }
+                ToolPanelView::AgentSessions => ctx.focus(&self.agent_sessions_view),
                 ToolPanelView::GlobalSearch { .. } => {
                     if let Some(view) = self.active_global_search_view(ctx) {
                         ctx.focus(&view);
@@ -1118,6 +1148,7 @@ impl View for LeftPanelView {
 
         let mouse_state_handles = vec![
             self.mouse_state_handles.project_explorer_button.clone(),
+            self.mouse_state_handles.agent_sessions_button.clone(),
             self.mouse_state_handles
                 .conversation_list_view_button
                 .clone(),
@@ -1158,6 +1189,9 @@ impl View for LeftPanelView {
                 } else {
                     Shrinkable::new(1.0, Container::new(Empty::new().finish()).finish()).finish()
                 }
+            }
+            ToolPanelView::AgentSessions => {
+                Shrinkable::new(1.0, ChildView::new(&self.agent_sessions_view).finish()).finish()
             }
             ToolPanelView::GlobalSearch { .. } => {
                 if let Some(global_search_view) = self.active_global_search_view(app) {

@@ -38,6 +38,7 @@ use crate::tab::{NewSessionMenuItem, SelectedTabColor};
 use crate::tab_configs::TabConfig;
 use crate::terminal::available_shells::AvailableShell;
 use crate::terminal::view::inline_banner::ZeroStatePromptSuggestionType;
+use crate::terminal::CLIAgent;
 use crate::themes::theme::AnsiColorIdentifier;
 use crate::themes::theme_chooser::ThemeChooserMode;
 use crate::workflows::{WorkflowSelectionSource, WorkflowSource, WorkflowType};
@@ -610,6 +611,18 @@ pub enum WorkspaceAction {
     OpenRepository {
         path: Option<String>,
     },
+    /// Open a project folder picker for the Agent Sessions side panel.
+    OpenAgentSessionProjectPicker,
+    /// Start a CLI agent session for a project from the Agent Sessions side panel.
+    StartAgentSession {
+        project_path: PathBuf,
+        agent: CLIAgent,
+    },
+    /// Restore a session from the Agent Sessions side panel, focusing its terminal if it is live
+    /// or reopening the agent in the session's project directory.
+    RestoreAgentSession {
+        session_id: String,
+    },
     /// Open the native folder picker for a repo param in the tab-config modal after the
     /// current interaction cycle finishes.
     OpenTabConfigRepoPicker {
@@ -861,6 +874,8 @@ impl WorkspaceAction {
             | ForkAIConversation { .. }
             | SummarizeAIConversation { .. }
             | OpenRepository { .. }
+            | StartAgentSession { .. }
+            | RestoreAgentSession { .. }
             | SelectTabConfig(_)
             | ToggleVerticalTabsPanel => true, // actions that actually change a state of the state of user's
             // workspace would most likely require a save, so that if the app gets
@@ -920,6 +935,7 @@ impl WorkspaceAction {
             | ToggleFocusReporting
             | ImportToPersonalDrive
             | ImportToTeamDrive
+            | OpenAgentSessionProjectPicker
             | CreatePersonalNotebook
             | CreateTeamNotebook
             | CreatePersonalWorkflow
