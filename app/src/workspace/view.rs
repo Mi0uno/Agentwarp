@@ -12333,6 +12333,7 @@ impl Workspace {
         project_path: PathBuf,
         agent: CLIAgent,
         existing_session_id: Option<String>,
+        launch_command: Option<String>,
         ctx: &mut ViewContext<Self>,
     ) {
         ProjectManagementModel::handle(ctx).update(ctx, |projects, ctx| {
@@ -12363,7 +12364,10 @@ impl Workspace {
                     model.attach_terminal(&session_id, terminal_view_id, ctx);
                 });
                 active_terminal.update(ctx, |terminal, ctx| {
-                    terminal.execute_command_or_set_pending(agent.command_prefix(), ctx);
+                    let launch_command = launch_command
+                        .as_deref()
+                        .unwrap_or_else(|| agent.command_prefix());
+                    terminal.execute_command_or_set_pending(launch_command, ctx);
                 });
             }
         });
@@ -12383,7 +12387,17 @@ impl Workspace {
             }
         }
 
-        self.start_agent_session(record.project_path, record.agent, Some(record.id), ctx);
+        let launch_command = record
+            .agent_session_id
+            .as_deref()
+            .and_then(|session_id| record.agent.resume_command(session_id));
+        self.start_agent_session(
+            record.project_path,
+            record.agent,
+            Some(record.id),
+            launch_command,
+            ctx,
+        );
     }
 
     /// Navigate to an existing AI conversation, focusing on its terminal view, if it's open anywhere.
@@ -23816,7 +23830,7 @@ impl TypedActionView for Workspace {
                 project_path,
                 agent,
             } => {
-                self.start_agent_session(project_path.clone(), *agent, None, ctx);
+                self.start_agent_session(project_path.clone(), *agent, None, None, ctx);
             }
             RestoreAgentSession { session_id } => {
                 self.restore_agent_session(session_id, ctx);

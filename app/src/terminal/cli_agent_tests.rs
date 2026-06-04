@@ -32,6 +32,32 @@ fn aliases(pairs: &[(&str, &str)]) -> HashMap<SmolStr, String> {
         .collect()
 }
 
+#[test]
+fn resume_command_uses_agent_specific_resume_syntax() {
+    assert_eq!(
+        CLIAgent::Claude.resume_command("claude-session"),
+        Some("claude --resume claude-session".to_owned())
+    );
+    assert_eq!(
+        CLIAgent::Codex.resume_command("codex-session"),
+        Some("codex resume codex-session".to_owned())
+    );
+}
+
+#[test]
+fn resume_command_quotes_session_ids() {
+    assert_eq!(
+        CLIAgent::Codex.resume_command("session with space"),
+        Some("codex resume 'session with space'".to_owned())
+    );
+}
+
+#[test]
+fn resume_command_ignores_empty_or_unsupported_agents() {
+    assert_eq!(CLIAgent::Claude.resume_command("   "), None);
+    assert_eq!(CLIAgent::OpenCode.resume_command("session-id"), None);
+}
+
 // ---------------------------------------------------------------------------
 // Helpers for prompt-building tests
 // ---------------------------------------------------------------------------

@@ -168,6 +168,22 @@ impl CLIAgent {
         }
     }
 
+    /// Returns the command used to resume a prior local CLI-agent session when the agent supports
+    /// resuming by session id.
+    pub fn resume_command(&self, session_id: &str) -> Option<String> {
+        let session_id = session_id.trim();
+        if session_id.is_empty() {
+            return None;
+        }
+
+        let session_id = shell_words::quote(session_id);
+        match self {
+            CLIAgent::Claude => Some(format!("{} --resume {session_id}", self.command_prefix())),
+            CLIAgent::Codex => Some(format!("{} resume {session_id}", self.command_prefix())),
+            _ => None,
+        }
+    }
+
     /// Serialized version of the CLIAgent name (e.g. "Claude", "Gemini"). Used for the
     /// session-sharing protocol's opaque `cli_agent` string field.
     pub fn to_serialized_name(&self) -> String {
