@@ -1133,6 +1133,18 @@ fn agent_session_launch_command(record: &AgentSessionRecord, base_command: &str)
     )
 }
 
+fn agent_session_base_command(record: &AgentSessionRecord) -> String {
+    record
+        .agent_session_id
+        .as_deref()
+        .and_then(|session_id| record.agent.resume_command(session_id))
+        .unwrap_or_else(|| record.agent.command_prefix().to_owned())
+}
+
+fn agent_session_restore_command(record: &AgentSessionRecord) -> String {
+    agent_session_launch_command(record, &agent_session_base_command(record))
+}
+
 fn hosted_transcript_from_terminal_view(terminal_view: &TerminalView) -> Option<String> {
     let model = terminal_view.model.lock();
     let mut transcript = String::new();
@@ -12519,19 +12531,26 @@ impl Workspace {
         };
 
         if let Some(terminal_view_id) = record.terminal_view_id {
-            if self.focus_terminal_view_locally(terminal_view_id, ctx)
-                || self.focus_terminal_view_in_other_window(terminal_view_id, ctx)
-            {
+            let is_agent_active = CLIAgentSessionsModel::as_ref(ctx)
+                .session(terminal_view_id)
+                .is_some_and(|session| session.agent == record.agent);
+
+            if is_agent_active {
+                if self.focus_terminal_view_locally(terminal_view_id, ctx)
+                    || self.focus_terminal_view_in_other_window(terminal_view_id, ctx)
+                {
+                    return;
+                }
+            } else if self.restore_agent_session_in_existing_terminal(
+                &record,
+                terminal_view_id,
+                ctx,
+            ) {
                 return;
             }
         }
 
-        let base_command = record
-            .agent_session_id
-            .as_deref()
-            .and_then(|session_id| record.agent.resume_command(session_id))
-            .unwrap_or_else(|| record.agent.command_prefix().to_owned());
-        let launch_command = agent_session_launch_command(&record, &base_command);
+        let launch_command = agent_session_restore_command(&record);
         self.start_agent_session(
             record.project_path,
             record.agent,
@@ -12539,6 +12558,34 @@ impl Workspace {
             Some(launch_command),
             ctx,
         );
+    }
+
+    fn restore_agent_session_in_existing_terminal(
+        &mut self,
+        record: &AgentSessionRecord,
+        terminal_view_id: EntityId,
+        ctx: &mut ViewContext<Self>,
+    ) -> bool {
+        if !self.focus_terminal_view_locally(terminal_view_id, ctx) {
+            return false;
+        }
+
+        self.capture_agent_session_transcript(terminal_view_id, ctx);
+
+        let launch_command = agent_session_restore_command(record);
+        let Some(terminal_view) =
+            ctx.view_with_id::<TerminalView>(ctx.window_id(), terminal_view_id)
+        else {
+            return false;
+        };
+
+        AgentSessionsModel::handle(ctx).update(ctx, |model, ctx| {
+            model.attach_terminal(&record.id, terminal_view_id, ctx);
+        });
+        terminal_view.update(ctx, |terminal, ctx| {
+            terminal.execute_command_or_set_pending(&launch_command, ctx);
+        });
+        true
     }
 
     /// Navigate to an existing AI conversation, focusing on its terminal view, if it's open anywhere.

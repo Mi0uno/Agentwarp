@@ -332,7 +332,12 @@ impl AgentSessionsModel {
                 })
             }
             CLIAgentSessionsModelEvent::InputSessionChanged { .. } => false,
-            CLIAgentSessionsModelEvent::Ended { .. } => false,
+            CLIAgentSessionsModelEvent::Ended { agent, .. } => {
+                self.update_record_for_terminal(terminal_view_id, |record| {
+                    record.agent = *agent;
+                    record.status = AgentSessionStatus::Success;
+                })
+            }
         };
 
         if changed {
