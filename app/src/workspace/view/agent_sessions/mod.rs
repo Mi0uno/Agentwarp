@@ -348,10 +348,7 @@ impl AgentSessionsView {
             )
             .finish();
 
-        let mut project_column = Flex::column()
-            .with_main_axis_size(MainAxisSize::Max)
-            .with_spacing(8.)
-            .with_child(header);
+        let mut project_column = Flex::column().with_spacing(8.).with_child(header);
 
         let agent_row = SUPPORTED_AGENTS
             .into_iter()
@@ -586,21 +583,18 @@ impl View for AgentSessionsView {
         }
 
         let records = AgentSessionsModel::as_ref(app);
-        let mut content = Flex::column()
-            .with_main_axis_size(MainAxisSize::Max)
-            .with_spacing(2.)
-            .with_child(
-                Container::new(
-                    Flex::row()
-                        .with_main_axis_size(MainAxisSize::Max)
-                        .with_main_axis_alignment(MainAxisAlignment::End)
-                        .with_child(self.render_add_project_button(app))
-                        .finish(),
-                )
-                .with_horizontal_padding(12.)
-                .with_vertical_padding(8.)
-                .finish(),
-            );
+        let mut content = Flex::column().with_spacing(2.).with_child(
+            Container::new(
+                Flex::row()
+                    .with_main_axis_size(MainAxisSize::Max)
+                    .with_main_axis_alignment(MainAxisAlignment::End)
+                    .with_child(self.render_add_project_button(app))
+                    .finish(),
+            )
+            .with_horizontal_padding(12.)
+            .with_vertical_padding(8.)
+            .finish(),
+        );
 
         for project_path in projects {
             let mut sessions = records
