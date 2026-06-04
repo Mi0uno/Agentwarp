@@ -18,7 +18,7 @@ use warp_core::ui::theme::color::internal_colors;
 use warp_core::ui::theme::{AnsiColorIdentifier, Fill as WarpThemeFill, WarpTheme};
 use warp_core::ui::Icon as WarpIcon;
 use warpui::elements::{
-    resizable_state_handle, Border, ChildAnchor, Clipped, ClippedScrollStateHandle,
+    resizable_state_handle, Border, ChildAnchor, ChildView, Clipped, ClippedScrollStateHandle,
     ClippedScrollable, ConstrainedBox, Container, CornerRadius, CrossAxisAlignment,
     DispatchEventResult, DragAxis, DragBarSide, Draggable, DropShadow, DropTarget, Element, Empty,
     EventHandler, Expanded, Fill as ElementFill, Flex, Hoverable, MainAxisAlignment, MainAxisSize,
@@ -74,6 +74,7 @@ use crate::workspace::tab_settings::{
     TabSettings, VerticalTabsCompactSubtitle, VerticalTabsDisplayGranularity,
     VerticalTabsPrimaryInfo, VerticalTabsTabItemMode, VerticalTabsViewMode,
 };
+use crate::workspace::view::agent_sessions::AgentSessionsView;
 use crate::workspace::view::vertical_tabs::telemetry::{
     VerticalTabsChipEntrypoint, VerticalTabsTelemetryEvent,
 };
@@ -1522,6 +1523,7 @@ fn render_vertical_tabs_panel(
     state: &VerticalTabsPanelState,
     workspace: &Workspace,
     side: super::PanelPosition,
+    agent_sessions_view: &ViewHandle<AgentSessionsView>,
     app: &AppContext,
 ) -> Box<dyn Element> {
     let appearance = Appearance::as_ref(app);
@@ -1538,6 +1540,15 @@ fn render_vertical_tabs_panel(
     .with_overlayed_scrollbar()
     .finish();
 
+    let agent_sessions = Container::new(
+        ConstrainedBox::new(ChildView::new(agent_sessions_view).finish())
+            .with_min_height(120.)
+            .with_max_height(300.)
+            .finish(),
+    )
+    .with_border(Border::top(1.).with_border_fill(internal_colors::fg_overlay_2(theme)))
+    .finish();
+
     let panel_content = Flex::column()
         .with_main_axis_size(MainAxisSize::Max)
         .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
@@ -1548,6 +1559,7 @@ fn render_vertical_tabs_panel(
             app,
         ))
         .with_child(Shrinkable::new(1., scrollable_groups).finish())
+        .with_child(agent_sessions)
         .finish();
 
     // The settings popup is rendered at the workspace level (with Dismiss for click-outside-
@@ -6801,7 +6813,13 @@ impl Workspace {
         side: super::PanelPosition,
         app: &AppContext,
     ) -> Box<dyn Element> {
-        render_vertical_tabs_panel(&self.vertical_tabs_panel, self, side, app)
+        render_vertical_tabs_panel(
+            &self.vertical_tabs_panel,
+            self,
+            side,
+            &self.agent_sessions_view,
+            app,
+        )
     }
 }
 

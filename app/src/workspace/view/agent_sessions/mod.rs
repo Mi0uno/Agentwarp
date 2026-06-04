@@ -12,7 +12,7 @@ use warp_util::path::user_friendly_path;
 use warpui::elements::{
     Border, ClippedScrollStateHandle, ClippedScrollable, ConstrainedBox, Container, CornerRadius,
     CrossAxisAlignment, Element, Fill as ElementFill, Flex, Hoverable, MainAxisAlignment,
-    MainAxisSize, MouseStateHandle, ParentElement, Radius, ScrollbarWidth, Shrinkable, Text,
+    MainAxisSize, MouseStateHandle, ParentElement, Radius, ScrollbarWidth, Shrinkable, Text, Wrap,
 };
 use warpui::fonts::{Properties, Weight};
 use warpui::platform::Cursor;
@@ -350,13 +350,13 @@ impl AgentSessionsView {
 
         let mut project_column = Flex::column().with_spacing(8.).with_child(header);
 
-        let agent_row = SUPPORTED_AGENTS
-            .into_iter()
-            .fold(
-                Flex::row()
-                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                    .with_spacing(6.),
-                |row, agent| row.with_child(self.render_agent_chip(project_path, agent, app)),
+        let agent_row = Wrap::row()
+            .with_spacing(6.)
+            .with_run_spacing(6.)
+            .with_children(
+                SUPPORTED_AGENTS
+                    .into_iter()
+                    .map(|agent| self.render_agent_chip(project_path, agent, app)),
             )
             .finish();
         project_column.add_child(agent_row);

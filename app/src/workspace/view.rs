@@ -475,7 +475,7 @@ use crate::workspace::tab_settings::TabCloseButtonPosition;
 use crate::workspace::toast_stack::{
     ToastStack, ToastStack as WorkspaceToastStack, ToastStackEvent as WorkspaceToastStackEvent,
 };
-use crate::workspace::view::agent_sessions::AgentSessionsModel;
+use crate::workspace::view::agent_sessions::{AgentSessionsModel, AgentSessionsView};
 use crate::workspace::view::build_plan_migration_modal::{
     BuildPlanMigrationModal, BuildPlanMigrationModalEvent,
 };
@@ -1070,6 +1070,7 @@ pub struct Workspace {
     left_panel_open: bool,
     vertical_tabs_panel_open: bool,
     vertical_tabs_panel: VerticalTabsPanelState,
+    agent_sessions_view: ViewHandle<AgentSessionsView>,
     left_panel_view: ViewHandle<LeftPanelView>,
     left_panel_views: Vec<ToolPanelView>,
     right_panel_view: ViewHandle<RightPanelView>,
@@ -2885,6 +2886,8 @@ impl Workspace {
         let working_directories_model =
             ctx.add_model(|_| pane_group::WorkingDirectoriesModel::new());
 
+        let agent_sessions_view = ctx.add_view(AgentSessionsView::new);
+
         let left_panel_views = Self::compute_left_panel_views(ctx);
 
         let left_panel_view = ctx.add_typed_action_view(|ctx| {
@@ -3287,6 +3290,7 @@ impl Workspace {
             left_panel_open: false,
             vertical_tabs_panel_open: false,
             vertical_tabs_panel: Default::default(),
+            agent_sessions_view,
             left_panel_view,
             left_panel_views,
             right_panel_view,
@@ -3970,11 +3974,17 @@ impl Workspace {
             }
         }
 
+        let fallback_left_panel_view = self
+            .left_panel_views
+            .first()
+            .copied()
+            .unwrap_or(ToolPanelView::WarpDrive);
+
         self.left_panel_view.update(ctx, |lp, ctx| {
             // Restore which panel tab was active
             let active_view = match left_panel_snapshot.left_panel_displayed_tab {
                 LeftPanelDisplayedTab::FileTree => ToolPanelView::ProjectExplorer,
-                LeftPanelDisplayedTab::AgentSessions => ToolPanelView::AgentSessions,
+                LeftPanelDisplayedTab::AgentSessions => fallback_left_panel_view,
                 LeftPanelDisplayedTab::GlobalSearch => ToolPanelView::GlobalSearch {
                     entry_focus: GlobalSearchEntryFocus::Results,
                 },
@@ -12314,7 +12324,7 @@ impl Workspace {
         ProjectManagementModel::handle(ctx).update(ctx, |projects, ctx| {
             projects.upsert_project(path_buf, ctx);
         });
-        self.open_left_panel_view(&LeftPanelAction::AgentSessions, ctx);
+        self.open_vertical_tabs_panel_if_enabled(ctx);
         ctx.notify();
     }
 
@@ -18980,7 +18990,6 @@ impl Workspace {
                         .unwrap_or(ToolPanelView::WarpDrive)
                     {
                         ToolPanelView::ProjectExplorer => "Project explorer",
-                        ToolPanelView::AgentSessions => "Agent sessions",
                         ToolPanelView::GlobalSearch { .. } => "Global search",
                         ToolPanelView::WarpDrive => "Warp Drive",
                         ToolPanelView::ConversationListView => "Agent conversations",
@@ -19035,7 +19044,6 @@ impl Workspace {
                 .unwrap_or(ToolPanelView::WarpDrive)
             {
                 ToolPanelView::ProjectExplorer => "Project explorer",
-                ToolPanelView::AgentSessions => "Agent sessions",
                 ToolPanelView::GlobalSearch { .. } => "Global search",
                 ToolPanelView::WarpDrive => "Warp Drive",
                 ToolPanelView::ConversationListView => "Agent conversations",
@@ -22193,9 +22201,6 @@ impl Workspace {
         let mut views = vec![];
         if cfg!(feature = "local_fs") && *CodeSettings::as_ref(ctx).show_project_explorer.value() {
             views.push(ToolPanelView::ProjectExplorer);
-        }
-        if cfg!(feature = "local_fs") {
-            views.push(ToolPanelView::AgentSessions);
         }
         if FeatureFlag::AgentViewConversationListView.is_enabled()
             && AISettings::as_ref(ctx).is_any_ai_enabled(ctx)
