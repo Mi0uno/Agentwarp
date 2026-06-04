@@ -23045,6 +23045,11 @@ impl TypedActionView for Workspace {
             ToggleVerticalTabsPanel => {
                 self.toggle_vertical_tabs_panel(ctx);
             }
+            SetVerticalTabsPanelMode(mode) => {
+                self.vertical_tabs_panel.panel_mode = *mode;
+                self.vertical_tabs_panel.show_settings_popup = false;
+                ctx.notify();
+            }
             ToggleNotificationMailbox { select_first } => {
                 if FeatureFlag::HOANotifications.is_enabled()
                     && *AISettings::as_ref(ctx).show_agent_notifications

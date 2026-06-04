@@ -3,6 +3,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
+use pathfinder_geometry::vector::vec2f;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use warp_core::ui::theme::Fill as ThemeFill;
@@ -10,12 +11,15 @@ use warp_core::ui::Icon;
 use warp_core::user_preferences::GetUserPreferences as _;
 use warp_util::path::user_friendly_path;
 use warpui::elements::{
-    Border, ClippedScrollStateHandle, ClippedScrollable, ConstrainedBox, Container, CornerRadius,
-    CrossAxisAlignment, Element, Fill as ElementFill, Flex, Hoverable, MainAxisAlignment,
-    MainAxisSize, MouseStateHandle, ParentElement, Radius, ScrollbarWidth, Shrinkable, Text, Wrap,
+    Border, ChildAnchor, ClippedScrollStateHandle, ClippedScrollable, ConstrainedBox, Container,
+    CornerRadius, CrossAxisAlignment, Element, Empty, Fill as ElementFill, Flex, Hoverable,
+    MainAxisAlignment, MainAxisSize, MouseStateHandle, OffsetPositioning, ParentAnchor,
+    ParentElement, ParentOffsetBounds, Radius, ScrollbarWidth, Shrinkable, Stack, Text, Wrap,
 };
 use warpui::fonts::{Properties, Weight};
 use warpui::platform::Cursor;
+use warpui::prelude::Align;
+use warpui::ui_components::components::UiComponent;
 use warpui::{AppContext, Entity, EntityId, ModelContext, SingletonEntity, View, ViewContext};
 
 use crate::appearance::Appearance;
@@ -29,6 +33,8 @@ use crate::workspace::WorkspaceAction;
 const AGENT_SESSION_RECORDS_PREF_KEY: &str = "agent_sessions.records.v1";
 const MAX_AGENT_SESSION_RECORDS: usize = 200;
 const MAX_TITLE_CHARS: usize = 96;
+const ICON_BUTTON_SIZE: f32 = 22.;
+const SIDEBAR_HORIZONTAL_PADDING: f32 = 12.;
 
 const SUPPORTED_AGENTS: [CLIAgent; 3] = [CLIAgent::Claude, CLIAgent::Codex, CLIAgent::OpenCode];
 
@@ -253,6 +259,7 @@ impl AgentSessionsModel {
 pub struct AgentSessionsView {
     scroll_state: ClippedScrollStateHandle,
     row_mouse_states: RefCell<HashMap<String, MouseStateHandle>>,
+    projects_header_mouse_state: MouseStateHandle,
     add_project_mouse_state: MouseStateHandle,
     empty_state_mouse_state: MouseStateHandle,
 }
@@ -272,6 +279,7 @@ impl AgentSessionsView {
         Self {
             scroll_state: ClippedScrollStateHandle::default(),
             row_mouse_states: RefCell::new(HashMap::new()),
+            projects_header_mouse_state: MouseStateHandle::default(),
             add_project_mouse_state: MouseStateHandle::default(),
             empty_state_mouse_state: MouseStateHandle::default(),
         }
@@ -297,14 +305,46 @@ impl AgentSessionsView {
             .clone()
     }
 
-    fn render_add_project_button(&self, app: &AppContext) -> Box<dyn Element> {
-        render_compact_button(
-            self.add_project_mouse_state.clone(),
-            Icon::Plus,
-            "Project",
-            app,
-            WorkspaceAction::OpenAgentSessionProjectPicker,
-        )
+    fn render_projects_header(&self, app: &AppContext) -> Box<dyn Element> {
+        let appearance = Appearance::as_ref(app);
+        let theme = appearance.theme();
+        let header_mouse_state = self.projects_header_mouse_state.clone();
+        let add_project_mouse_state = self.add_project_mouse_state.clone();
+
+        Hoverable::new(header_mouse_state, move |state| {
+            let action = WorkspaceAction::OpenAgentSessionProjectPicker;
+            let trailing = if state.is_hovered() {
+                render_icon_button(
+                    add_project_mouse_state.clone(),
+                    Icon::Plus,
+                    "Add project",
+                    appearance,
+                    action,
+                )
+            } else {
+                icon_button_placeholder()
+            };
+
+            Container::new(
+                Flex::row()
+                    .with_main_axis_size(MainAxisSize::Max)
+                    .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_child(
+                        Text::new_inline("Projects", appearance.ui_font_family(), 12.)
+                            .with_color(theme.sub_text_color(theme.background()).into())
+                            .with_style(Properties::default().weight(Weight::Medium))
+                            .finish(),
+                    )
+                    .with_child(trailing)
+                    .finish(),
+            )
+            .with_horizontal_padding(SIDEBAR_HORIZONTAL_PADDING)
+            .with_vertical_padding(4.)
+            .finish()
+        })
+        .with_defer_events_to_children()
+        .finish()
     }
 
     fn render_project(
@@ -323,22 +363,31 @@ impl AgentSessionsView {
         let project_path_text = friendly_path(project_path);
 
         let header = Flex::row()
-            .with_main_axis_size(MainAxisSize::Max)
-            .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_spacing(7.)
+            .with_child(
+                ConstrainedBox::new(
+                    Icon::Folder
+                        .to_warpui_icon(theme.sub_text_color(theme.background()))
+                        .finish(),
+                )
+                .with_width(14.)
+                .with_height(14.)
+                .finish(),
+            )
             .with_child(
                 Shrinkable::new(
                     1.0,
                     Flex::column()
-                        .with_spacing(2.)
+                        .with_spacing(1.)
                         .with_child(
-                            Text::new_inline(project_name, font_family.clone(), 13.)
+                            Text::new_inline(project_name, font_family.clone(), 12.)
                                 .with_color(theme.main_text_color(theme.background()).into())
                                 .with_style(Properties::default().weight(Weight::Semibold))
                                 .finish(),
                         )
                         .with_child(
-                            Text::new_inline(project_path_text, font_family.clone(), 11.)
+                            Text::new_inline(project_path_text, font_family.clone(), 10.5)
                                 .with_color(theme.sub_text_color(theme.background()).into())
                                 .finish(),
                         )
@@ -348,7 +397,7 @@ impl AgentSessionsView {
             )
             .finish();
 
-        let mut project_column = Flex::column().with_spacing(8.).with_child(header);
+        let mut project_column = Flex::column().with_spacing(7.).with_child(header);
 
         let agent_row = Wrap::row()
             .with_spacing(6.)
@@ -378,8 +427,8 @@ impl AgentSessionsView {
         }
 
         Container::new(project_column.finish())
-            .with_horizontal_padding(12.)
-            .with_vertical_padding(10.)
+            .with_horizontal_padding(SIDEBAR_HORIZONTAL_PADDING)
+            .with_vertical_padding(6.)
             .finish()
     }
 
@@ -583,18 +632,9 @@ impl View for AgentSessionsView {
         }
 
         let records = AgentSessionsModel::as_ref(app);
-        let mut content = Flex::column().with_spacing(2.).with_child(
-            Container::new(
-                Flex::row()
-                    .with_main_axis_size(MainAxisSize::Max)
-                    .with_main_axis_alignment(MainAxisAlignment::End)
-                    .with_child(self.render_add_project_button(app))
-                    .finish(),
-            )
-            .with_horizontal_padding(12.)
-            .with_vertical_padding(8.)
-            .finish(),
-        );
+        let mut content = Flex::column()
+            .with_spacing(1.)
+            .with_child(self.render_projects_header(app));
 
         for project_path in projects {
             let mut sessions = records
@@ -618,6 +658,78 @@ impl View for AgentSessionsView {
         .with_overlayed_scrollbar()
         .finish()
     }
+}
+
+fn icon_button_placeholder() -> Box<dyn Element> {
+    ConstrainedBox::new(Empty::new().finish())
+        .with_width(ICON_BUTTON_SIZE)
+        .with_height(ICON_BUTTON_SIZE)
+        .finish()
+}
+
+fn render_icon_button(
+    mouse_state: MouseStateHandle,
+    icon: Icon,
+    tooltip_text: &'static str,
+    appearance: &Appearance,
+    action: WorkspaceAction,
+) -> Box<dyn Element> {
+    let theme = appearance.theme();
+    let ui_builder = appearance.ui_builder().clone();
+
+    Hoverable::new(mouse_state, move |state| {
+        let icon_color = if state.is_hovered() {
+            theme.main_text_color(theme.background())
+        } else {
+            theme.sub_text_color(theme.background())
+        };
+        let mut button = Container::new(
+            Align::new(
+                ConstrainedBox::new(icon.to_warpui_icon(icon_color).finish())
+                    .with_width(13.)
+                    .with_height(13.)
+                    .finish(),
+            )
+            .finish(),
+        )
+        .with_horizontal_padding(4.)
+        .with_vertical_padding(4.)
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)));
+
+        if state.is_hovered() {
+            button = button.with_background(theme.surface_overlay_1());
+        }
+
+        let button = ConstrainedBox::new(button.finish())
+            .with_width(ICON_BUTTON_SIZE)
+            .with_height(ICON_BUTTON_SIZE)
+            .finish();
+
+        if state.is_hovered() {
+            let tooltip = ui_builder
+                .tool_tip(tooltip_text.to_string())
+                .build()
+                .finish();
+            let mut stack = Stack::new().with_child(button);
+            stack.add_positioned_overlay_child(
+                tooltip,
+                OffsetPositioning::offset_from_parent(
+                    vec2f(0., 4.),
+                    ParentOffsetBounds::WindowByPosition,
+                    ParentAnchor::BottomMiddle,
+                    ChildAnchor::TopMiddle,
+                ),
+            );
+            stack.finish()
+        } else {
+            button
+        }
+    })
+    .with_cursor(Cursor::PointingHand)
+    .on_click(move |ctx, _, _| {
+        ctx.dispatch_typed_action(action.clone());
+    })
+    .finish()
 }
 
 fn render_compact_button(

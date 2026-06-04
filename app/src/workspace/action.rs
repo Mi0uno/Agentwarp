@@ -102,6 +102,12 @@ impl NewSessionMenuAnchor {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerticalTabsPanelMode {
+    Terminal,
+    Agent,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum VerticalTabsPaneContextMenuTarget {
     ClickedPane(PaneViewLocator),
@@ -326,6 +332,7 @@ pub enum WorkspaceAction {
     OpenCodeReviewPanel(PaneViewLocator),
     /// Toggles the vertical tabs panel. This happens as an explicit action from the user.
     ToggleVerticalTabsPanel,
+    SetVerticalTabsPanelMode(VerticalTabsPanelMode),
     ToggleVerticalTabsSettingsPopup,
     SetVerticalTabsDisplayGranularity(VerticalTabsDisplayGranularity),
     SetVerticalTabsTabItemMode(VerticalTabsTabItemMode),
@@ -957,6 +964,7 @@ impl WorkspaceAction {
             | ClosePanel
             | ToggleRightPanel
             | OpenCodeReviewPanel(..)
+            | SetVerticalTabsPanelMode(_)
             | ToggleVerticalTabsSettingsPopup
             | SetVerticalTabsDisplayGranularity(_)
             | SetVerticalTabsTabItemMode(_)

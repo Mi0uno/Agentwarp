@@ -66,7 +66,7 @@ use crate::ui_components::icon_with_status::{render_icon_with_status, IconWithSt
 use crate::ui_components::icons::Icon as UiIcon;
 use crate::util::bindings::keybinding_name_to_display_string;
 use crate::util::color::Opacity;
-use crate::workspace::action::{NewSessionMenuAnchor, WorkspaceAction};
+use crate::workspace::action::{NewSessionMenuAnchor, VerticalTabsPanelMode, WorkspaceAction};
 use crate::workspace::cross_window_tab_drag::CrossWindowTabDrag;
 use crate::workspace::hoa_onboarding::HoaOnboardingStep;
 use crate::workspace::tab_group::{TabGroup, TabGroupId};
@@ -592,6 +592,9 @@ pub(super) struct VerticalTabsPanelState {
     detail_overlay_state: Arc<Mutex<VerticalTabsDetailOverlayState>>,
     new_tab_hover_state: MouseStateHandle,
     new_tab_button_state: MouseStateHandle,
+    terminal_mode_mouse_state: MouseStateHandle,
+    agent_mode_mouse_state: MouseStateHandle,
+    pub(super) panel_mode: VerticalTabsPanelMode,
     pub(super) search_query: String,
     settings_button_mouse_state: MouseStateHandle,
     panes_segment_mouse_state: MouseStateHandle,
@@ -629,6 +632,9 @@ impl Default for VerticalTabsPanelState {
             detail_overlay_state: Arc::new(Mutex::new(VerticalTabsDetailOverlayState::default())),
             new_tab_hover_state: Default::default(),
             new_tab_button_state: Default::default(),
+            terminal_mode_mouse_state: Default::default(),
+            agent_mode_mouse_state: Default::default(),
+            panel_mode: VerticalTabsPanelMode::Terminal,
             search_query: String::new(),
             settings_button_mouse_state: Default::default(),
             panes_segment_mouse_state: Default::default(),
@@ -1290,21 +1296,123 @@ fn render_control_bar(
     let settings_button = render_settings_button(state, appearance);
     let new_tab_button = render_new_tab_button(state, workspace, appearance, app);
 
+    let mut row = Flex::row()
+        .with_main_axis_size(MainAxisSize::Max)
+        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+        .with_spacing(CONTROL_BAR_SPACING)
+        .with_child(render_panel_mode_toggle(state, appearance));
+
+    if matches!(state.panel_mode, VerticalTabsPanelMode::Terminal) {
+        row.add_child(Shrinkable::new(1., search_bar).finish());
+        row.add_child(settings_button);
+        row.add_child(new_tab_button);
+    } else {
+        row.add_child(Shrinkable::new(1., Empty::new().finish()).finish());
+    }
+
+    Container::new(row.finish())
+        .with_padding(
+            Padding::uniform(CONTROL_BAR_VERTICAL_PADDING)
+                .with_left(GROUP_HORIZONTAL_PADDING)
+                .with_right(GROUP_HORIZONTAL_PADDING),
+        )
+        .finish()
+}
+
+fn render_panel_mode_toggle(
+    state: &VerticalTabsPanelState,
+    appearance: &Appearance,
+) -> Box<dyn Element> {
+    let theme = appearance.theme();
     Container::new(
         Flex::row()
-            .with_main_axis_size(MainAxisSize::Max)
+            .with_main_axis_size(MainAxisSize::Min)
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
-            .with_spacing(CONTROL_BAR_SPACING)
-            .with_child(Shrinkable::new(1., search_bar).finish())
-            .with_child(settings_button)
-            .with_child(new_tab_button)
+            .with_child(render_panel_mode_segment(
+                WarpIcon::Terminal,
+                "Terminal sessions",
+                matches!(state.panel_mode, VerticalTabsPanelMode::Terminal),
+                state.terminal_mode_mouse_state.clone(),
+                VerticalTabsPanelMode::Terminal,
+                appearance,
+            ))
+            .with_child(render_panel_mode_segment(
+                WarpIcon::Oz,
+                "Agent sessions",
+                matches!(state.panel_mode, VerticalTabsPanelMode::Agent),
+                state.agent_mode_mouse_state.clone(),
+                VerticalTabsPanelMode::Agent,
+                appearance,
+            ))
             .finish(),
     )
-    .with_padding(
-        Padding::uniform(CONTROL_BAR_VERTICAL_PADDING)
-            .with_left(GROUP_HORIZONTAL_PADDING)
-            .with_right(GROUP_HORIZONTAL_PADDING),
-    )
+    .with_uniform_padding(2.)
+    .with_background(internal_colors::fg_overlay_2(theme))
+    .with_corner_radius(CornerRadius::with_all(CONTROL_BAR_BUTTON_RADIUS))
+    .finish()
+}
+
+fn render_panel_mode_segment(
+    icon: WarpIcon,
+    tooltip_text: &'static str,
+    is_selected: bool,
+    mouse_state: MouseStateHandle,
+    mode: VerticalTabsPanelMode,
+    appearance: &Appearance,
+) -> Box<dyn Element> {
+    let theme = appearance.theme();
+    let main_text = theme.main_text_color(theme.background());
+    let sub_text = theme.sub_text_color(theme.background());
+    let ui_builder = appearance.ui_builder().clone();
+
+    Hoverable::new(mouse_state, move |hover_state| {
+        let background = if is_selected {
+            internal_colors::fg_overlay_3(theme)
+        } else if hover_state.is_hovered() {
+            internal_colors::fg_overlay_1(theme)
+        } else {
+            ThemeFill::Solid(ColorU::transparent_black())
+        };
+        let icon_color = if is_selected { main_text } else { sub_text };
+        let segment = Container::new(
+            Align::new(
+                ConstrainedBox::new(icon.to_warpui_icon(icon_color).finish())
+                    .with_width(14.)
+                    .with_height(14.)
+                    .finish(),
+            )
+            .finish(),
+        )
+        .with_horizontal_padding(4.)
+        .with_vertical_padding(3.)
+        .with_background(background)
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
+        .finish();
+
+        if hover_state.is_hovered() {
+            let tooltip = ui_builder
+                .tool_tip(tooltip_text.to_string())
+                .build()
+                .finish();
+            let mut stack = Stack::new().with_child(segment);
+            stack.add_positioned_overlay_child(
+                tooltip,
+                OffsetPositioning::offset_from_parent(
+                    vec2f(0., 4.),
+                    ParentOffsetBounds::WindowByPosition,
+                    ParentAnchor::BottomMiddle,
+                    ChildAnchor::TopMiddle,
+                ),
+            );
+            stack.finish()
+        } else {
+            segment
+        }
+    })
+    .on_click(move |ctx, _, _| {
+        ctx.dispatch_typed_action(WorkspaceAction::SetVerticalTabsPanelMode(mode));
+    })
+    .with_cursor(Cursor::PointingHand)
     .finish()
 }
 
@@ -1529,7 +1637,7 @@ fn render_vertical_tabs_panel(
     let appearance = Appearance::as_ref(app);
     let theme = appearance.theme();
 
-    let scrollable_groups = ClippedScrollable::vertical(
+    let terminal_sessions = ClippedScrollable::vertical(
         state.scroll_state.clone(),
         render_groups(state, workspace, app),
         ScrollbarWidth::Custom(4.),
@@ -1540,14 +1648,10 @@ fn render_vertical_tabs_panel(
     .with_overlayed_scrollbar()
     .finish();
 
-    let agent_sessions = Container::new(
-        ConstrainedBox::new(ChildView::new(agent_sessions_view).finish())
-            .with_min_height(120.)
-            .with_max_height(300.)
-            .finish(),
-    )
-    .with_border(Border::top(1.).with_border_fill(internal_colors::fg_overlay_2(theme)))
-    .finish();
+    let panel_body = match state.panel_mode {
+        VerticalTabsPanelMode::Terminal => terminal_sessions,
+        VerticalTabsPanelMode::Agent => ChildView::new(agent_sessions_view).finish(),
+    };
 
     let panel_content = Flex::column()
         .with_main_axis_size(MainAxisSize::Max)
@@ -1558,8 +1662,7 @@ fn render_vertical_tabs_panel(
             &workspace.vertical_tabs_search_input,
             app,
         ))
-        .with_child(Shrinkable::new(1., scrollable_groups).finish())
-        .with_child(agent_sessions)
+        .with_child(Shrinkable::new(1., panel_body).finish())
         .finish();
 
     // The settings popup is rendered at the workspace level (with Dismiss for click-outside-
