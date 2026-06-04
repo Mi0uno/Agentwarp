@@ -14,7 +14,7 @@ use warpui::elements::{
     Border, ChildAnchor, ClippedScrollStateHandle, ClippedScrollable, ConstrainedBox, Container,
     CornerRadius, CrossAxisAlignment, Element, Empty, Fill as ElementFill, Flex, Hoverable,
     MainAxisAlignment, MainAxisSize, MouseStateHandle, OffsetPositioning, ParentAnchor,
-    ParentElement, ParentOffsetBounds, Radius, ScrollbarWidth, Shrinkable, Stack, Text, Wrap,
+    ParentElement, ParentOffsetBounds, Radius, ScrollbarWidth, Shrinkable, Stack, Text,
 };
 use warpui::fonts::{Properties, Weight};
 use warpui::platform::Cursor;
@@ -33,6 +33,7 @@ use crate::workspace::WorkspaceAction;
 const AGENT_SESSION_RECORDS_PREF_KEY: &str = "agent_sessions.records.v1";
 const MAX_AGENT_SESSION_RECORDS: usize = 200;
 const MAX_TITLE_CHARS: usize = 96;
+const AGENT_BUTTON_SIZE: f32 = 26.;
 const ICON_BUTTON_SIZE: f32 = 22.;
 const SIDEBAR_HORIZONTAL_PADDING: f32 = 12.;
 
@@ -399,9 +400,10 @@ impl AgentSessionsView {
 
         let mut project_column = Flex::column().with_spacing(7.).with_child(header);
 
-        let agent_row = Wrap::row()
+        let agent_row = Flex::row()
+            .with_main_axis_size(MainAxisSize::Min)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
             .with_spacing(6.)
-            .with_run_spacing(6.)
             .with_children(
                 SUPPORTED_AGENTS
                     .into_iter()
@@ -447,31 +449,26 @@ impl AgentSessionsView {
         let project_path = project_path.to_path_buf();
         let appearance = Appearance::as_ref(app);
         let theme = appearance.theme();
-        let label = agent.display_name();
+        let tooltip_text = agent.display_name().to_string();
         let icon = agent.icon().unwrap_or(Icon::Terminal);
+        let ui_builder = appearance.ui_builder().clone();
 
         Hoverable::new(mouse_state, move |state| {
+            let icon_color = if state.is_hovered() {
+                theme.main_text_color(theme.background())
+            } else {
+                theme.sub_text_color(theme.background())
+            };
             let mut container = Container::new(
-                Flex::row()
-                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                    .with_spacing(4.)
-                    .with_child(
-                        ConstrainedBox::new(
-                            icon.to_warpui_icon(theme.main_text_color(theme.background()))
-                                .finish(),
-                        )
-                        .with_width(13.)
-                        .with_height(13.)
+                Align::new(
+                    ConstrainedBox::new(icon.to_warpui_icon(icon_color).finish())
+                        .with_width(15.)
+                        .with_height(15.)
                         .finish(),
-                    )
-                    .with_child(
-                        Text::new_inline(label, appearance.ui_font_family(), 11.)
-                            .with_color(theme.main_text_color(theme.background()).into())
-                            .finish(),
-                    )
-                    .finish(),
+                )
+                .finish(),
             )
-            .with_horizontal_padding(8.)
+            .with_horizontal_padding(5.)
             .with_vertical_padding(5.)
             .with_border(Border::all(1.).with_border_fill(theme.surface_3()))
             .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)));
@@ -479,7 +476,28 @@ impl AgentSessionsView {
             if state.is_hovered() {
                 container = container.with_background(theme.surface_overlay_1());
             }
-            container.finish()
+
+            let button = ConstrainedBox::new(container.finish())
+                .with_width(AGENT_BUTTON_SIZE)
+                .with_height(AGENT_BUTTON_SIZE)
+                .finish();
+
+            if state.is_hovered() {
+                let tooltip = ui_builder.tool_tip(tooltip_text.clone()).build().finish();
+                let mut stack = Stack::new().with_child(button);
+                stack.add_positioned_overlay_child(
+                    tooltip,
+                    OffsetPositioning::offset_from_parent(
+                        vec2f(0., 4.),
+                        ParentOffsetBounds::WindowByPosition,
+                        ParentAnchor::BottomMiddle,
+                        ChildAnchor::TopMiddle,
+                    ),
+                );
+                stack.finish()
+            } else {
+                button
+            }
         })
         .with_cursor(Cursor::PointingHand)
         .on_click(move |ctx, _, _| {
