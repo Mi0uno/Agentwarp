@@ -1138,7 +1138,10 @@ fn agent_session_base_command(record: &AgentSessionRecord) -> String {
         .agent_session_id
         .as_deref()
         .and_then(|session_id| record.agent.resume_command(session_id))
-        .unwrap_or_else(|| record.agent.command_prefix().to_owned())
+        .unwrap_or_else(|| match record.agent {
+            CLIAgent::Codex => format!("{} resume --last", record.agent.command_prefix()),
+            _ => record.agent.command_prefix().to_owned(),
+        })
 }
 
 fn agent_session_restore_command(record: &AgentSessionRecord) -> String {
@@ -1223,6 +1226,14 @@ mod agent_session_hosted_transcript_tests {
             agent_session_launch_command(&record, "codex resume agent-session"),
             "codex resume agent-session"
         );
+    }
+
+    #[test]
+    fn agent_session_base_command_uses_codex_resume_last_without_session_id() {
+        let mut record = record_with_hosted_transcript(None);
+        record.agent_session_id = None;
+
+        assert_eq!(agent_session_base_command(&record), "codex resume --last");
     }
 
     #[test]
@@ -12526,6 +12537,10 @@ impl Workspace {
     }
 
     fn restore_agent_session(&mut self, session_id: &str, ctx: &mut ViewContext<Self>) {
+        AgentSessionsModel::handle(ctx).update(ctx, |model, ctx| {
+            model.resolve_missing_agent_session_id(session_id, ctx);
+        });
+
         let Some(record) = AgentSessionsModel::as_ref(ctx).session(session_id).cloned() else {
             return;
         };

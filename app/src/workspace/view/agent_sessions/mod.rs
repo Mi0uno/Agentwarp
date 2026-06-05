@@ -1,6 +1,12 @@
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
+#[cfg(not(target_family = "wasm"))]
+use std::fs::{self, File};
+#[cfg(not(target_family = "wasm"))]
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+#[cfg(not(target_family = "wasm"))]
+use std::time::SystemTime;
 
 use chrono::Utc;
 use pathfinder_geometry::vector::vec2f;
@@ -205,6 +211,23 @@ impl AgentSessionsModel {
         self.persist_and_emit(ctx);
     }
 
+    pub fn resolve_missing_agent_session_id(
+        &mut self,
+        session_id: &str,
+        ctx: &mut ModelContext<Self>,
+    ) -> Option<String> {
+        let record = self.record_mut(session_id)?;
+        if record.agent_session_id.is_some() || record.agent != CLIAgent::Codex {
+            return record.agent_session_id.clone();
+        }
+
+        let session_id = latest_codex_session_id_for_project(&record.project_path)?;
+        record.agent_session_id = Some(session_id.clone());
+        record.updated_at_ms = now_ms();
+        self.persist_and_emit(ctx);
+        Some(session_id)
+    }
+
     pub fn rename_session(
         &mut self,
         session_id: &str,
@@ -333,9 +356,24 @@ impl AgentSessionsModel {
             }
             CLIAgentSessionsModelEvent::InputSessionChanged { .. } => false,
             CLIAgentSessionsModelEvent::Ended { agent, .. } => {
+                let fallback_session_id = if *agent == CLIAgent::Codex {
+                    self.records
+                        .iter()
+                        .find(|record| record.terminal_view_id == Some(terminal_view_id))
+                        .filter(|record| record.agent_session_id.is_none())
+                        .and_then(|record| {
+                            latest_codex_session_id_for_project(&record.project_path)
+                        })
+                } else {
+                    None
+                };
+
                 self.update_record_for_terminal(terminal_view_id, |record| {
                     record.agent = *agent;
                     record.status = AgentSessionStatus::Success;
+                    if record.agent_session_id.is_none() {
+                        record.agent_session_id = fallback_session_id;
+                    }
                 })
             }
         };
@@ -1417,6 +1455,134 @@ fn now_ms() -> i64 {
     Utc::now().timestamp_millis()
 }
 
+#[cfg(not(target_family = "wasm"))]
+fn latest_codex_session_id_for_project(project_path: &Path) -> Option<String> {
+    latest_codex_session_id_for_project_in_home(&codex_home_dir()?, project_path)
+}
+
+#[cfg(target_family = "wasm")]
+fn latest_codex_session_id_for_project(_project_path: &Path) -> Option<String> {
+    None
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn codex_home_dir() -> Option<PathBuf> {
+    if let Some(codex_home) = std::env::var_os("CODEX_HOME") {
+        return Some(PathBuf::from(codex_home));
+    }
+
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex"))
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn latest_codex_session_id_for_project_in_home(
+    codex_home: &Path,
+    project_path: &Path,
+) -> Option<String> {
+    let sessions_dir = codex_home.join("sessions");
+    let project_path = normalized_path_key(project_path);
+    let mut best: Option<(SystemTime, String)> = None;
+
+    visit_codex_session_files(&sessions_dir, &project_path, &mut best);
+    best.map(|(_, session_id)| session_id)
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn visit_codex_session_files(
+    dir: &Path,
+    project_path: &Path,
+    best: &mut Option<(SystemTime, String)>,
+) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            visit_codex_session_files(&path, project_path, best);
+            continue;
+        }
+
+        if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+            continue;
+        }
+
+        let Some(meta) = read_codex_session_meta(&path) else {
+            continue;
+        };
+        if normalized_path_key(&meta.cwd) != project_path {
+            continue;
+        }
+
+        let modified_at = path
+            .metadata()
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+
+        let should_replace = best
+            .as_ref()
+            .is_none_or(|(best_modified_at, _)| modified_at > *best_modified_at);
+        if should_replace {
+            *best = Some((modified_at, meta.id));
+        }
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn read_codex_session_meta(path: &Path) -> Option<CodexSessionMeta> {
+    let file = File::open(path).ok()?;
+    let mut lines = BufReader::new(file).lines();
+    let first_line = lines.next()?.ok()?;
+    let meta = serde_json::from_str::<CodexSessionMetaLine>(&first_line).ok()?;
+
+    if meta.kind != "session_meta" {
+        return None;
+    }
+
+    Some(meta.payload)
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn normalized_path_key(path: &Path) -> PathBuf {
+    let expanded = expand_tilde(path);
+    expanded.canonicalize().unwrap_or(expanded)
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn expand_tilde(path: &Path) -> PathBuf {
+    let path_text = path.to_string_lossy();
+    if path_text == "~" {
+        return std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| path.to_path_buf());
+    }
+
+    if let Some(rest) = path_text.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+
+    path.to_path_buf()
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[derive(Deserialize)]
+struct CodexSessionMetaLine {
+    #[serde(rename = "type")]
+    kind: String,
+    payload: CodexSessionMeta,
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[derive(Deserialize)]
+struct CodexSessionMeta {
+    id: String,
+    cwd: PathBuf,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1576,6 +1742,46 @@ mod tests {
         assert_eq!(
             AgentSessionStatus::from_cli_status(&CLIAgentSessionStatus::Blocked { message: None }),
             AgentSessionStatus::Blocked
+        );
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn finds_latest_codex_session_id_for_project() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let project_dir = temp_dir.path().join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let sessions_dir = temp_dir.path().join("sessions/2026/06/04");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        std::fs::write(
+            sessions_dir.join("old.jsonl"),
+            format!(
+                r#"{{"type":"session_meta","payload":{{"id":"old-session","cwd":{}}}}}"#,
+                serde_json::to_string(&project_dir).unwrap()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            sessions_dir.join("other.jsonl"),
+            r#"{"type":"session_meta","payload":{"id":"other-session","cwd":"/tmp/other"}}"#,
+        )
+        .unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(
+            sessions_dir.join("new.jsonl"),
+            format!(
+                r#"{{"type":"session_meta","payload":{{"id":"new-session","cwd":{}}}}}"#,
+                serde_json::to_string(&project_dir).unwrap()
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            latest_codex_session_id_for_project_in_home(temp_dir.path(), &project_dir).as_deref(),
+            Some("new-session")
         );
     }
 }
