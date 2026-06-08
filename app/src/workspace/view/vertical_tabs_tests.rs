@@ -8,10 +8,11 @@ use warpui::EntityId;
 use super::{
     branch_label_display, coalesce_summary_branch_entries, code_detail_kind_label,
     compact_branch_subtitle_display, detail_sidecar_width_and_bounds,
-    detail_target_for_hovered_row, non_terminal_search_text_fragments,
-    pane_ids_for_display_granularity, pane_search_text_fragments, preferred_agent_tab_titles,
-    push_normalized_unique_summary_label, search_fragments_contain_query,
-    select_summary_pane_kind_icons, should_keep_detail_sidecar_visible_for_mouse_position,
+    detail_target_for_hovered_row, is_generated_agent_session_group_title,
+    non_terminal_search_text_fragments, pane_ids_for_display_granularity,
+    pane_search_text_fragments, preferred_agent_tab_titles, push_normalized_unique_summary_label,
+    search_fragments_contain_query, select_summary_pane_kind_icons,
+    should_keep_detail_sidecar_visible_for_mouse_position,
     sort_summary_primary_labels_status_first, summary_overflow_count,
     summary_search_text_fragments, terminal_kind_badge_label, terminal_primary_line_data,
     terminal_pull_request_badge_label, terminal_search_text_fragments,
@@ -43,6 +44,19 @@ fn code_summary_kind(title: &str) -> SummaryPaneKind {
     SummaryPaneKind::Code {
         title: title.to_string(),
     }
+}
+
+#[test]
+fn generated_agent_session_group_titles_are_folded() {
+    assert!(is_generated_agent_session_group_title("Agent group"));
+    assert!(is_generated_agent_session_group_title(
+        "New Codex session agents"
+    ));
+    assert!(is_generated_agent_session_group_title(
+        "Explain this codebase agents"
+    ));
+    assert!(!is_generated_agent_session_group_title("Agent sessions"));
+    assert!(!is_generated_agent_session_group_title("Build tools"));
 }
 
 #[test]

@@ -161,6 +161,7 @@ use crate::util::openable_file_type::FileTarget;
 use crate::view_components::ToastFlavor;
 use crate::workflows::workflow::Workflow;
 use crate::workflows::{WorkflowSelectionSource, WorkflowSource, WorkflowType};
+use crate::workspace::view::ssh_remote::{ssh_remote_terminal_launch, SshRemoteModel};
 use crate::workspace::{
     self, CommandSearchOptions, PaneViewLocator, TabBarLocation, WorkspaceAction,
 };
@@ -574,6 +575,9 @@ pub enum Event {
     CloseSharedSessionPaneRequested {
         pane_id: PaneId,
     },
+    TerminalPaneClosed {
+        terminal_view_id: EntityId,
+    },
     /// Dirty the workspace so the tab indicator shows.
     MaximizePaneToggled,
     /// A remote server resolved the repo root for a session in this pane group.
@@ -692,6 +696,9 @@ pub enum Event {
         target_view: LeftPanelTargetView,
         force_open: bool,
     },
+    OpenSshRemoteFileExplorer {
+        initial_path: Option<String>,
+    },
     #[cfg(feature = "local_fs")]
     OpenFileWithTarget {
         path: PathBuf,
@@ -784,6 +791,8 @@ pub struct NewTerminalOptions {
     pub is_shared_session_creator: IsSharedSessionCreator,
     /// The AI conversation to restore when the terminal is created.
     pub conversation_restoration: Option<ConversationRestorationInNewPaneType>,
+    /// SSH remote host that owns this terminal, when spawned through the built-in SSH remote flow.
+    pub ssh_remote_host_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2596,9 +2605,11 @@ impl PaneGroup {
             return;
         };
 
-        if AuthStateProvider::as_ref(ctx)
-            .get()
-            .is_anonymous_or_logged_out()
+        if !cfg!(feature = "skip_login")
+            && !FeatureFlag::SkipFirebaseAnonymousUser.is_enabled()
+            && AuthStateProvider::as_ref(ctx)
+                .get()
+                .is_anonymous_or_logged_out()
         {
             AuthManager::handle(ctx).update(ctx, |auth_manager, ctx| {
                 auth_manager.attempt_login_gated_feature(
@@ -4252,6 +4263,11 @@ impl PaneGroup {
             None,
             ctx,
         );
+        if let Some(host_id) = options.ssh_remote_host_id.clone() {
+            SshRemoteModel::handle(ctx).update(ctx, |model, ctx| {
+                model.register_terminal_host(view.id(), host_id, ctx);
+            });
+        }
 
         let pane_data = TerminalPane::new(
             uuid.as_bytes().to_vec(),
@@ -4844,12 +4860,19 @@ impl PaneGroup {
             &is_shared_session_creator,
             IsSharedSessionCreator::Yes { .. }
         );
-        let (pane_data, _view) = self.create_terminal_pane_data(
-            startup_directory,
+        let mut options = NewTerminalOptions {
+            initial_directory: startup_directory,
             env_vars,
             is_shared_session_creator,
-            None,
-            None,
+            ..Default::default()
+        };
+        self.apply_active_ssh_remote_to_terminal_options(&mut options, ctx);
+        let (pane_data, _view) = self.create_terminal_pane_data(
+            options.initial_directory,
+            options.env_vars,
+            options.is_shared_session_creator,
+            options.shell,
+            options.conversation_restoration,
             ctx,
         );
         let new_pane_id = pane_data.terminal_pane_id();
@@ -5588,6 +5611,10 @@ impl PaneGroup {
             return;
         }
 
+        let closing_terminal_view_id = self
+            .terminal_view_from_pane_id(pane_id, ctx)
+            .map(|view| view.id());
+
         // Child agent panes return to off-tree state instead of being
         // destroyed; future pill clicks re-host the same view. The view
         // keeps ownership of its conversation, so we skip the
@@ -5619,6 +5646,9 @@ impl PaneGroup {
                 ctx,
             );
             self.handle_pane_count_change(ctx);
+            if let Some(terminal_view_id) = closing_terminal_view_id {
+                ctx.emit(Event::TerminalPaneClosed { terminal_view_id });
+            }
             ctx.emit(Event::TerminalViewStateChanged);
             ctx.emit(Event::AppStateChanged);
             return;
@@ -5641,6 +5671,9 @@ impl PaneGroup {
             }
 
             if self.panes.visible_pane_count() == 1 {
+                if let Some(terminal_view_id) = closing_terminal_view_id {
+                    ctx.emit(Event::TerminalPaneClosed { terminal_view_id });
+                }
                 // Tell the workspace that this pane group is now empty without
                 // doing any additional clean-up work.  This ensures we don't
                 // pre-emptively delete any state that we might want to retain
@@ -5685,6 +5718,9 @@ impl PaneGroup {
             );
         } else {
             if self.pane_count() == 1 {
+                if let Some(terminal_view_id) = closing_terminal_view_id {
+                    ctx.emit(Event::TerminalPaneClosed { terminal_view_id });
+                }
                 // Tell the workspace that this pane group is now empty without
                 // doing any additional clean-up work.  This ensures we don't
                 // pre-emptively delete any state that we might want to retain
@@ -5731,6 +5767,9 @@ impl PaneGroup {
 
         self.handle_pane_count_change(ctx);
 
+        if let Some(terminal_view_id) = closing_terminal_view_id {
+            ctx.emit(Event::TerminalPaneClosed { terminal_view_id });
+        }
         ctx.emit(Event::TerminalViewStateChanged);
         ctx.emit(Event::AppStateChanged);
     }
@@ -5788,7 +5827,7 @@ impl PaneGroup {
     /// to a swapped-out pane; without the reveal, focus would land on an
     /// off-tree pane the user can't see. Logs a warning if the pane is
     /// neither in the tree nor swap-hidden.
-    pub fn reveal_and_focus_pane(&mut self, pane_id: PaneId, ctx: &mut ViewContext<Self>) {
+    pub fn reveal_and_focus_pane(&mut self, pane_id: PaneId, ctx: &mut ViewContext<Self>) -> bool {
         if let Some(replacement_id) = self.panes.replacement_pane_for_original(pane_id) {
             self.revert_swap_clearing_split_off(replacement_id, ctx);
             self.handle_pane_count_change(ctx);
@@ -5808,7 +5847,7 @@ impl PaneGroup {
                 "reveal_and_focus_pane: pane {pane_id:?} is off-tree; focus will land on a non-visible pane"
             );
         }
-        self.focus_pane_by_id(pane_id, ctx);
+        self.focus_pane_by_id(pane_id, ctx)
     }
 
     /// Temporarily replace a pane with another pane.
@@ -5968,7 +6007,9 @@ impl PaneGroup {
                 self.focus_pane_by_id(pane_id, ctx);
                 self.toggle_maximize_pane(ctx);
             }
-            PaneEvent::FocusSelf => self.focus_pane_by_id(pane_id, ctx),
+            PaneEvent::FocusSelf => {
+                self.focus_pane_by_id(pane_id, ctx);
+            }
             PaneEvent::FocusActiveSession => self.focus_active_session(ctx),
             PaneEvent::AppStateChanged => {
                 ctx.emit(Event::AppStateChanged);
@@ -6651,7 +6692,7 @@ impl PaneGroup {
         self.focus_pane_by_id(id, ctx);
     }
 
-    pub fn focus_pane_by_id(&mut self, id: PaneId, ctx: &mut ViewContext<Self>) {
+    pub fn focus_pane_by_id(&mut self, id: PaneId, ctx: &mut ViewContext<Self>) -> bool {
         // If user clicks on a pane quickly after dragging the border, a race condition
         // could happen where the mouse down movement is considered as part of dragging.
         // We clear the dragging state here to avoid such conditions.
@@ -6659,6 +6700,9 @@ impl PaneGroup {
         if self.focus_pane_and_record_in_history(id, ctx) {
             ctx.emit(Event::AppStateChanged);
             ctx.emit(Event::PaneFocused);
+            true
+        } else {
+            false
         }
     }
 
@@ -7207,6 +7251,49 @@ impl PaneGroup {
         )
     }
 
+    fn apply_active_ssh_remote_to_terminal_options(
+        &self,
+        options: &mut NewTerminalOptions,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if options.shell.is_some() {
+            return;
+        }
+
+        let Some(host) = SshRemoteModel::as_ref(ctx).active_host().cloned() else {
+            return;
+        };
+
+        match ssh_remote_terminal_launch(&host, options.initial_directory.as_deref()) {
+            Ok((shell, env_vars)) => {
+                options.shell = Some(shell);
+                options.initial_directory = None;
+                options.env_vars.extend(env_vars);
+                options.hide_homepage = true;
+                options.ssh_remote_host_id = Some(host.id.clone());
+            }
+            Err(error) => {
+                log::error!("Failed to prepare SSH remote pane session: {error}");
+            }
+        }
+    }
+
+    pub(crate) fn add_session_with_terminal_options(
+        &mut self,
+        direction: Direction,
+        base_pane_id: Option<PaneId>,
+        options: NewTerminalOptions,
+        ctx: &mut ViewContext<Self>,
+    ) -> TerminalPaneId {
+        self.add_session_from_options(
+            direction,
+            base_pane_id,
+            options,
+            DefaultSessionModeBehavior::Ignore,
+            ctx,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn add_session_with_default_session_mode_behavior(
         &mut self,
@@ -7251,6 +7338,50 @@ impl PaneGroup {
             default_session_mode_behavior,
             ctx,
         )
+    }
+
+    fn add_session_from_options(
+        &mut self,
+        direction: Direction,
+        base_pane_id: Option<PaneId>,
+        options: NewTerminalOptions,
+        default_session_mode_behavior: DefaultSessionModeBehavior,
+        ctx: &mut ViewContext<Self>,
+    ) -> TerminalPaneId {
+        let should_immediately_enter_agent_view = matches!(
+            default_session_mode_behavior,
+            DefaultSessionModeBehavior::Apply
+        ) && options.conversation_restoration.is_none()
+            && AISettings::as_ref(ctx).default_session_mode(ctx) == DefaultSessionMode::Agent;
+
+        let (pane_data, view) = self.create_terminal_pane_data(
+            options.initial_directory,
+            options.env_vars,
+            options.is_shared_session_creator,
+            options.shell,
+            options.conversation_restoration,
+            ctx,
+        );
+        if let Some(host_id) = options.ssh_remote_host_id {
+            SshRemoteModel::handle(ctx).update(ctx, |model, ctx| {
+                model.register_terminal_host(view.id(), host_id, ctx);
+            });
+        }
+        let new_pane_id = pane_data.terminal_pane_id();
+
+        let _ = self.add_pane(direction, base_pane_id, Box::new(pane_data), true, ctx);
+
+        if should_immediately_enter_agent_view {
+            view.update(ctx, |terminal_view, ctx| {
+                terminal_view.enter_agent_view_for_new_conversation(
+                    None,
+                    AgentViewEntryOrigin::DefaultSessionMode,
+                    ctx,
+                );
+            });
+        }
+
+        new_pane_id
     }
 
     /// Creates a new terminal session and wraps it in a `TerminalPane`.
@@ -7313,36 +7444,20 @@ impl PaneGroup {
         default_session_mode_behavior: DefaultSessionModeBehavior,
         ctx: &mut ViewContext<Self>,
     ) -> TerminalPaneId {
-        let should_immediately_enter_agent_view = matches!(
-            default_session_mode_behavior,
-            DefaultSessionModeBehavior::Apply
-        ) && conversation_restoration.is_none()
-            && AISettings::as_ref(ctx).default_session_mode(ctx) == DefaultSessionMode::Agent;
-
-        let (pane_data, view) = self.create_terminal_pane_data(
-            startup_directory,
-            HashMap::new(),
-            IsSharedSessionCreator::No,
-            chosen_shell,
+        let mut options = NewTerminalOptions {
+            shell: chosen_shell,
+            initial_directory: startup_directory,
             conversation_restoration,
+            ..Default::default()
+        };
+        self.apply_active_ssh_remote_to_terminal_options(&mut options, ctx);
+        self.add_session_from_options(
+            direction,
+            base_pane_id,
+            options,
+            default_session_mode_behavior,
             ctx,
-        );
-        let new_pane_id = pane_data.terminal_pane_id();
-
-        let _ = self.add_pane(direction, base_pane_id, Box::new(pane_data), true, ctx);
-
-        // Enter agent view if default session mode is Agent and AI is enabled
-        if should_immediately_enter_agent_view {
-            view.update(ctx, |terminal_view, ctx| {
-                terminal_view.enter_agent_view_for_new_conversation(
-                    None,
-                    AgentViewEntryOrigin::DefaultSessionMode,
-                    ctx,
-                );
-            });
-        }
-
-        new_pane_id
+        )
     }
 
     /// Adds a new side-pane to this group, at the root of the pane tree.

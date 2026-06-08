@@ -13,7 +13,7 @@ use repo_metadata::file_tree_store::{
 };
 use repo_metadata::local_model::IndexedRepoState;
 use repo_metadata::repositories::DetectedRepositories;
-use repo_metadata::{FileTreeEntry, RepoMetadataModel};
+use repo_metadata::{FileMetadata, FileTreeEntry, RepoMetadataModel};
 use warp_core::features::FeatureFlag;
 use warp_core::ui::theme::color::internal_colors;
 use warp_core::ui::theme::Fill;
@@ -59,6 +59,9 @@ use crate::util::openable_file_type::{
 #[cfg(feature = "local_fs")]
 use crate::util::openable_file_type::{
     resolve_file_target_to_open_in_warp, resolve_file_target_with_editor_choice,
+};
+use crate::workspace::view::ssh_remote::{
+    list_remote_directories, ssh_remote_environment_id, SshRemoteDirectoryListing, SshRemoteHost,
 };
 
 mod editing;
@@ -278,6 +281,8 @@ pub struct FileTreeView {
     /// [`LocalRepoMetadataModel`] for file watching.
     #[cfg(feature = "local_fs")]
     registered_lazy_loaded_paths: HashSet<StandardizedPath>,
+    ssh_remote_root_hosts: HashMap<StandardizedPath, SshRemoteHost>,
+    ssh_remote_loading_paths: HashSet<StandardizedPath>,
     /// Directory the view wants to focus once its entry becomes available.
     ///
     /// Set when a descendant path is absorbed into an ancestor root but the
@@ -703,6 +708,8 @@ impl FileTreeView {
             explicitly_collapsed: HashMap::new(),
             #[cfg(feature = "local_fs")]
             registered_lazy_loaded_paths: HashSet::new(),
+            ssh_remote_root_hosts: HashMap::new(),
+            ssh_remote_loading_paths: HashSet::new(),
             pending_focus_target: None,
         };
 
@@ -956,6 +963,105 @@ impl FileTreeView {
             self.rebuild_flattened_items();
             ctx.notify();
         }
+    }
+
+    fn standardized_ssh_remote_path(path: &str) -> Option<StandardizedPath> {
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        StandardizedPath::try_new(trimmed).ok()
+    }
+
+    fn ssh_remote_root_path(host: &SshRemoteHost, path: &str) -> StandardizedPath {
+        Self::standardized_ssh_remote_path(path)
+            .or_else(|| Self::standardized_ssh_remote_path(&host.remote_setup_dir))
+            .or_else(|| Self::standardized_ssh_remote_path("/"))
+            .expect("fallback SSH remote root path should be absolute")
+    }
+
+    pub fn clear_ssh_remote_root_directories(&mut self, ctx: &mut ViewContext<Self>) {
+        if self.ssh_remote_root_hosts.is_empty() {
+            return;
+        }
+
+        let stale_paths: Vec<_> = self.ssh_remote_root_hosts.keys().cloned().collect();
+        for path in &stale_paths {
+            self.root_directories.remove(path);
+            self.displayed_directories
+                .retain(|displayed| displayed != path);
+            self.ssh_remote_loading_paths.remove(path);
+            self.explicitly_collapsed.remove(path);
+        }
+        self.ssh_remote_root_hosts.clear();
+        if self
+            .selected_item
+            .as_ref()
+            .is_some_and(|id| stale_paths.contains(&id.root))
+        {
+            self.selected_item = None;
+        }
+        self.rebuild_flattened_items();
+        ctx.notify();
+    }
+
+    pub fn set_ssh_remote_root_directory(
+        &mut self,
+        host: SshRemoteHost,
+        path: String,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let root_path = Self::ssh_remote_root_path(&host, &path);
+        let host_id = HostId::new(ssh_remote_environment_id(&host.id));
+
+        let stale_paths: Vec<_> = self
+            .ssh_remote_root_hosts
+            .keys()
+            .filter(|existing| **existing != root_path)
+            .cloned()
+            .collect();
+        for stale_path in &stale_paths {
+            self.root_directories.remove(stale_path);
+            self.displayed_directories
+                .retain(|displayed| displayed != stale_path);
+            self.ssh_remote_loading_paths.remove(stale_path);
+            self.explicitly_collapsed.remove(stale_path);
+        }
+
+        let host_changed = self
+            .ssh_remote_root_hosts
+            .get(&root_path)
+            .is_some_and(|existing| existing.id != host.id);
+        self.ssh_remote_root_hosts
+            .insert(root_path.clone(), host.clone());
+
+        let root_dir = self
+            .root_directories
+            .entry(root_path.clone())
+            .or_insert_with(|| RootDirectory {
+                entry: FileTreeEntry::new_for_directory(Arc::new(root_path.clone())),
+                expanded_folders: HashSet::new(),
+                items: Vec::new(),
+                item_states: HashMap::new(),
+                remote_host_id: Some(host_id.clone()),
+            });
+        if host_changed {
+            root_dir.entry = FileTreeEntry::new_for_directory(Arc::new(root_path.clone()));
+            root_dir.item_states.clear();
+        }
+        root_dir.remote_host_id = Some(host_id);
+        root_dir.expanded_folders.insert(root_path.clone());
+        if let Some(FileTreeEntryState::Directory(directory)) = root_dir.entry.get_mut(&root_path) {
+            directory.loaded = false;
+        }
+
+        if !self.displayed_directories.contains(&root_path) {
+            self.displayed_directories.push(root_path.clone());
+        }
+
+        self.ensure_loaded_path(&root_path, &root_path, ctx);
+        self.rebuild_flattened_items();
+        ctx.notify();
     }
 
     /// Sets the root directories to display in the file tree.
@@ -1385,6 +1491,11 @@ impl FileTreeView {
         target_item: &FileTreeEntryState,
         ctx: &mut ViewContext<Self>,
     ) {
+        if self.ssh_remote_root_hosts.contains_key(root_path) {
+            self.load_ssh_remote_directory(root_path, target_item, ctx);
+            return;
+        }
+
         // Check if this is a remote-backed root.
         if self
             .root_directories
@@ -1423,6 +1534,112 @@ impl FileTreeView {
             if let Some(root_dir) = self.root_directories.get_mut(root_path) {
                 root_dir.entry = state.entry.clone();
             }
+        }
+    }
+
+    fn load_ssh_remote_directory(
+        &mut self,
+        root_path: &StandardizedPath,
+        target_item: &FileTreeEntryState,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let Some(host) = self.ssh_remote_root_hosts.get(root_path).cloned() else {
+            return;
+        };
+        let dir_path = target_item.path().clone();
+        if !self.ssh_remote_loading_paths.insert(dir_path.clone()) {
+            return;
+        }
+
+        let root_path = root_path.clone();
+        let requested_path = dir_path.to_string();
+        ctx.spawn(
+            list_remote_directories(host, requested_path),
+            move |view, result, ctx| {
+                view.ssh_remote_loading_paths.remove(&dir_path);
+                match result {
+                    Ok(listing) => {
+                        view.apply_ssh_remote_listing(&root_path, listing);
+                        view.rebuild_flattened_items_for_root(&root_path);
+                        ctx.notify();
+                    }
+                    Err(error) => {
+                        log::warn!("Failed to load SSH remote directory {dir_path}: {error}");
+                        ctx.notify();
+                    }
+                }
+            },
+        );
+    }
+
+    fn apply_ssh_remote_listing(
+        &mut self,
+        root_path: &StandardizedPath,
+        listing: SshRemoteDirectoryListing,
+    ) {
+        let Some(dir_path) = Self::standardized_ssh_remote_path(&listing.path) else {
+            return;
+        };
+        if !dir_path.starts_with(root_path) {
+            return;
+        }
+
+        let Some(root_dir) = self.root_directories.get_mut(root_path) else {
+            return;
+        };
+
+        if !root_dir.entry.contains(&dir_path) {
+            if let Some(parent) = dir_path.parent() {
+                root_dir.entry.ensure_parent_directories_exist(&parent);
+                root_dir.entry.insert_child_state(
+                    &parent,
+                    FileTreeEntryState::Directory(FileTreeDirectoryEntryState {
+                        path: Arc::new(dir_path.clone()),
+                        ignored: false,
+                        loaded: false,
+                    }),
+                );
+            }
+        }
+
+        let existing_children: Vec<StandardizedPath> = root_dir
+            .entry
+            .child_paths(&dir_path)
+            .map(|path| path.as_ref().clone())
+            .collect();
+        let mut listed_children = HashSet::new();
+
+        for entry in listing.entries {
+            let Some(child_path) = Self::standardized_ssh_remote_path(&entry.path) else {
+                continue;
+            };
+            if !child_path.starts_with(root_path) {
+                continue;
+            }
+
+            listed_children.insert(child_path.clone());
+            let child_state = if entry.is_dir {
+                FileTreeEntryState::Directory(FileTreeDirectoryEntryState {
+                    path: Arc::new(child_path.clone()),
+                    ignored: false,
+                    loaded: false,
+                })
+            } else {
+                FileTreeEntryState::File(
+                    FileMetadata::from_standardized(child_path.clone(), false).into(),
+                )
+            };
+            root_dir.entry.insert_child_state(&dir_path, child_state);
+        }
+
+        for child_path in existing_children {
+            if !listed_children.contains(&child_path) {
+                root_dir.entry.remove(&child_path);
+            }
+        }
+
+        if let Some(FileTreeEntryState::Directory(directory)) = root_dir.entry.get_mut(&dir_path) {
+            directory.loaded = true;
         }
     }
 

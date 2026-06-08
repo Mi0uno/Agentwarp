@@ -1,9 +1,11 @@
 use ::ai::api_keys::{ApiKeyManager, ApiKeys};
 use enum_iterator::all;
 use itertools::Itertools;
+use pathfinder_color::ColorU;
 use pathfinder_geometry::vector::vec2f;
 use regex::Regex;
 use settings::{Setting, ToggleableSetting};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use strum::IntoEnumIterator;
 use warp_core::channel::ChannelState;
 use warp_core::context_flag::ContextFlag;
@@ -12,16 +14,19 @@ use warp_core::ui::color::contrast::MinimumAllowedContrast;
 use warp_core::ui::color::ContrastingColor;
 use warp_core::ui::theme::color::internal_colors;
 use warp_core::ui::theme::Fill as ThemeFill;
+use warpui::clipboard::ClipboardContent;
 use warpui::elements::{
-    Border, ChildAnchor, ChildView, ConstrainedBox, Container, CornerRadius, CrossAxisAlignment,
-    Dismiss, Empty, Expanded, Fill, Flex, FormattedTextElement, HighlightedHyperlink, Hoverable,
+    Align, Border, ChildAnchor, ChildView, ClippedScrollStateHandle, ClippedScrollable,
+    ConstrainedBox, Container, CornerRadius, CrossAxisAlignment, Dismiss, Empty, Expanded,
+    Fill as ElementFill, Fill, Flex, FormattedTextElement, HighlightedHyperlink, Hoverable,
     HyperlinkLens, HyperlinkUrl, MainAxisAlignment, MainAxisSize, MouseStateHandle,
-    OffsetPositioning, ParentAnchor, ParentElement, ParentOffsetBounds, Radius, Shrinkable, Stack,
-    Text,
+    OffsetPositioning, ParentAnchor, ParentElement, ParentOffsetBounds, Radius, ScrollbarWidth,
+    Shrinkable, Stack, Text,
 };
 use warpui::fonts::{Properties, Weight};
 use warpui::keymap::{ContextPredicate, Keystroke};
 use warpui::platform::Cursor;
+use warpui::r#async::Timer;
 use warpui::ui_components::button::ButtonVariant;
 use warpui::ui_components::components::{Coords, UiComponent, UiComponentStyles};
 use warpui::ui_components::slider::SliderStateHandle;
@@ -73,20 +78,24 @@ use crate::auth::AuthStateProvider;
 use crate::cloud_object::model::persistence::{CloudModel, CloudModelEvent};
 use crate::cloud_object::GenericStringObjectFormat::Json;
 use crate::cloud_object::{JsonObjectType, ObjectType};
-use crate::editor::{EditorOptions, InteractionState, SingleLineEditorOptions, TextColors};
+use crate::editor::{
+    EditorOptions, EnterAction, EnterSettings, InteractionState, SingleLineEditorOptions,
+    TextColors,
+};
 use crate::modal::{Modal, ModalEvent, ModalViewState};
 use crate::settings::{
     AIAutoDetectionEnabled, AICommandDenylist, AISettingsChangedEvent,
     AgentModeCodingPermissionsType, AgentModeCommandExecutionDenylist,
     AgentModeCommandExecutionPredicate, AgentModeQuerySuggestionsEnabled, AwsBedrockAutoLogin,
-    AwsBedrockCredentialsEnabled, CanUseWarpCreditsForFallback, CodeSettings,
-    CodebaseContextEnabled, FileBasedMcpEnabled, GitOperationsAutogenEnabled,
+    AwsBedrockCredentialsEnabled, CLIAgentApiModelMapping, CLIAgentApiProfile,
+    CLIAgentApiProfileHealth, CLIAgentBuiltinPromptMode, CanUseWarpCreditsForFallback,
+    CodeSettings, CodebaseContextEnabled, FileBasedMcpEnabled, GitOperationsAutogenEnabled,
     IncludeAgentCommandsInHistory, InputSettings, IntelligentAutosuggestionsEnabled, MemoryEnabled,
     NLDInTerminalEnabled, NaturalLanguageAutosuggestionsEnabled, PromptSubmissionMode,
     RuleSuggestionsEnabled, SharedBlockTitleGenerationEnabled, ShouldRenderCLIAgentToolbar,
     ShouldRenderUseAgentToolbarForUserCommands, ShouldShowOzUpdatesInZeroState, ShowAgentTips,
     ShowConversationHistory, ShowHintText, ThinkingDisplayMode, VoiceInputEnabled,
-    WarpDriveContextEnabled,
+    WarpDriveContextEnabled, CLI_AGENT_API_ALL_ENVIRONMENTS_ID, CLI_AGENT_API_LOCAL_ENVIRONMENT_ID,
 };
 use crate::terminal::session_settings::{SessionSettings, SessionSettingsChangedEvent};
 use crate::terminal::CLIAgent;
@@ -107,8 +116,12 @@ pub enum AISubpage {
     Profiles,
     /// Knowledge / Rules settings.
     Knowledge,
+    /// Built-in prompt settings for supported third-party CLI agents.
+    BuiltinPrompts,
     /// Third-party CLI agent settings.
     ThirdPartyCLIAgents,
+    /// Unified API endpoint, model mapping, and failover settings for CLI agents.
+    AgentApiProfiles,
 }
 
 impl AISubpage {
@@ -117,7 +130,9 @@ impl AISubpage {
             SettingsSection::WarpAgent => Some(Self::WarpAgent),
             SettingsSection::AgentProfiles => Some(Self::Profiles),
             SettingsSection::Knowledge => Some(Self::Knowledge),
+            SettingsSection::AgentBuiltinPrompts => Some(Self::BuiltinPrompts),
             SettingsSection::ThirdPartyCLIAgents => Some(Self::ThirdPartyCLIAgents),
+            SettingsSection::AgentApiProfiles => Some(Self::AgentApiProfiles),
             // AgentMCPServers renders the standalone MCPServers page, not an AI subpage.
             _ => None,
         }
@@ -126,6 +141,7 @@ impl AISubpage {
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::fs;
 use std::ops::Not;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
@@ -146,6 +162,10 @@ use crate::ui_components::icons::Icon;
 use crate::util::bindings;
 use crate::view_components::dropdown::DropdownAction;
 use crate::view_components::{Dropdown, DropdownItem};
+use crate::workspace::view::ssh_remote::{
+    ssh_remote_environment_id, sync_remote_claude_agent_api_settings,
+    sync_remote_codex_agent_api_settings, SshRemoteModel,
+};
 use crate::workspaces::workspace::{AdminEnablementSetting, CustomerType};
 use crate::{
     report_error, report_if_error, send_telemetry_from_ctx, TelemetryEvent, UserWorkspaces,
@@ -158,6 +178,38 @@ const AI_SETTINGS_DROPDOWN_WIDTH: f32 = 250.;
 const AI_SETTINGS_DROPDOWN_MAX_HEIGHT: f32 = 250.;
 const CONTEXT_WINDOW_SLIDER_WIDTH: f32 = 220.;
 const CONTEXT_WINDOW_INPUT_BOX_WIDTH: f32 = 120.;
+
+const CLI_AGENT_API_CUSTOM_PRESET_ID: &str = "custom";
+const CLI_AGENT_API_ANTHROPIC_BASE_URL_ENV_KEY: &str = "ANTHROPIC_BASE_URL";
+const CLI_AGENT_API_OPENAI_BASE_URL_ENV_KEY: &str = "OPENAI_BASE_URL";
+const CLI_AGENT_API_CLAUDE_SETTINGS_ENV_KEYS: &[&str] = &[
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME",
+];
+const CLI_AGENT_API_CODEX_SETTINGS_ENV_KEYS: &[&str] =
+    &["OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL"];
+const CLI_AGENT_API_CODEX_MODEL_MIGRATION_TARGET: &str = "gpt-5.4";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CLIAgentApiProfilePreset {
+    id: &'static str,
+    label: &'static str,
+    profile_name: &'static str,
+    agent: CLIAgent,
+    base_url: &'static str,
+    model: &'static str,
+    priority: u32,
+}
+
+const CLI_AGENT_API_PROFILE_PRESETS: &[CLIAgentApiProfilePreset] = &[];
 
 const NEXT_COMMAND_DESCRIPTION: &str = "Let AI suggest the next command to run based on your command history, outputs, and common workflows.";
 const PROMPT_SUGGESTIONS_DESCRIPTION: &str = "Let AI suggest natural language prompts, as inline banners in the input, based on recent commands and their outputs.";
@@ -604,6 +656,55 @@ pub struct AISettingsPageView {
     cli_agent_footer_command_editor: ViewHandle<SubmittableTextInput>,
     cli_agent_footer_command_mouse_state_handles: Vec<MouseStateHandle>,
     cli_agent_footer_command_agent_dropdowns: Vec<ViewHandle<Dropdown<AISettingsPageAction>>>,
+    cli_agent_builtin_prompt_editors: Vec<ViewHandle<EditorView>>,
+    cli_agent_builtin_prompt_mode_dropdowns: Vec<ViewHandle<Dropdown<AISettingsPageAction>>>,
+    cli_agent_api_profile_preset_dropdown: ViewHandle<Dropdown<AISettingsPageAction>>,
+    cli_agent_api_profile_selected_preset_id: String,
+    cli_agent_api_profile_agent_dropdown: ViewHandle<Dropdown<AISettingsPageAction>>,
+    cli_agent_api_profile_environment_dropdown: ViewHandle<Dropdown<AISettingsPageAction>>,
+    cli_agent_api_profile_draft_agent: CLIAgent,
+    cli_agent_api_profile_draft_environment_id: String,
+    cli_agent_api_profile_editing_profile_id: Option<String>,
+    cli_agent_api_profile_editor_open: bool,
+    cli_agent_api_profile_modal_scroll_state: ClippedScrollStateHandle,
+    cli_agent_api_profile_name_editor: ViewHandle<EditorView>,
+    cli_agent_api_profile_base_url_editor: ViewHandle<EditorView>,
+    cli_agent_api_profile_openai_base_url_editor: ViewHandle<EditorView>,
+    cli_agent_api_profile_api_format_editor: ViewHandle<EditorView>,
+    cli_agent_api_profile_auth_env_var_editor: ViewHandle<EditorView>,
+    cli_agent_api_profile_full_url_mode_editor: ViewHandle<EditorView>,
+    cli_agent_api_profile_api_key_editor: ViewHandle<EditorView>,
+    cli_agent_api_profile_model_editor: ViewHandle<EditorView>,
+    cli_agent_api_profile_model_catalog_editor: ViewHandle<EditorView>,
+    cli_agent_api_profile_model_mappings_editor: ViewHandle<EditorView>,
+    cli_agent_api_profile_priority_editor: ViewHandle<EditorView>,
+    cli_agent_api_profile_input_cost_editor: ViewHandle<EditorView>,
+    cli_agent_api_profile_output_cost_editor: ViewHandle<EditorView>,
+    cli_agent_api_profile_extra_env_editor: ViewHandle<EditorView>,
+    cli_agent_api_profile_fetched_models: Vec<String>,
+    cli_agent_api_profile_selected_fetched_model: String,
+    cli_agent_api_profile_fetch_models_error: Option<String>,
+    cli_agent_api_profile_fetching_models: bool,
+    cli_agent_api_profile_fetch_models_request_id: u64,
+    cli_agent_api_profile_model_picker_dropdown: ViewHandle<Dropdown<AISettingsPageAction>>,
+    cli_agent_api_profile_add_model_open: bool,
+    cli_agent_api_profile_model_mapping_open: bool,
+    cli_agent_api_profile_save_feedback: Option<String>,
+    cli_agent_api_profile_save_feedback_is_error: bool,
+    cli_agent_api_profile_save_feedback_generation: u64,
+    cli_agent_api_profile_open_add_button: ViewHandle<ActionButton>,
+    cli_agent_api_profile_add_button: ViewHandle<ActionButton>,
+    cli_agent_api_profile_cancel_edit_button: ViewHandle<ActionButton>,
+    cli_agent_api_profile_fetch_models_button: ViewHandle<ActionButton>,
+    cli_agent_api_profile_toggle_add_model_button: ViewHandle<ActionButton>,
+    cli_agent_api_profile_add_manual_model_button: ViewHandle<ActionButton>,
+    cli_agent_api_profile_add_selected_model_button: ViewHandle<ActionButton>,
+    cli_agent_api_profiles_json_editor: ViewHandle<EditorView>,
+    cli_agent_api_profile_mouse_state_handles: Vec<MouseStateHandle>,
+    cli_agent_api_profile_edit_mouse_state_handles: Vec<MouseStateHandle>,
+    cli_agent_api_profile_check_mouse_state_handles: Vec<MouseStateHandle>,
+    cli_agent_api_profile_toggle_mouse_state_handles: Vec<MouseStateHandle>,
+    cli_agent_api_profile_remove_mouse_state_handles: Vec<MouseStateHandle>,
     agent_toolbar_inline_editor: ViewHandle<AgentToolbarInlineEditor>,
     cli_agent_toolbar_inline_editor: ViewHandle<AgentToolbarInlineEditor>,
 
@@ -970,6 +1071,237 @@ impl AISettingsPageView {
             },
         );
 
+        let cli_agent_builtin_prompt_editors = Self::create_cli_agent_builtin_prompt_editors(ctx);
+        let cli_agent_builtin_prompt_mode_dropdowns =
+            Self::create_cli_agent_builtin_prompt_mode_dropdowns(ctx);
+        let cli_agent_api_profile_selected_preset_id = CLI_AGENT_API_CUSTOM_PRESET_ID.to_owned();
+        let initial_cli_agent_api_profile = AISettings::as_ref(ctx)
+            .cli_agent_api_profiles()
+            .profiles
+            .into_iter()
+            .next();
+        let cli_agent_api_profile_preset_dropdown =
+            Self::create_cli_agent_api_profile_preset_dropdown(
+                &cli_agent_api_profile_selected_preset_id,
+                ctx,
+            );
+        let cli_agent_api_profile_draft_agent = initial_cli_agent_api_profile
+            .as_ref()
+            .map(CLIAgentApiProfile::agent)
+            .unwrap_or(CLIAgent::Claude);
+        let cli_agent_api_profile_draft_environment_id = initial_cli_agent_api_profile
+            .as_ref()
+            .map(|profile| profile.environment_id.clone())
+            .unwrap_or_else(|| CLI_AGENT_API_ALL_ENVIRONMENTS_ID.to_owned());
+        let cli_agent_api_profile_agent_dropdown =
+            Self::create_cli_agent_api_profile_agent_dropdown(
+                cli_agent_api_profile_draft_agent,
+                ctx,
+            );
+        let cli_agent_api_profile_environment_dropdown =
+            Self::create_cli_agent_api_profile_environment_dropdown(
+                &cli_agent_api_profile_draft_environment_id,
+                ctx,
+            );
+        let cli_agent_api_profile_name_editor =
+            Self::create_cli_agent_api_profile_editor("Profile name", false, ctx);
+        let cli_agent_api_profile_base_url_editor = Self::create_cli_agent_api_profile_editor(
+            "https://api.example.com/anthropic",
+            false,
+            ctx,
+        );
+        let cli_agent_api_profile_openai_base_url_editor =
+            Self::create_cli_agent_api_profile_editor("https://api.example.com", false, ctx);
+        let cli_agent_api_profile_api_format_editor = Self::create_cli_agent_api_profile_editor(
+            "anthropic_messages / openai_chat / gemini",
+            false,
+            ctx,
+        );
+        let cli_agent_api_profile_auth_env_var_editor =
+            Self::create_cli_agent_api_profile_editor("ANTHROPIC_AUTH_TOKEN", false, ctx);
+        let cli_agent_api_profile_full_url_mode_editor =
+            Self::create_cli_agent_api_profile_editor("false", false, ctx);
+        let cli_agent_api_profile_api_key_editor =
+            Self::create_cli_agent_api_profile_editor("API key", true, ctx);
+        let cli_agent_api_profile_model_editor =
+            Self::create_cli_agent_api_profile_editor("Optional model", false, ctx);
+        let cli_agent_api_profile_model_catalog_editor =
+            Self::create_cli_agent_api_profile_multiline_editor(
+                "One model id per line, e.g. claude-3-5-sonnet-latest",
+                ctx,
+            );
+        let cli_agent_api_profile_model_mappings_editor =
+            Self::create_cli_agent_api_profile_multiline_editor(
+                "Role, display, request model, 1M flag; e.g. Sonnet=qwen3.5-plus",
+                ctx,
+            );
+        let cli_agent_api_profile_priority_editor =
+            Self::create_cli_agent_api_profile_editor("0", false, ctx);
+        let cli_agent_api_profile_input_cost_editor =
+            Self::create_cli_agent_api_profile_editor("0.00", false, ctx);
+        let cli_agent_api_profile_output_cost_editor =
+            Self::create_cli_agent_api_profile_editor("0.00", false, ctx);
+        let cli_agent_api_profile_extra_env_editor =
+            Self::create_cli_agent_api_profile_extra_env_editor(ctx);
+        if let Some(profile) = initial_cli_agent_api_profile.as_ref() {
+            let anthropic_base_url = Self::cli_agent_api_profile_anthropic_base_url(profile);
+            let openai_base_url = Self::cli_agent_api_profile_openai_base_url(profile);
+            for (editor, text) in [
+                (&cli_agent_api_profile_name_editor, profile.name.clone()),
+                (&cli_agent_api_profile_base_url_editor, anthropic_base_url),
+                (
+                    &cli_agent_api_profile_openai_base_url_editor,
+                    openai_base_url,
+                ),
+                (
+                    &cli_agent_api_profile_api_format_editor,
+                    profile.api_format.clone(),
+                ),
+                (
+                    &cli_agent_api_profile_auth_env_var_editor,
+                    profile.auth_env_var.clone(),
+                ),
+                (
+                    &cli_agent_api_profile_full_url_mode_editor,
+                    profile.full_url_mode.to_string(),
+                ),
+                (
+                    &cli_agent_api_profile_api_key_editor,
+                    profile.api_key.clone(),
+                ),
+                (&cli_agent_api_profile_model_editor, profile.model.clone()),
+                (
+                    &cli_agent_api_profile_model_catalog_editor,
+                    Self::format_cli_agent_api_model_catalog(&profile.model_catalog),
+                ),
+                (
+                    &cli_agent_api_profile_model_mappings_editor,
+                    Self::format_cli_agent_api_model_mappings(&profile.model_mappings),
+                ),
+                (
+                    &cli_agent_api_profile_priority_editor,
+                    profile.priority.to_string(),
+                ),
+                (
+                    &cli_agent_api_profile_input_cost_editor,
+                    profile.input_cost_per_million_tokens.to_string(),
+                ),
+                (
+                    &cli_agent_api_profile_output_cost_editor,
+                    profile.output_cost_per_million_tokens.to_string(),
+                ),
+                (
+                    &cli_agent_api_profile_extra_env_editor,
+                    Self::format_cli_agent_api_extra_env(&profile.extra_env),
+                ),
+            ] {
+                editor.update(ctx, |editor, ctx| editor.set_buffer_text(&text, ctx));
+            }
+        }
+        let cli_agent_api_profile_open_add_button = ctx.add_typed_action_view(|_| {
+            ActionButton::new("添加供应商", SecondaryTheme)
+                .with_icon(Icon::Plus)
+                .with_size(ButtonSize::Small)
+                .on_click(|ctx| {
+                    ctx.dispatch_typed_action(AISettingsPageAction::OpenAddCLIAgentApiProfileModal);
+                })
+        });
+        let cli_agent_api_profile_add_button = ctx.add_typed_action_view(|_| {
+            ActionButton::new("保存", SecondaryTheme)
+                .with_icon(Icon::Check)
+                .with_size(ButtonSize::Small)
+                .on_click(|ctx| {
+                    ctx.dispatch_typed_action(AISettingsPageAction::AddCLIAgentApiProfile);
+                })
+        });
+        let cli_agent_api_profile_cancel_edit_button = ctx.add_typed_action_view(|_| {
+            ActionButton::new("Cancel", SecondaryTheme)
+                .with_size(ButtonSize::Small)
+                .on_click(|ctx| {
+                    ctx.dispatch_typed_action(AISettingsPageAction::CancelEditCLIAgentApiProfile);
+                })
+        });
+        let cli_agent_api_profile_fetch_models_button = ctx.add_typed_action_view(|_| {
+            ActionButton::new("获取模型", SecondaryTheme)
+                .with_icon(Icon::RefreshCw04)
+                .with_size(ButtonSize::Small)
+                .on_click(|ctx| {
+                    ctx.dispatch_typed_action(AISettingsPageAction::FetchCLIAgentApiProfileModels);
+                })
+        });
+        let cli_agent_api_profile_toggle_add_model_button = ctx.add_typed_action_view(|_| {
+            ActionButton::new("添加模型", SecondaryTheme)
+                .with_icon(Icon::Plus)
+                .with_size(ButtonSize::Small)
+                .on_click(|ctx| {
+                    ctx.dispatch_typed_action(
+                        AISettingsPageAction::ToggleCLIAgentApiProfileAddModel,
+                    );
+                })
+        });
+        let cli_agent_api_profile_add_manual_model_button = ctx.add_typed_action_view(|_| {
+            ActionButton::new("添加", SecondaryTheme)
+                .with_icon(Icon::Plus)
+                .with_size(ButtonSize::Small)
+                .on_click(|ctx| {
+                    ctx.dispatch_typed_action(
+                        AISettingsPageAction::AddCLIAgentApiProfileDraftModel,
+                    );
+                })
+        });
+        let cli_agent_api_profile_add_selected_model_button = ctx.add_typed_action_view(|_| {
+            ActionButton::new("添加所选", SecondaryTheme)
+                .with_icon(Icon::Check)
+                .with_size(ButtonSize::Small)
+                .on_click(|ctx| {
+                    ctx.dispatch_typed_action(
+                        AISettingsPageAction::AddCLIAgentApiProfileSelectedFetchedModel,
+                    );
+                })
+        });
+        let initial_cli_agent_api_fetched_models = initial_cli_agent_api_profile
+            .as_ref()
+            .map(|profile| profile.model_catalog.clone())
+            .unwrap_or_default();
+        let initial_cli_agent_api_selected_fetched_model = initial_cli_agent_api_profile
+            .as_ref()
+            .map(|profile| profile.preferred_model())
+            .filter(|model| !model.trim().is_empty())
+            .or_else(|| initial_cli_agent_api_fetched_models.first().cloned())
+            .unwrap_or_default();
+        let cli_agent_api_profile_model_picker_dropdown =
+            Self::create_cli_agent_api_profile_model_picker_dropdown(
+                &initial_cli_agent_api_selected_fetched_model,
+                &initial_cli_agent_api_fetched_models,
+                ctx,
+            );
+        let cli_agent_api_profiles_json_editor =
+            Self::create_cli_agent_api_profiles_json_editor(ctx);
+        let cli_agent_api_profile_count = AISettings::as_ref(ctx)
+            .cli_agent_api_profiles()
+            .profiles
+            .len();
+        let cli_agent_api_profile_mouse_state_handles = (0..cli_agent_api_profile_count)
+            .map(|_| Default::default())
+            .collect();
+        let cli_agent_api_profile_edit_mouse_state_handles = (0..cli_agent_api_profile_count)
+            .map(|_| Default::default())
+            .collect();
+        let cli_agent_api_profile_check_mouse_state_handles = (0..cli_agent_api_profile_count)
+            .map(|_| Default::default())
+            .collect();
+        let cli_agent_api_profile_toggle_mouse_state_handles = (0..cli_agent_api_profile_count)
+            .map(|_| Default::default())
+            .collect();
+        let cli_agent_api_profile_remove_mouse_state_handles = (0..cli_agent_api_profile_count)
+            .map(|_| Default::default())
+            .collect();
+
+        ctx.subscribe_to_model(&SshRemoteModel::handle(ctx), |me, _, _, ctx| {
+            me.refresh_cli_agent_api_profile_environment_dropdown(ctx);
+            ctx.notify();
+        });
+
         let request_usage_model = AIRequestUsageModel::handle(ctx);
         ctx.subscribe_to_model(&request_usage_model, |_, _, _, ctx| {
             // The only event is RequestUsageUpdated
@@ -1191,6 +1523,13 @@ impl AISettingsPageView {
                         .collect();
                     me.cli_agent_footer_command_agent_dropdowns =
                         Self::create_cli_agent_dropdowns(ctx);
+                }
+                AISettingsChangedEvent::CLIAgentBuiltinPrompts { .. } => {
+                    me.sync_cli_agent_builtin_prompt_editors(ctx);
+                    me.refresh_cli_agent_builtin_prompt_mode_dropdowns(ctx);
+                }
+                AISettingsChangedEvent::CLIAgentApiProfiles { .. } => {
+                    me.sync_cli_agent_api_profile_mouse_state_handles(ctx);
                 }
                 AISettingsChangedEvent::ThinkingDisplayMode { .. } => {
                     let current_mode = *AISettings::as_ref(ctx).thinking_display_mode.value();
@@ -1705,6 +2044,58 @@ impl AISettingsPageView {
             cli_agent_footer_command_editor,
             cli_agent_footer_command_mouse_state_handles,
             cli_agent_footer_command_agent_dropdowns: Self::create_cli_agent_dropdowns(ctx),
+            cli_agent_builtin_prompt_editors,
+            cli_agent_builtin_prompt_mode_dropdowns,
+            cli_agent_api_profile_preset_dropdown,
+            cli_agent_api_profile_selected_preset_id,
+            cli_agent_api_profile_agent_dropdown,
+            cli_agent_api_profile_environment_dropdown,
+            cli_agent_api_profile_draft_agent,
+            cli_agent_api_profile_draft_environment_id,
+            cli_agent_api_profile_editing_profile_id: initial_cli_agent_api_profile
+                .as_ref()
+                .map(|profile| profile.id.clone()),
+            cli_agent_api_profile_editor_open: false,
+            cli_agent_api_profile_modal_scroll_state: ClippedScrollStateHandle::default(),
+            cli_agent_api_profile_name_editor,
+            cli_agent_api_profile_base_url_editor,
+            cli_agent_api_profile_openai_base_url_editor,
+            cli_agent_api_profile_api_format_editor,
+            cli_agent_api_profile_auth_env_var_editor,
+            cli_agent_api_profile_full_url_mode_editor,
+            cli_agent_api_profile_api_key_editor,
+            cli_agent_api_profile_model_editor,
+            cli_agent_api_profile_model_catalog_editor,
+            cli_agent_api_profile_model_mappings_editor,
+            cli_agent_api_profile_priority_editor,
+            cli_agent_api_profile_input_cost_editor,
+            cli_agent_api_profile_output_cost_editor,
+            cli_agent_api_profile_extra_env_editor,
+            cli_agent_api_profile_fetched_models: initial_cli_agent_api_fetched_models,
+            cli_agent_api_profile_selected_fetched_model:
+                initial_cli_agent_api_selected_fetched_model,
+            cli_agent_api_profile_fetch_models_error: None,
+            cli_agent_api_profile_fetching_models: false,
+            cli_agent_api_profile_fetch_models_request_id: 0,
+            cli_agent_api_profile_model_picker_dropdown,
+            cli_agent_api_profile_add_model_open: false,
+            cli_agent_api_profile_model_mapping_open: false,
+            cli_agent_api_profile_save_feedback: None,
+            cli_agent_api_profile_save_feedback_is_error: false,
+            cli_agent_api_profile_save_feedback_generation: 0,
+            cli_agent_api_profile_open_add_button,
+            cli_agent_api_profile_add_button,
+            cli_agent_api_profile_cancel_edit_button,
+            cli_agent_api_profile_fetch_models_button,
+            cli_agent_api_profile_toggle_add_model_button,
+            cli_agent_api_profile_add_manual_model_button,
+            cli_agent_api_profile_add_selected_model_button,
+            cli_agent_api_profiles_json_editor,
+            cli_agent_api_profile_mouse_state_handles,
+            cli_agent_api_profile_edit_mouse_state_handles,
+            cli_agent_api_profile_check_mouse_state_handles,
+            cli_agent_api_profile_toggle_mouse_state_handles,
+            cli_agent_api_profile_remove_mouse_state_handles,
             agent_toolbar_inline_editor,
             cli_agent_toolbar_inline_editor,
             base_model_dropdown,
@@ -1761,7 +2152,9 @@ impl AISettingsPageView {
     }
 
     pub fn get_modal_content(&self, app: &AppContext) -> Option<Box<dyn Element>> {
-        if self.custom_endpoint_modal_state.is_open() {
+        if self.cli_agent_api_profile_editor_open {
+            Some(self.render_cli_agent_api_profile_editor_modal(app))
+        } else if self.custom_endpoint_modal_state.is_open() {
             Some(self.custom_endpoint_modal_state.render())
         } else if self
             .remove_custom_endpoint_confirmation_dialog
@@ -1772,6 +2165,117 @@ impl AISettingsPageView {
         } else {
             None
         }
+    }
+
+    fn render_cli_agent_api_profile_editor_modal(&self, app: &AppContext) -> Box<dyn Element> {
+        let appearance = Appearance::as_ref(app);
+        let theme = appearance.theme();
+        let is_editing = self.cli_agent_api_profile_editing_profile_id.is_some();
+        let title = if is_editing {
+            "Edit Agent API endpoint"
+        } else {
+            "Add Agent API endpoint"
+        };
+
+        let close_button = appearance
+            .ui_builder()
+            .close_button(22., MouseStateHandle::default())
+            .build()
+            .on_click(|ctx, _, _| {
+                ctx.dispatch_typed_action(AISettingsPageAction::CancelEditCLIAgentApiProfile);
+            })
+            .finish();
+        let header = Container::new(
+            Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
+                .with_child(
+                    Text::new_inline(title, appearance.header_font_family(), 16.)
+                        .with_color(theme.active_ui_text_color().into())
+                        .with_style(Properties::default().weight(Weight::Semibold))
+                        .finish(),
+                )
+                .with_child(close_button)
+                .finish(),
+        )
+        .with_horizontal_padding(18.)
+        .with_vertical_padding(12.)
+        .with_border(Border::bottom(1.).with_border_fill(theme.outline()))
+        .finish();
+
+        let form = CLIAgentApiProfilesWidget.render_profile_form(self, appearance, app);
+        let scrollable = ClippedScrollable::vertical(
+            self.cli_agent_api_profile_modal_scroll_state.clone(),
+            form,
+            ScrollbarWidth::Custom(4.),
+            theme.nonactive_ui_detail().into(),
+            theme.active_ui_detail().into(),
+            ElementFill::None,
+        )
+        .with_overlayed_scrollbar()
+        .finish();
+        let body = ConstrainedBox::new(
+            Container::new(scrollable)
+                .with_uniform_padding(14.)
+                .with_background(theme.surface_2())
+                .finish(),
+        )
+        .with_max_height(460.)
+        .finish();
+
+        let footer_actions = Flex::row()
+            .with_spacing(8.)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_child(
+                self.cli_agent_api_profile_cancel_edit_button
+                    .as_ref(app)
+                    .render(app),
+            )
+            .with_child(
+                self.cli_agent_api_profile_add_button
+                    .as_ref(app)
+                    .render(app),
+            )
+            .finish();
+        let footer = Container::new(
+            Flex::row()
+                .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_main_axis_size(MainAxisSize::Max)
+                .with_child(
+                    self.cli_agent_api_profile_fetch_models_button
+                        .as_ref(app)
+                        .render(app),
+                )
+                .with_child(footer_actions)
+                .finish(),
+        )
+        .with_horizontal_padding(18.)
+        .with_vertical_padding(10.)
+        .with_border(Border::top(1.).with_border_fill(theme.outline()))
+        .finish();
+
+        let modal = ConstrainedBox::new(
+            Container::new(
+                Flex::column()
+                    .with_child(header)
+                    .with_child(body)
+                    .with_child(footer)
+                    .finish(),
+            )
+            .with_background(theme.surface_1())
+            .with_border(Border::all(1.).with_border_fill(theme.outline()))
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
+            .finish(),
+        )
+        .with_max_width(780.)
+        .with_max_height(620.)
+        .finish();
+
+        Container::new(Align::new(modal).finish())
+            .with_background_color(ColorU::new(0, 0, 0, 179))
+            .with_corner_radius(app.windows().window_corner_radius())
+            .finish()
     }
 
     fn sync_custom_endpoint_buttons(&mut self, ctx: &mut ViewContext<Self>) {
@@ -2109,6 +2613,7 @@ impl AISettingsPageView {
                 }
                 widgets.push(Box::new(CloudHandoffWidget::default()));
                 widgets.push(Box::new(CLIAgentWidget::default()));
+                widgets.push(Box::new(CLIAgentBuiltinPromptsWidget::default()));
                 widgets.push(Box::new(ApiKeysWidget::new(ctx)));
                 widgets.push(Box::new(AwsBedrockWidget::new(ctx)));
                 widgets.push(Box::new(AgentAttributionWidget::default()));
@@ -2171,6 +2676,12 @@ impl AISettingsPageView {
             }
             Some(AISubpage::ThirdPartyCLIAgents) => {
                 widgets.push(Box::new(CLIAgentWidget::default()));
+            }
+            Some(AISubpage::AgentApiProfiles) => {
+                widgets.push(Box::new(CLIAgentApiProfilesWidget::default()));
+            }
+            Some(AISubpage::BuiltinPrompts) => {
+                widgets.push(Box::new(CLIAgentBuiltinPromptsWidget::default()));
             }
         }
 
@@ -2712,6 +3223,2100 @@ impl AISettingsPageView {
         Self::refresh_menu_dropdown(menu, AISettingsPageAction::AddToMCPDenylist, ctx);
     }
 
+    fn create_cli_agent_builtin_prompt_editors(
+        ctx: &mut ViewContext<Self>,
+    ) -> Vec<ViewHandle<EditorView>> {
+        AISettings::cli_agent_builtin_prompt_agents()
+            .into_iter()
+            .map(|agent| {
+                let initial_prompt = AISettings::as_ref(ctx)
+                    .cli_agent_builtin_prompt(agent)
+                    .prompt
+                    .clone();
+                let editor = ctx.add_typed_action_view(move |ctx| {
+                    let appearance = Appearance::handle(ctx).as_ref(ctx);
+                    let options = EditorOptions {
+                        autogrow: true,
+                        soft_wrap: true,
+                        placeholder_soft_wrap: true,
+                        enter_settings: EnterSettings {
+                            enter: EnterAction::Emit,
+                            ..Default::default()
+                        },
+                        text: TextOptions {
+                            font_size_override: Some(appearance.ui_font_size()),
+                            font_family_override: Some(appearance.monospace_font_family()),
+                            text_colors_override: Some(TextColors {
+                                default_color: appearance.theme().active_ui_text_color(),
+                                disabled_color: appearance.theme().disabled_ui_text_color(),
+                                hint_color: appearance.theme().disabled_ui_text_color(),
+                            }),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    };
+                    let mut editor = EditorView::new(options, ctx);
+                    editor.set_placeholder_text(
+                        format!("Custom system prompt for {}", agent.display_name()),
+                        ctx,
+                    );
+                    editor.set_buffer_text(&initial_prompt, ctx);
+                    editor
+                });
+
+                ctx.subscribe_to_view(&editor, move |_, editor, event, ctx| match event {
+                    EditorEvent::Blurred | EditorEvent::Enter => {
+                        let prompt = editor.as_ref(ctx).buffer_text(ctx);
+                        AISettings::handle(ctx).update(ctx, |settings, ctx| {
+                            settings.set_cli_agent_builtin_prompt_text(agent, prompt, ctx);
+                        });
+                    }
+                    EditorEvent::Escape => ctx.emit(AISettingsPageEvent::FocusModal),
+                    _ => {}
+                });
+
+                editor
+            })
+            .collect()
+    }
+
+    fn create_cli_agent_builtin_prompt_mode_dropdowns(
+        ctx: &mut ViewContext<Self>,
+    ) -> Vec<ViewHandle<Dropdown<AISettingsPageAction>>> {
+        AISettings::cli_agent_builtin_prompt_agents()
+            .into_iter()
+            .map(|agent| {
+                ctx.add_typed_action_view(move |ctx| {
+                    let mut dropdown = Dropdown::new(ctx);
+                    dropdown.set_top_bar_max_width(160.);
+                    dropdown.set_menu_width(180., ctx);
+                    dropdown.set_main_axis_size(MainAxisSize::Min, ctx);
+
+                    dropdown.add_items(
+                        CLIAgentBuiltinPromptMode::iter()
+                            .map(|mode| {
+                                DropdownItem::new(
+                                    mode.display_name(),
+                                    AISettingsPageAction::SetCLIAgentBuiltinPromptMode {
+                                        agent,
+                                        mode,
+                                    },
+                                )
+                            })
+                            .collect(),
+                        ctx,
+                    );
+
+                    let current_mode = AISettings::as_ref(ctx).cli_agent_builtin_prompt(agent).mode;
+                    dropdown.set_selected_by_action(
+                        AISettingsPageAction::SetCLIAgentBuiltinPromptMode {
+                            agent,
+                            mode: current_mode,
+                        },
+                        ctx,
+                    );
+
+                    dropdown
+                })
+            })
+            .collect()
+    }
+
+    fn sync_cli_agent_builtin_prompt_editors(&mut self, ctx: &mut ViewContext<Self>) {
+        for (idx, agent) in AISettings::cli_agent_builtin_prompt_agents()
+            .into_iter()
+            .enumerate()
+        {
+            let Some(editor) = self.cli_agent_builtin_prompt_editors.get(idx) else {
+                continue;
+            };
+            let prompt = AISettings::as_ref(ctx)
+                .cli_agent_builtin_prompt(agent)
+                .prompt;
+            editor.update(ctx, |editor, ctx| {
+                if editor.buffer_text(ctx) != prompt {
+                    editor.system_reset_buffer_text(&prompt, ctx);
+                }
+            });
+        }
+    }
+
+    fn refresh_cli_agent_builtin_prompt_mode_dropdowns(&mut self, ctx: &mut ViewContext<Self>) {
+        for (idx, agent) in AISettings::cli_agent_builtin_prompt_agents()
+            .into_iter()
+            .enumerate()
+        {
+            let Some(dropdown) = self.cli_agent_builtin_prompt_mode_dropdowns.get(idx) else {
+                continue;
+            };
+            let current_mode = AISettings::as_ref(ctx).cli_agent_builtin_prompt(agent).mode;
+            dropdown.update(ctx, |dropdown, ctx| {
+                dropdown.set_selected_by_action(
+                    AISettingsPageAction::SetCLIAgentBuiltinPromptMode {
+                        agent,
+                        mode: current_mode,
+                    },
+                    ctx,
+                );
+            });
+        }
+    }
+
+    fn cli_agent_api_profile_preset(preset_id: &str) -> Option<&'static CLIAgentApiProfilePreset> {
+        CLI_AGENT_API_PROFILE_PRESETS
+            .iter()
+            .find(|preset| preset.id == preset_id)
+    }
+
+    fn create_cli_agent_api_profile_preset_dropdown(
+        selected_preset_id: &str,
+        ctx: &mut ViewContext<Self>,
+    ) -> ViewHandle<Dropdown<AISettingsPageAction>> {
+        let selected_preset_id = selected_preset_id.to_owned();
+        ctx.add_typed_action_view(move |ctx| {
+            let mut dropdown = Dropdown::new(ctx);
+            dropdown.set_top_bar_max_width(220.);
+            dropdown.set_menu_width(280., ctx);
+            dropdown.set_main_axis_size(MainAxisSize::Min, ctx);
+            let mut items = vec![DropdownItem::new(
+                "Custom provider",
+                AISettingsPageAction::SetCLIAgentApiProfilePreset(
+                    CLI_AGENT_API_CUSTOM_PRESET_ID.to_owned(),
+                ),
+            )];
+            items.extend(CLI_AGENT_API_PROFILE_PRESETS.iter().map(|preset| {
+                DropdownItem::new(
+                    preset.label,
+                    AISettingsPageAction::SetCLIAgentApiProfilePreset(preset.id.to_owned()),
+                )
+            }));
+            dropdown.set_items(items, ctx);
+            dropdown.set_selected_by_action(
+                AISettingsPageAction::SetCLIAgentApiProfilePreset(selected_preset_id.clone()),
+                ctx,
+            );
+            dropdown
+        })
+    }
+
+    fn create_cli_agent_api_profile_agent_dropdown(
+        selected_agent: CLIAgent,
+        ctx: &mut ViewContext<Self>,
+    ) -> ViewHandle<Dropdown<AISettingsPageAction>> {
+        ctx.add_typed_action_view(move |ctx| {
+            let mut dropdown = Dropdown::new(ctx);
+            dropdown.set_top_bar_max_width(190.);
+            dropdown.set_menu_width(220., ctx);
+            dropdown.set_main_axis_size(MainAxisSize::Min, ctx);
+            dropdown.add_items(
+                AISettings::cli_agent_api_profile_agents()
+                    .into_iter()
+                    .map(|agent| {
+                        DropdownItem::new(
+                            agent.display_name(),
+                            AISettingsPageAction::SetCLIAgentApiProfileDraftAgent(agent),
+                        )
+                    })
+                    .collect(),
+                ctx,
+            );
+            dropdown.set_selected_by_action(
+                AISettingsPageAction::SetCLIAgentApiProfileDraftAgent(selected_agent),
+                ctx,
+            );
+            dropdown
+        })
+    }
+
+    fn create_cli_agent_api_profile_environment_dropdown(
+        selected_environment_id: &str,
+        ctx: &mut ViewContext<Self>,
+    ) -> ViewHandle<Dropdown<AISettingsPageAction>> {
+        let selected_environment_id = selected_environment_id.to_owned();
+        ctx.add_typed_action_view(move |ctx| {
+            let mut dropdown = Dropdown::new(ctx);
+            dropdown.set_top_bar_max_width(220.);
+            dropdown.set_menu_width(260., ctx);
+            dropdown.set_main_axis_size(MainAxisSize::Min, ctx);
+            Self::populate_cli_agent_api_profile_environment_dropdown(
+                &mut dropdown,
+                &selected_environment_id,
+                ctx,
+            );
+            dropdown
+        })
+    }
+
+    fn populate_cli_agent_api_profile_environment_dropdown(
+        dropdown: &mut Dropdown<AISettingsPageAction>,
+        selected_environment_id: &str,
+        ctx: &mut ViewContext<Dropdown<AISettingsPageAction>>,
+    ) {
+        let mut items = vec![
+            DropdownItem::new(
+                "Local",
+                AISettingsPageAction::SetCLIAgentApiProfileDraftEnvironment(
+                    CLI_AGENT_API_LOCAL_ENVIRONMENT_ID.to_owned(),
+                ),
+            ),
+            DropdownItem::new(
+                "All environments",
+                AISettingsPageAction::SetCLIAgentApiProfileDraftEnvironment(
+                    CLI_AGENT_API_ALL_ENVIRONMENTS_ID.to_owned(),
+                ),
+            ),
+        ];
+
+        for host in SshRemoteModel::as_ref(ctx).hosts() {
+            items.push(DropdownItem::new(
+                format!("SSH {}", host.display_name()),
+                AISettingsPageAction::SetCLIAgentApiProfileDraftEnvironment(
+                    ssh_remote_environment_id(&host.id),
+                ),
+            ));
+        }
+
+        dropdown.set_items(items, ctx);
+        dropdown.set_selected_by_action(
+            AISettingsPageAction::SetCLIAgentApiProfileDraftEnvironment(
+                selected_environment_id.to_owned(),
+            ),
+            ctx,
+        );
+    }
+
+    fn refresh_cli_agent_api_profile_environment_dropdown(&mut self, ctx: &mut ViewContext<Self>) {
+        let selected_environment_id = if self
+            .cli_agent_api_profile_draft_environment_id
+            .starts_with("ssh:")
+            && SshRemoteModel::as_ref(ctx).hosts().iter().all(|host| {
+                ssh_remote_environment_id(&host.id)
+                    != self.cli_agent_api_profile_draft_environment_id
+            }) {
+            self.cli_agent_api_profile_draft_environment_id =
+                CLI_AGENT_API_LOCAL_ENVIRONMENT_ID.to_owned();
+            self.cli_agent_api_profile_draft_environment_id.clone()
+        } else {
+            self.cli_agent_api_profile_draft_environment_id.clone()
+        };
+
+        self.cli_agent_api_profile_environment_dropdown
+            .update(ctx, |dropdown, ctx| {
+                Self::populate_cli_agent_api_profile_environment_dropdown(
+                    dropdown,
+                    &selected_environment_id,
+                    ctx,
+                );
+            });
+    }
+
+    fn cli_agent_api_profile_anthropic_base_url(profile: &CLIAgentApiProfile) -> String {
+        if profile.agent() == CLIAgent::Claude {
+            profile.base_url.clone()
+        } else {
+            profile
+                .extra_env
+                .get(CLI_AGENT_API_ANTHROPIC_BASE_URL_ENV_KEY)
+                .cloned()
+                .unwrap_or_default()
+        }
+    }
+
+    fn cli_agent_api_profile_openai_base_url(profile: &CLIAgentApiProfile) -> String {
+        if matches!(
+            profile.agent(),
+            CLIAgent::Codex | CLIAgent::OpenCode | CLIAgent::Hermes
+        ) {
+            profile.base_url.clone()
+        } else {
+            profile
+                .extra_env
+                .get(CLI_AGENT_API_OPENAI_BASE_URL_ENV_KEY)
+                .cloned()
+                .unwrap_or_default()
+        }
+    }
+
+    fn cli_agent_api_profile_base_url_for_agent(
+        agent: CLIAgent,
+        anthropic_base_url: &str,
+        openai_base_url: &str,
+    ) -> String {
+        match agent {
+            CLIAgent::Claude => anthropic_base_url.to_owned(),
+            CLIAgent::Codex | CLIAgent::OpenCode | CLIAgent::Hermes => openai_base_url.to_owned(),
+            _ => openai_base_url
+                .trim()
+                .is_empty()
+                .then(|| anthropic_base_url.to_owned())
+                .unwrap_or_else(|| openai_base_url.to_owned()),
+        }
+    }
+
+    fn create_cli_agent_api_profile_model_picker_dropdown(
+        selected_model: &str,
+        models: &[String],
+        ctx: &mut ViewContext<Self>,
+    ) -> ViewHandle<Dropdown<AISettingsPageAction>> {
+        let selected_model = selected_model.to_owned();
+        let models = models.to_vec();
+        ctx.add_typed_action_view(move |ctx| {
+            let mut dropdown = Dropdown::new(ctx);
+            dropdown.set_top_bar_max_width(260.);
+            dropdown.set_menu_width(320., ctx);
+            dropdown.set_main_axis_size(MainAxisSize::Min, ctx);
+            Self::populate_cli_agent_api_profile_model_picker_dropdown(
+                &mut dropdown,
+                &selected_model,
+                &models,
+                ctx,
+            );
+            dropdown
+        })
+    }
+
+    fn populate_cli_agent_api_profile_model_picker_dropdown(
+        dropdown: &mut Dropdown<AISettingsPageAction>,
+        selected_model: &str,
+        models: &[String],
+        ctx: &mut ViewContext<Dropdown<AISettingsPageAction>>,
+    ) {
+        let selected_model = if models
+            .iter()
+            .any(|model| model.eq_ignore_ascii_case(selected_model))
+        {
+            selected_model.to_owned()
+        } else {
+            models.first().cloned().unwrap_or_default()
+        };
+        let items = if models.is_empty() {
+            vec![DropdownItem::new(
+                "暂无模型",
+                AISettingsPageAction::SelectCLIAgentApiProfileFetchedModel(String::new()),
+            )]
+        } else {
+            models
+                .iter()
+                .map(|model| {
+                    DropdownItem::new(
+                        model.clone(),
+                        AISettingsPageAction::SelectCLIAgentApiProfileFetchedModel(model.clone()),
+                    )
+                })
+                .collect()
+        };
+
+        dropdown.set_items(items, ctx);
+        dropdown.set_selected_by_action(
+            AISettingsPageAction::SelectCLIAgentApiProfileFetchedModel(selected_model),
+            ctx,
+        );
+    }
+
+    fn refresh_cli_agent_api_profile_model_picker_dropdown(&mut self, ctx: &mut ViewContext<Self>) {
+        let selected_model = if self
+            .cli_agent_api_profile_fetched_models
+            .iter()
+            .any(|model| {
+                model.eq_ignore_ascii_case(&self.cli_agent_api_profile_selected_fetched_model)
+            }) {
+            self.cli_agent_api_profile_selected_fetched_model.clone()
+        } else {
+            self.cli_agent_api_profile_fetched_models
+                .first()
+                .cloned()
+                .unwrap_or_default()
+        };
+        self.cli_agent_api_profile_selected_fetched_model = selected_model.clone();
+        let models = self.cli_agent_api_profile_fetched_models.clone();
+        self.cli_agent_api_profile_model_picker_dropdown
+            .update(ctx, |dropdown, ctx| {
+                Self::populate_cli_agent_api_profile_model_picker_dropdown(
+                    dropdown,
+                    &selected_model,
+                    &models,
+                    ctx,
+                );
+            });
+    }
+
+    fn create_cli_agent_api_profile_editor(
+        placeholder: &'static str,
+        is_password: bool,
+        ctx: &mut ViewContext<Self>,
+    ) -> ViewHandle<EditorView> {
+        let editor = ctx.add_typed_action_view(move |ctx| {
+            let appearance = Appearance::handle(ctx).as_ref(ctx);
+            let options = SingleLineEditorOptions {
+                is_password,
+                text: TextOptions {
+                    font_size_override: Some(appearance.ui_font_size()),
+                    font_family_override: Some(appearance.monospace_font_family()),
+                    text_colors_override: Some(TextColors {
+                        default_color: appearance.theme().active_ui_text_color(),
+                        disabled_color: appearance.theme().disabled_ui_text_color(),
+                        hint_color: appearance.theme().disabled_ui_text_color(),
+                    }),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut editor = EditorView::single_line(options, ctx);
+            editor.set_placeholder_text(placeholder, ctx);
+            editor
+        });
+        Self::update_editor_interaction_state(editor.clone(), true, ctx);
+        editor
+    }
+
+    fn create_cli_agent_api_profiles_json_editor(
+        ctx: &mut ViewContext<Self>,
+    ) -> ViewHandle<EditorView> {
+        let editor = ctx.add_typed_action_view(|ctx| {
+            let appearance = Appearance::handle(ctx).as_ref(ctx);
+            let options = EditorOptions {
+                autogrow: true,
+                soft_wrap: true,
+                placeholder_soft_wrap: true,
+                enter_settings: EnterSettings {
+                    enter: EnterAction::Emit,
+                    ..Default::default()
+                },
+                text: TextOptions {
+                    font_size_override: Some(appearance.ui_font_size()),
+                    font_family_override: Some(appearance.monospace_font_family()),
+                    text_colors_override: Some(TextColors {
+                        default_color: appearance.theme().active_ui_text_color(),
+                        disabled_color: appearance.theme().disabled_ui_text_color(),
+                        hint_color: appearance.theme().disabled_ui_text_color(),
+                    }),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut editor = EditorView::new(options, ctx);
+            editor.set_placeholder_text(
+                "Paste Agent API profiles JSON, or copy the current export here.",
+                ctx,
+            );
+            editor
+        });
+        Self::update_editor_interaction_state(editor.clone(), true, ctx);
+        editor
+    }
+
+    fn create_cli_agent_api_profile_multiline_editor(
+        placeholder: &'static str,
+        ctx: &mut ViewContext<Self>,
+    ) -> ViewHandle<EditorView> {
+        let editor = ctx.add_typed_action_view(move |ctx| {
+            let appearance = Appearance::handle(ctx).as_ref(ctx);
+            let options = EditorOptions {
+                autogrow: true,
+                soft_wrap: true,
+                placeholder_soft_wrap: true,
+                enter_settings: EnterSettings {
+                    enter: EnterAction::InsertNewLineIfMultiLine,
+                    ..Default::default()
+                },
+                text: TextOptions {
+                    font_size_override: Some(appearance.ui_font_size()),
+                    font_family_override: Some(appearance.monospace_font_family()),
+                    text_colors_override: Some(TextColors {
+                        default_color: appearance.theme().active_ui_text_color(),
+                        disabled_color: appearance.theme().disabled_ui_text_color(),
+                        hint_color: appearance.theme().disabled_ui_text_color(),
+                    }),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut editor = EditorView::new(options, ctx);
+            editor.set_placeholder_text(placeholder, ctx);
+            editor
+        });
+        Self::update_editor_interaction_state(editor.clone(), true, ctx);
+        editor
+    }
+
+    fn create_cli_agent_api_profile_extra_env_editor(
+        ctx: &mut ViewContext<Self>,
+    ) -> ViewHandle<EditorView> {
+        Self::create_cli_agent_api_profile_multiline_editor(
+            "KEY=value per line, e.g. header:HTTP-Referer=https://app.example",
+            ctx,
+        )
+    }
+
+    fn sync_cli_agent_api_profile_mouse_state_handles(&mut self, ctx: &mut ViewContext<Self>) {
+        let profile_count = AISettings::as_ref(ctx)
+            .cli_agent_api_profiles()
+            .profiles
+            .len();
+        self.cli_agent_api_profile_mouse_state_handles =
+            (0..profile_count).map(|_| Default::default()).collect();
+        self.cli_agent_api_profile_edit_mouse_state_handles =
+            (0..profile_count).map(|_| Default::default()).collect();
+        self.cli_agent_api_profile_check_mouse_state_handles =
+            (0..profile_count).map(|_| Default::default()).collect();
+        self.cli_agent_api_profile_toggle_mouse_state_handles =
+            (0..profile_count).map(|_| Default::default()).collect();
+        self.cli_agent_api_profile_remove_mouse_state_handles =
+            (0..profile_count).map(|_| Default::default()).collect();
+    }
+
+    fn set_cli_agent_api_profile_preset_selection(
+        &mut self,
+        preset_id: &str,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        self.cli_agent_api_profile_selected_preset_id = preset_id.to_owned();
+        self.cli_agent_api_profile_preset_dropdown
+            .update(ctx, |dropdown, ctx| {
+                dropdown.set_selected_by_action(
+                    AISettingsPageAction::SetCLIAgentApiProfilePreset(preset_id.to_owned()),
+                    ctx,
+                );
+            });
+    }
+
+    fn handle_set_cli_agent_api_profile_preset(
+        &mut self,
+        preset_id: &str,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        self.cli_agent_api_profile_selected_preset_id = preset_id.to_owned();
+        let Some(preset) = Self::cli_agent_api_profile_preset(preset_id) else {
+            ctx.notify();
+            return;
+        };
+
+        self.cli_agent_api_profile_draft_agent = preset.agent;
+        self.cli_agent_api_profile_agent_dropdown
+            .update(ctx, |dropdown, ctx| {
+                dropdown.set_selected_by_action(
+                    AISettingsPageAction::SetCLIAgentApiProfileDraftAgent(preset.agent),
+                    ctx,
+                );
+            });
+        let anthropic_base_url = if preset.agent == CLIAgent::Claude {
+            preset.base_url
+        } else {
+            ""
+        };
+        let openai_base_url = if matches!(
+            preset.agent,
+            CLIAgent::Codex | CLIAgent::OpenCode | CLIAgent::Hermes
+        ) {
+            preset.base_url
+        } else {
+            ""
+        };
+
+        for (editor, text) in [
+            (&self.cli_agent_api_profile_name_editor, preset.profile_name),
+            (
+                &self.cli_agent_api_profile_base_url_editor,
+                anthropic_base_url,
+            ),
+            (
+                &self.cli_agent_api_profile_openai_base_url_editor,
+                openai_base_url,
+            ),
+            (
+                &self.cli_agent_api_profile_api_format_editor,
+                Self::cli_agent_api_default_api_format(preset.agent),
+            ),
+            (
+                &self.cli_agent_api_profile_auth_env_var_editor,
+                Self::cli_agent_api_default_auth_env_var(preset.agent),
+            ),
+            (&self.cli_agent_api_profile_full_url_mode_editor, "false"),
+            (&self.cli_agent_api_profile_model_editor, preset.model),
+        ] {
+            editor.update(ctx, |editor, ctx| editor.set_buffer_text(text, ctx));
+        }
+        self.cli_agent_api_profile_priority_editor
+            .update(ctx, |editor, ctx| {
+                editor.set_buffer_text(&preset.priority.to_string(), ctx);
+            });
+        for editor in [
+            &self.cli_agent_api_profile_input_cost_editor,
+            &self.cli_agent_api_profile_output_cost_editor,
+        ] {
+            editor.update(ctx, |editor, ctx| editor.set_buffer_text("0", ctx));
+        }
+        self.cli_agent_api_profile_extra_env_editor
+            .update(ctx, |editor, ctx| editor.set_buffer_text("", ctx));
+        self.cli_agent_api_profile_model_catalog_editor
+            .update(ctx, |editor, ctx| {
+                editor.set_buffer_text(preset.model, ctx);
+            });
+        self.cli_agent_api_profile_fetched_models = if preset.model.trim().is_empty() {
+            Vec::new()
+        } else {
+            vec![preset.model.to_owned()]
+        };
+        self.cli_agent_api_profile_selected_fetched_model = preset.model.to_owned();
+        self.refresh_cli_agent_api_profile_model_picker_dropdown(ctx);
+        self.cli_agent_api_profile_model_mappings_editor
+            .update(ctx, |editor, ctx| {
+                editor.set_buffer_text(
+                    &Self::default_cli_agent_api_model_mappings_text(preset.agent, preset.model),
+                    ctx,
+                );
+            });
+        ctx.notify();
+    }
+
+    fn cli_agent_api_default_api_format(agent: CLIAgent) -> &'static str {
+        match agent {
+            CLIAgent::Claude => "anthropic_messages",
+            CLIAgent::Gemini => "gemini",
+            CLIAgent::Codex | CLIAgent::OpenCode | CLIAgent::Hermes => "openai_chat",
+            _ => "openai_chat",
+        }
+    }
+
+    fn cli_agent_api_default_auth_env_var(agent: CLIAgent) -> &'static str {
+        match agent {
+            CLIAgent::Claude => "ANTHROPIC_AUTH_TOKEN",
+            CLIAgent::Gemini => "GEMINI_API_KEY",
+            CLIAgent::Codex | CLIAgent::OpenCode | CLIAgent::Hermes => "OPENAI_API_KEY",
+            _ => "OPENAI_API_KEY",
+        }
+    }
+
+    fn default_cli_agent_api_model_mappings_text(agent: CLIAgent, model: &str) -> String {
+        let model = model.trim();
+        if model.is_empty() {
+            return String::new();
+        }
+        match agent {
+            CLIAgent::Claude => ["Sonnet", "Opus", "Haiku"]
+                .into_iter()
+                .map(|role| format!("{role},{model},{model}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => format!("Default,{model},{model}"),
+        }
+    }
+
+    fn parse_cli_agent_api_cost_per_million_tokens(text: &str) -> f64 {
+        let value = text.trim().parse::<f64>().unwrap_or_default();
+        if value.is_finite() && value > 0.0 {
+            value
+        } else {
+            0.0
+        }
+    }
+
+    fn parse_cli_agent_api_extra_env(text: &str) -> HashMap<String, String> {
+        text.lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    return None;
+                }
+                let (key, value) = line.split_once('=')?;
+                let key = key.trim();
+                let value = value.trim();
+                if key.is_empty() || value.is_empty() {
+                    None
+                } else {
+                    Some((key.to_owned(), value.to_owned()))
+                }
+            })
+            .collect()
+    }
+
+    fn format_cli_agent_api_extra_env(extra_env: &HashMap<String, String>) -> String {
+        let mut entries = extra_env
+            .iter()
+            .filter(|(key, value)| !key.trim().is_empty() && !value.trim().is_empty())
+            .map(|(key, value)| format!("{}={}", key.trim(), value.trim()))
+            .collect::<Vec<_>>();
+        entries.sort();
+        entries.join("\n")
+    }
+
+    fn parse_cli_agent_api_model_catalog(text: &str) -> Vec<String> {
+        text.lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(ToOwned::to_owned)
+            .unique()
+            .collect()
+    }
+
+    fn format_cli_agent_api_model_catalog(models: &[String]) -> String {
+        models
+            .iter()
+            .map(|model| model.trim())
+            .filter(|model| !model.is_empty())
+            .unique()
+            .join("\n")
+    }
+
+    fn parse_cli_agent_api_model_mappings(text: &str) -> Vec<CLIAgentApiModelMapping> {
+        text.lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    return None;
+                }
+
+                let (role, display_name, model, context_window_tokens) =
+                    if let Some((left, model)) = line.split_once("=>") {
+                        let (role, display_name) = left
+                            .split_once('=')
+                            .map(|(role, display)| (role, display))
+                            .unwrap_or((left, ""));
+                        (role, display_name, model, 0)
+                    } else {
+                        let parts = line.split(',').map(str::trim).collect::<Vec<_>>();
+                        (
+                            parts.first().copied().unwrap_or_default(),
+                            parts.get(1).copied().unwrap_or_default(),
+                            parts.get(2).copied().unwrap_or_default(),
+                            parts
+                                .get(3)
+                                .and_then(|value| value.parse::<u32>().ok())
+                                .unwrap_or_default(),
+                        )
+                    };
+
+                let role = role.trim();
+                let display_name = display_name.trim();
+                let model = model.trim();
+                if role.is_empty() && display_name.is_empty() && model.is_empty() {
+                    return None;
+                }
+                Some(CLIAgentApiModelMapping {
+                    role: role.to_owned(),
+                    display_name: display_name.to_owned(),
+                    model: model.to_owned(),
+                    supports_one_million_context: context_window_tokens >= 1_000_000,
+                    context_window_tokens,
+                })
+            })
+            .collect()
+    }
+
+    fn format_cli_agent_api_model_mappings(mappings: &[CLIAgentApiModelMapping]) -> String {
+        mappings
+            .iter()
+            .map(|mapping| {
+                let context = if mapping.context_window_tokens > 0 {
+                    format!(",{}", mapping.context_window_tokens)
+                } else if mapping.supports_one_million_context {
+                    ",1000000".to_owned()
+                } else {
+                    String::new()
+                };
+                format!(
+                    "{},{},{}{}",
+                    mapping.role.trim(),
+                    mapping.display_name.trim(),
+                    mapping.model.trim(),
+                    context
+                )
+            })
+            .filter(|line| line.split(',').any(|part| !part.trim().is_empty()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn cli_agent_api_profile_model_catalog(&self, app: &AppContext) -> Vec<String> {
+        Self::parse_cli_agent_api_model_catalog(
+            &self
+                .cli_agent_api_profile_model_catalog_editor
+                .as_ref(app)
+                .buffer_text(app),
+        )
+    }
+
+    fn set_cli_agent_api_profile_model_catalog(
+        &self,
+        models: &[String],
+        ctx: &mut ViewContext<Self>,
+    ) {
+        self.cli_agent_api_profile_model_catalog_editor
+            .update(ctx, |editor, ctx| {
+                editor.set_buffer_text(&Self::format_cli_agent_api_model_catalog(models), ctx);
+            });
+    }
+
+    fn clear_cli_agent_api_profile_save_feedback(&mut self, ctx: &mut ViewContext<Self>) {
+        self.cli_agent_api_profile_save_feedback = None;
+        self.cli_agent_api_profile_save_feedback_is_error = false;
+        self.cli_agent_api_profile_save_feedback_generation = self
+            .cli_agent_api_profile_save_feedback_generation
+            .wrapping_add(1);
+        self.cli_agent_api_profile_add_button
+            .update(ctx, |button, ctx| {
+                button.set_label("保存", ctx);
+                button.set_icon(Some(Icon::Check), ctx);
+            });
+    }
+
+    fn sync_cli_agent_api_profile_add_model_button(&mut self, ctx: &mut ViewContext<Self>) {
+        let open = self.cli_agent_api_profile_add_model_open;
+        self.cli_agent_api_profile_toggle_add_model_button
+            .update(ctx, |button, ctx| {
+                button.set_label(if open { "收起" } else { "添加模型" }, ctx);
+                button.set_icon(Some(if open { Icon::X } else { Icon::Plus }), ctx);
+            });
+    }
+
+    fn set_cli_agent_api_profile_save_feedback(
+        &mut self,
+        message: impl Into<String>,
+        is_error: bool,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let message = message.into();
+        self.cli_agent_api_profile_save_feedback = Some(message.clone());
+        self.cli_agent_api_profile_save_feedback_is_error = is_error;
+        self.cli_agent_api_profile_save_feedback_generation = self
+            .cli_agent_api_profile_save_feedback_generation
+            .wrapping_add(1);
+        let generation = self.cli_agent_api_profile_save_feedback_generation;
+        self.cli_agent_api_profile_add_button
+            .update(ctx, |button, ctx| {
+                button.set_label(if is_error { "保存" } else { "已保存" }, ctx);
+                button.set_icon(Some(Icon::Check), ctx);
+            });
+
+        let window_id = ctx.window_id();
+        crate::ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
+            let toast = if is_error {
+                crate::view_components::DismissibleToast::error(message.clone())
+            } else {
+                crate::view_components::DismissibleToast::success(message.clone())
+            };
+            toast_stack.add_ephemeral_toast(toast, window_id, ctx);
+        });
+
+        let timeout = if is_error {
+            Duration::from_millis(2600)
+        } else {
+            Duration::from_millis(1800)
+        };
+        ctx.spawn(Timer::after(timeout), move |me, _, ctx| {
+            if me.cli_agent_api_profile_save_feedback_generation != generation {
+                return;
+            }
+            me.cli_agent_api_profile_save_feedback = None;
+            me.cli_agent_api_profile_save_feedback_is_error = false;
+            me.cli_agent_api_profile_add_button
+                .update(ctx, |button, ctx| {
+                    button.set_label("保存", ctx);
+                    button.set_icon(Some(Icon::Check), ctx);
+                });
+            ctx.notify();
+        });
+        ctx.notify();
+    }
+
+    fn cli_agent_api_claude_settings_env_vars(
+        env_vars: HashMap<String, String>,
+    ) -> HashMap<String, String> {
+        env_vars
+            .into_iter()
+            .filter(|(key, value)| {
+                CLI_AGENT_API_CLAUDE_SETTINGS_ENV_KEYS.contains(&key.as_str())
+                    && !value.trim().is_empty()
+            })
+            .collect()
+    }
+
+    fn has_cli_agent_api_claude_settings_env_vars(env_vars: &HashMap<String, String>) -> bool {
+        env_vars.iter().any(|(key, value)| {
+            CLI_AGENT_API_CLAUDE_SETTINGS_ENV_KEYS.contains(&key.as_str())
+                && !value.trim().is_empty()
+        })
+    }
+
+    fn write_local_claude_agent_api_settings_blocking(
+        env_vars: HashMap<String, String>,
+    ) -> Result<(), String> {
+        let env_vars = Self::cli_agent_api_claude_settings_env_vars(env_vars);
+        if env_vars.is_empty() {
+            return Ok(());
+        }
+
+        let home_dir =
+            dirs::home_dir().ok_or_else(|| "Could not locate home directory".to_owned())?;
+        let claude_dir = home_dir.join(".claude");
+        let settings_path = claude_dir.join("settings.json");
+        let mut settings = fs::read_to_string(&settings_path)
+            .ok()
+            .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
+            .unwrap_or_else(|| serde_json::json!({}));
+        if !settings.is_object() {
+            settings = serde_json::json!({});
+        }
+
+        let root = settings
+            .as_object_mut()
+            .ok_or_else(|| "Claude settings root is not an object".to_owned())?;
+        root.insert("skipIntroduction".to_owned(), serde_json::Value::Bool(true));
+        root.insert(
+            "skipDangerousModePermissionPrompt".to_owned(),
+            serde_json::Value::Bool(true),
+        );
+
+        let env = root
+            .entry("env".to_owned())
+            .or_insert_with(|| serde_json::json!({}));
+        if !env.is_object() {
+            *env = serde_json::json!({});
+        }
+        let env = env
+            .as_object_mut()
+            .ok_or_else(|| "Claude settings env is not an object".to_owned())?;
+        for (key, value) in env_vars {
+            env.insert(key, serde_json::Value::String(value));
+        }
+
+        fs::create_dir_all(&claude_dir)
+            .map_err(|error| format!("Could not create {}: {error}", claude_dir.display()))?;
+        let mut serialized = serde_json::to_vec_pretty(&settings)
+            .map_err(|error| format!("Could not serialize Claude settings: {error}"))?;
+        serialized.push(b'\n');
+        fs::write(&settings_path, serialized)
+            .map_err(|error| format!("Could not write {}: {error}", settings_path.display()))
+    }
+
+    async fn sync_local_claude_agent_api_settings(
+        env_vars: HashMap<String, String>,
+    ) -> Result<(), String> {
+        tokio::task::spawn_blocking(move || {
+            Self::write_local_claude_agent_api_settings_blocking(env_vars)
+        })
+        .await
+        .map_err(|error| format!("Local Claude settings sync task failed: {error}"))?
+    }
+
+    fn cli_agent_api_codex_settings_env_vars(
+        env_vars: HashMap<String, String>,
+    ) -> HashMap<String, String> {
+        env_vars
+            .into_iter()
+            .filter(|(key, value)| {
+                CLI_AGENT_API_CODEX_SETTINGS_ENV_KEYS.contains(&key.as_str())
+                    && !value.trim().is_empty()
+            })
+            .collect()
+    }
+
+    fn has_cli_agent_api_codex_settings_env_vars(env_vars: &HashMap<String, String>) -> bool {
+        env_vars.iter().any(|(key, value)| {
+            CLI_AGENT_API_CODEX_SETTINGS_ENV_KEYS.contains(&key.as_str())
+                && !value.trim().is_empty()
+        })
+    }
+
+    fn toml_basic_string(value: &str) -> Result<String, String> {
+        serde_json::to_string(value)
+            .map_err(|error| format!("Could not serialize TOML string: {error}"))
+    }
+
+    fn is_toml_section_line(line: &str) -> bool {
+        let trimmed = line.trim();
+        trimmed.starts_with('[') && trimmed.ends_with(']')
+    }
+
+    fn is_toml_assignment_for_key(line: &str, key: &str) -> bool {
+        let trimmed = line.trim_start();
+        trimmed.starts_with(key) && trimmed[key.len()..].trim_start().starts_with('=')
+    }
+
+    fn finish_toml_lines(mut lines: Vec<String>) -> String {
+        while lines.last().is_some_and(|line| line.trim().is_empty()) {
+            lines.pop();
+        }
+        if lines.is_empty() {
+            String::new()
+        } else {
+            format!("{}\n", lines.join("\n"))
+        }
+    }
+
+    fn upsert_toml_top_level_key(content: &str, key: &str, value: &str) -> String {
+        let mut lines = content.lines().map(str::to_owned).collect::<Vec<String>>();
+        let first_section = lines
+            .iter()
+            .position(|line| Self::is_toml_section_line(line));
+        let limit = first_section.unwrap_or(lines.len());
+        let assignment = format!("{key} = {value}");
+
+        for line in lines.iter_mut().take(limit) {
+            if Self::is_toml_assignment_for_key(line, key) {
+                *line = assignment;
+                return Self::finish_toml_lines(lines);
+            }
+        }
+
+        if let Some(index) = first_section {
+            lines.insert(index, assignment);
+        } else {
+            lines.push(assignment);
+        }
+        Self::finish_toml_lines(lines)
+    }
+
+    fn upsert_toml_section_key(content: &str, section: &str, key: &str, value: &str) -> String {
+        let mut lines = content.lines().map(str::to_owned).collect::<Vec<String>>();
+        let assignment = format!("{key} = {value}");
+        let Some(start) = lines.iter().position(|line| line.trim() == section) else {
+            if lines.last().is_some_and(|line| !line.trim().is_empty()) {
+                lines.push(String::new());
+            }
+            lines.push(section.to_owned());
+            lines.push(assignment);
+            return Self::finish_toml_lines(lines);
+        };
+
+        let end = lines
+            .iter()
+            .enumerate()
+            .skip(start + 1)
+            .find_map(|(index, line)| Self::is_toml_section_line(line).then_some(index))
+            .unwrap_or(lines.len());
+
+        for line in lines.iter_mut().take(end).skip(start + 1) {
+            if Self::is_toml_assignment_for_key(line, key) {
+                *line = assignment;
+                return Self::finish_toml_lines(lines);
+            }
+        }
+
+        lines.insert(end, assignment);
+        Self::finish_toml_lines(lines)
+    }
+
+    fn write_local_codex_auth_json(
+        auth_path: &Path,
+        auth: &serde_json::Value,
+    ) -> Result<(), String> {
+        let serialized = serde_json::to_vec_pretty(auth)
+            .map_err(|error| format!("Could not serialize Codex auth.json: {error}"))?;
+        if let Some(parent) = auth_path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("Could not create {}: {error}", parent.display()))?;
+        }
+
+        #[cfg(unix)]
+        {
+            use std::io::Write as _;
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(auth_path)
+                .map_err(|error| format!("Could not open {}: {error}", auth_path.display()))?;
+            file.set_permissions(fs::Permissions::from_mode(0o600))
+                .map_err(|error| {
+                    format!(
+                        "Could not set permissions on {}: {error}",
+                        auth_path.display()
+                    )
+                })?;
+            file.write_all(&serialized)
+                .map_err(|error| format!("Could not write {}: {error}", auth_path.display()))?;
+            file.write_all(b"\n")
+                .map_err(|error| format!("Could not write {}: {error}", auth_path.display()))?;
+        }
+
+        #[cfg(not(unix))]
+        {
+            let mut serialized = serialized;
+            serialized.push(b'\n');
+            fs::write(auth_path, serialized)
+                .map_err(|error| format!("Could not write {}: {error}", auth_path.display()))?;
+        }
+
+        Ok(())
+    }
+
+    fn write_local_codex_agent_api_settings_blocking(
+        env_vars: HashMap<String, String>,
+    ) -> Result<(), String> {
+        let env_vars = Self::cli_agent_api_codex_settings_env_vars(env_vars);
+        if env_vars.is_empty() {
+            return Ok(());
+        }
+
+        let home_dir =
+            dirs::home_dir().ok_or_else(|| "Could not locate home directory".to_owned())?;
+        let codex_dir = home_dir.join(".codex");
+
+        if let Some(api_key) = env_vars
+            .get("OPENAI_API_KEY")
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+        {
+            let auth_path = codex_dir.join("auth.json");
+            let mut auth = fs::read_to_string(&auth_path)
+                .ok()
+                .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
+                .unwrap_or_else(|| serde_json::json!({}));
+            if !auth.is_object() {
+                auth = serde_json::json!({});
+            }
+            let root = auth
+                .as_object_mut()
+                .ok_or_else(|| "Codex auth root is not an object".to_owned())?;
+            root.insert(
+                "OPENAI_API_KEY".to_owned(),
+                serde_json::Value::String(api_key.to_owned()),
+            );
+            root.entry("auth_mode".to_owned())
+                .or_insert_with(|| serde_json::Value::String("apikey".to_owned()));
+            Self::write_local_codex_auth_json(&auth_path, &auth)?;
+        }
+
+        let config_path = codex_dir.join("config.toml");
+        let mut config = fs::read_to_string(&config_path).unwrap_or_default();
+        if let Some(base_url) = env_vars
+            .get("OPENAI_BASE_URL")
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+        {
+            config = Self::upsert_toml_top_level_key(
+                &config,
+                "openai_base_url",
+                &Self::toml_basic_string(base_url)?,
+            );
+        }
+        config = Self::upsert_toml_top_level_key(&config, "check_for_update_on_startup", "false");
+        if let Some(model) = env_vars
+            .get("OPENAI_MODEL")
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty() && *value != "default")
+        {
+            config =
+                Self::upsert_toml_top_level_key(&config, "model", &Self::toml_basic_string(model)?);
+            config = Self::upsert_toml_section_key(
+                &config,
+                "[notice.model_migrations]",
+                &Self::toml_basic_string(model)?,
+                &Self::toml_basic_string(CLI_AGENT_API_CODEX_MODEL_MIGRATION_TARGET)?,
+            );
+        }
+
+        fs::create_dir_all(&codex_dir)
+            .map_err(|error| format!("Could not create {}: {error}", codex_dir.display()))?;
+        fs::write(&config_path, config)
+            .map_err(|error| format!("Could not write {}: {error}", config_path.display()))
+    }
+
+    async fn sync_local_codex_agent_api_settings(
+        env_vars: HashMap<String, String>,
+    ) -> Result<(), String> {
+        tokio::task::spawn_blocking(move || {
+            Self::write_local_codex_agent_api_settings_blocking(env_vars)
+        })
+        .await
+        .map_err(|error| format!("Local Codex settings sync task failed: {error}"))?
+    }
+
+    fn handle_cli_agent_api_settings_sync_result(
+        &mut self,
+        feedback_prefix: &str,
+        target: &str,
+        result: Result<(), String>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        match result {
+            Ok(()) => {
+                self.set_cli_agent_api_profile_save_feedback(
+                    format!("{feedback_prefix}，{target} 已同步"),
+                    false,
+                    ctx,
+                );
+            }
+            Err(error) => {
+                log::warn!("Failed to sync Agent API settings for {target}: {error}");
+                self.set_cli_agent_api_profile_save_feedback(
+                    format!("{feedback_prefix}，{target} 同步失败"),
+                    true,
+                    ctx,
+                );
+            }
+        }
+    }
+
+    fn sync_cli_agent_api_profile_settings(
+        &mut self,
+        profile_id: &str,
+        feedback_prefix: impl Into<String>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let feedback_prefix = feedback_prefix.into();
+        let Some(profile) = AISettings::as_ref(ctx)
+            .cli_agent_api_profiles()
+            .profiles
+            .into_iter()
+            .find(|profile| profile.id == profile_id)
+        else {
+            return;
+        };
+        let profile_agent = profile.agent();
+        if !profile.enabled {
+            return;
+        }
+        let profile_env_vars = AISettings::cli_agent_api_profile_native_environment_vars(&profile);
+
+        if profile.environment_id == CLI_AGENT_API_LOCAL_ENVIRONMENT_ID
+            || profile.is_scoped_to_all_environments()
+        {
+            let env_vars = profile_env_vars.clone();
+            match profile_agent {
+                CLIAgent::Claude if Self::has_cli_agent_api_claude_settings_env_vars(&env_vars) => {
+                    let feedback_prefix = feedback_prefix.clone();
+                    ctx.spawn(
+                        Self::sync_local_claude_agent_api_settings(env_vars),
+                        move |me, result, ctx| {
+                            me.handle_cli_agent_api_settings_sync_result(
+                                &feedback_prefix,
+                                "本地 Claude",
+                                result,
+                                ctx,
+                            );
+                        },
+                    );
+                }
+                CLIAgent::Codex if Self::has_cli_agent_api_codex_settings_env_vars(&env_vars) => {
+                    let feedback_prefix = feedback_prefix.clone();
+                    ctx.spawn(
+                        Self::sync_local_codex_agent_api_settings(env_vars),
+                        move |me, result, ctx| {
+                            me.handle_cli_agent_api_settings_sync_result(
+                                &feedback_prefix,
+                                "本地 Codex",
+                                result,
+                                ctx,
+                            );
+                        },
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        let target_hosts = if let Some(host_id) = profile.environment_id.strip_prefix("ssh:") {
+            SshRemoteModel::as_ref(ctx)
+                .hosts()
+                .iter()
+                .find(|host| host.id == host_id)
+                .cloned()
+                .into_iter()
+                .collect::<Vec<_>>()
+        } else if profile.is_scoped_to_all_environments() {
+            SshRemoteModel::as_ref(ctx)
+                .active_host()
+                .cloned()
+                .into_iter()
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        if profile.environment_id.starts_with("ssh:") && target_hosts.is_empty() {
+            self.set_cli_agent_api_profile_save_feedback(
+                format!("{feedback_prefix}，未找到对应 SSH remote"),
+                true,
+                ctx,
+            );
+            return;
+        }
+
+        for host in target_hosts {
+            let env_vars = profile_env_vars.clone();
+            let target_label = format!("SSH {}", host.display_name());
+            match profile_agent {
+                CLIAgent::Claude if Self::has_cli_agent_api_claude_settings_env_vars(&env_vars) => {
+                    let feedback_prefix = feedback_prefix.clone();
+                    ctx.spawn(
+                        sync_remote_claude_agent_api_settings(host, env_vars),
+                        move |me, result, ctx| {
+                            me.handle_cli_agent_api_settings_sync_result(
+                                &feedback_prefix,
+                                &target_label,
+                                result,
+                                ctx,
+                            );
+                        },
+                    );
+                }
+                CLIAgent::Codex if Self::has_cli_agent_api_codex_settings_env_vars(&env_vars) => {
+                    let feedback_prefix = feedback_prefix.clone();
+                    ctx.spawn(
+                        sync_remote_codex_agent_api_settings(host, env_vars),
+                        move |me, result, ctx| {
+                            me.handle_cli_agent_api_settings_sync_result(
+                                &feedback_prefix,
+                                &target_label,
+                                result,
+                                ctx,
+                            );
+                        },
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn sync_saved_cli_agent_api_profile_settings(
+        &mut self,
+        profile_id: &str,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        self.sync_cli_agent_api_profile_settings(profile_id, "供应商已保存", ctx);
+    }
+
+    fn sync_active_cli_agent_api_profile_settings(
+        &mut self,
+        agent: CLIAgent,
+        environment_id: &str,
+        feedback_prefix: impl Into<String>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let Some(profile_id) = AISettings::as_ref(ctx)
+            .active_cli_agent_api_profile(agent, environment_id)
+            .map(|profile| profile.id.clone())
+        else {
+            return;
+        };
+        self.sync_cli_agent_api_profile_settings(&profile_id, feedback_prefix, ctx);
+    }
+
+    fn handle_add_cli_agent_api_profile_model(
+        &mut self,
+        model: &str,
+        make_preferred: bool,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let model = model.trim();
+        if model.is_empty() {
+            return;
+        }
+
+        let model = model.to_owned();
+        let mut models = self.cli_agent_api_profile_model_catalog(ctx);
+        if !models
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(&model))
+        {
+            models.push(model.clone());
+            self.set_cli_agent_api_profile_model_catalog(&models, ctx);
+        }
+
+        let current_model = self
+            .cli_agent_api_profile_model_editor
+            .as_ref(ctx)
+            .buffer_text(ctx);
+        if make_preferred || current_model.trim().is_empty() {
+            self.cli_agent_api_profile_model_editor
+                .update(ctx, |editor, ctx| editor.set_buffer_text(&model, ctx));
+        }
+
+        let mapping_text = self
+            .cli_agent_api_profile_model_mappings_editor
+            .as_ref(ctx)
+            .buffer_text(ctx);
+        if make_preferred || mapping_text.trim().is_empty() {
+            self.cli_agent_api_profile_model_mappings_editor
+                .update(ctx, |editor, ctx| {
+                    editor.set_buffer_text(
+                        &Self::default_cli_agent_api_model_mappings_text(
+                            self.cli_agent_api_profile_draft_agent,
+                            &model,
+                        ),
+                        ctx,
+                    );
+                });
+        }
+
+        self.cli_agent_api_profile_add_model_open = false;
+        ctx.notify();
+    }
+
+    fn handle_remove_cli_agent_api_profile_model(
+        &mut self,
+        model: &str,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let model = model.trim();
+        if model.is_empty() {
+            return;
+        }
+
+        let mut models = self.cli_agent_api_profile_model_catalog(ctx);
+        models.retain(|existing| !existing.eq_ignore_ascii_case(model));
+        self.set_cli_agent_api_profile_model_catalog(&models, ctx);
+
+        let current_model = self
+            .cli_agent_api_profile_model_editor
+            .as_ref(ctx)
+            .buffer_text(ctx);
+        let mut preferred_model_was_removed = false;
+        if current_model.trim().eq_ignore_ascii_case(model) {
+            preferred_model_was_removed = true;
+            let next_model = models.first().cloned().unwrap_or_default();
+            self.cli_agent_api_profile_model_editor
+                .update(ctx, |editor, ctx| editor.set_buffer_text(&next_model, ctx));
+        }
+
+        let mappings = Self::parse_cli_agent_api_model_mappings(
+            &self
+                .cli_agent_api_profile_model_mappings_editor
+                .as_ref(ctx)
+                .buffer_text(ctx),
+        );
+        let filtered_mappings = mappings
+            .into_iter()
+            .filter(|mapping| !mapping.model.eq_ignore_ascii_case(model))
+            .collect::<Vec<_>>();
+        let next_model = self
+            .cli_agent_api_profile_model_editor
+            .as_ref(ctx)
+            .buffer_text(ctx);
+        let next_mapping_text = if filtered_mappings.is_empty()
+            && preferred_model_was_removed
+            && !next_model.trim().is_empty()
+        {
+            Self::default_cli_agent_api_model_mappings_text(
+                self.cli_agent_api_profile_draft_agent,
+                &next_model,
+            )
+        } else {
+            Self::format_cli_agent_api_model_mappings(&filtered_mappings)
+        };
+        self.cli_agent_api_profile_model_mappings_editor
+            .update(ctx, |editor, ctx| {
+                editor.set_buffer_text(&next_mapping_text, ctx);
+            });
+
+        ctx.notify();
+    }
+
+    fn reset_cli_agent_api_profile_form(&mut self, ctx: &mut ViewContext<Self>) {
+        self.cli_agent_api_profile_editing_profile_id = None;
+        self.cli_agent_api_profile_fetched_models.clear();
+        self.cli_agent_api_profile_selected_fetched_model.clear();
+        self.cli_agent_api_profile_fetch_models_error = None;
+        self.cli_agent_api_profile_fetching_models = false;
+        self.cli_agent_api_profile_add_model_open = false;
+        self.cli_agent_api_profile_model_mapping_open = false;
+        self.cli_agent_api_profile_fetch_models_request_id = self
+            .cli_agent_api_profile_fetch_models_request_id
+            .wrapping_add(1);
+        self.sync_cli_agent_api_profile_add_model_button(ctx);
+        self.clear_cli_agent_api_profile_save_feedback(ctx);
+        self.set_cli_agent_api_profile_preset_selection(CLI_AGENT_API_CUSTOM_PRESET_ID, ctx);
+        self.cli_agent_api_profile_draft_agent = CLIAgent::Claude;
+        self.cli_agent_api_profile_draft_environment_id =
+            CLI_AGENT_API_ALL_ENVIRONMENTS_ID.to_owned();
+        self.cli_agent_api_profile_agent_dropdown
+            .update(ctx, |dropdown, ctx| {
+                dropdown.set_selected_by_action(
+                    AISettingsPageAction::SetCLIAgentApiProfileDraftAgent(CLIAgent::Claude),
+                    ctx,
+                );
+            });
+        self.cli_agent_api_profile_environment_dropdown
+            .update(ctx, |dropdown, ctx| {
+                dropdown.set_selected_by_action(
+                    AISettingsPageAction::SetCLIAgentApiProfileDraftEnvironment(
+                        CLI_AGENT_API_ALL_ENVIRONMENTS_ID.to_owned(),
+                    ),
+                    ctx,
+                );
+            });
+        self.cli_agent_api_profile_add_button
+            .update(ctx, |button, ctx| {
+                button.set_label("保存", ctx);
+                button.set_icon(Some(Icon::Check), ctx);
+            });
+        for editor in [
+            &self.cli_agent_api_profile_name_editor,
+            &self.cli_agent_api_profile_base_url_editor,
+            &self.cli_agent_api_profile_openai_base_url_editor,
+            &self.cli_agent_api_profile_api_format_editor,
+            &self.cli_agent_api_profile_auth_env_var_editor,
+            &self.cli_agent_api_profile_full_url_mode_editor,
+            &self.cli_agent_api_profile_api_key_editor,
+            &self.cli_agent_api_profile_model_editor,
+            &self.cli_agent_api_profile_model_catalog_editor,
+            &self.cli_agent_api_profile_model_mappings_editor,
+            &self.cli_agent_api_profile_priority_editor,
+            &self.cli_agent_api_profile_input_cost_editor,
+            &self.cli_agent_api_profile_output_cost_editor,
+            &self.cli_agent_api_profile_extra_env_editor,
+        ] {
+            editor.update(ctx, |editor, ctx| editor.set_buffer_text("", ctx));
+        }
+        self.cli_agent_api_profile_api_format_editor
+            .update(ctx, |editor, ctx| {
+                editor.set_buffer_text("anthropic_messages", ctx);
+            });
+        self.cli_agent_api_profile_auth_env_var_editor
+            .update(ctx, |editor, ctx| {
+                editor.set_buffer_text("ANTHROPIC_AUTH_TOKEN", ctx);
+            });
+        self.cli_agent_api_profile_full_url_mode_editor
+            .update(ctx, |editor, ctx| {
+                editor.set_buffer_text("false", ctx);
+            });
+        self.cli_agent_api_profile_fetch_models_button
+            .update(ctx, |button, ctx| {
+                button.set_label("获取模型", ctx);
+                button.set_disabled(false, ctx);
+            });
+        self.refresh_cli_agent_api_profile_model_picker_dropdown(ctx);
+    }
+
+    fn handle_edit_cli_agent_api_profile(&mut self, profile_id: &str, ctx: &mut ViewContext<Self>) {
+        let Some(profile) = AISettings::as_ref(ctx)
+            .cli_agent_api_profiles()
+            .profiles
+            .into_iter()
+            .find(|profile| profile.id == profile_id)
+        else {
+            return;
+        };
+
+        let agent = profile.agent();
+        let environment_id = profile.environment_id.clone();
+        let profile_id = profile.id.clone();
+        let should_sync_active_profile = profile.enabled && agent == CLIAgent::Claude;
+        self.cli_agent_api_profile_fetched_models = profile.model_catalog.clone();
+        self.cli_agent_api_profile_selected_fetched_model = profile
+            .preferred_model()
+            .trim()
+            .is_empty()
+            .then(|| {
+                self.cli_agent_api_profile_fetched_models
+                    .first()
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .unwrap_or_else(|| profile.preferred_model());
+        self.cli_agent_api_profile_fetch_models_error = None;
+        self.cli_agent_api_profile_fetching_models = false;
+        self.cli_agent_api_profile_add_model_open = false;
+        self.cli_agent_api_profile_model_mapping_open = false;
+        self.cli_agent_api_profile_fetch_models_request_id = self
+            .cli_agent_api_profile_fetch_models_request_id
+            .wrapping_add(1);
+        self.sync_cli_agent_api_profile_add_model_button(ctx);
+        self.clear_cli_agent_api_profile_save_feedback(ctx);
+        self.cli_agent_api_profile_editing_profile_id = Some(profile.id.clone());
+        self.set_cli_agent_api_profile_preset_selection(CLI_AGENT_API_CUSTOM_PRESET_ID, ctx);
+        self.cli_agent_api_profile_draft_agent = agent;
+        self.cli_agent_api_profile_draft_environment_id = environment_id.clone();
+        self.cli_agent_api_profile_agent_dropdown
+            .update(ctx, |dropdown, ctx| {
+                dropdown.set_selected_by_action(
+                    AISettingsPageAction::SetCLIAgentApiProfileDraftAgent(agent),
+                    ctx,
+                );
+            });
+        self.refresh_cli_agent_api_profile_environment_dropdown(ctx);
+        self.cli_agent_api_profile_add_button
+            .update(ctx, |button, ctx| {
+                button.set_label("保存", ctx);
+                button.set_icon(Some(Icon::Check), ctx);
+            });
+        self.cli_agent_api_profile_fetch_models_button
+            .update(ctx, |button, ctx| {
+                button.set_label("获取模型", ctx);
+                button.set_disabled(false, ctx);
+            });
+
+        let anthropic_base_url = Self::cli_agent_api_profile_anthropic_base_url(&profile);
+        let openai_base_url = Self::cli_agent_api_profile_openai_base_url(&profile);
+        for (editor, text) in [
+            (&self.cli_agent_api_profile_name_editor, profile.name),
+            (
+                &self.cli_agent_api_profile_base_url_editor,
+                anthropic_base_url,
+            ),
+            (
+                &self.cli_agent_api_profile_openai_base_url_editor,
+                openai_base_url,
+            ),
+            (
+                &self.cli_agent_api_profile_api_format_editor,
+                profile.api_format,
+            ),
+            (
+                &self.cli_agent_api_profile_auth_env_var_editor,
+                profile.auth_env_var,
+            ),
+            (
+                &self.cli_agent_api_profile_full_url_mode_editor,
+                profile.full_url_mode.to_string(),
+            ),
+            (&self.cli_agent_api_profile_api_key_editor, profile.api_key),
+            (&self.cli_agent_api_profile_model_editor, profile.model),
+            (
+                &self.cli_agent_api_profile_model_catalog_editor,
+                Self::format_cli_agent_api_model_catalog(&profile.model_catalog),
+            ),
+            (
+                &self.cli_agent_api_profile_model_mappings_editor,
+                Self::format_cli_agent_api_model_mappings(&profile.model_mappings),
+            ),
+            (
+                &self.cli_agent_api_profile_priority_editor,
+                profile.priority.to_string(),
+            ),
+            (
+                &self.cli_agent_api_profile_input_cost_editor,
+                profile.input_cost_per_million_tokens.to_string(),
+            ),
+            (
+                &self.cli_agent_api_profile_output_cost_editor,
+                profile.output_cost_per_million_tokens.to_string(),
+            ),
+            (
+                &self.cli_agent_api_profile_extra_env_editor,
+                Self::format_cli_agent_api_extra_env(&profile.extra_env),
+            ),
+        ] {
+            editor.update(ctx, |editor, ctx| editor.set_buffer_text(&text, ctx));
+        }
+
+        if profile.enabled {
+            let profile_id = profile_id.clone();
+            AISettings::handle(ctx).update(ctx, |settings, ctx| {
+                settings.set_active_cli_agent_api_profile(agent, &environment_id, &profile_id, ctx);
+            });
+        }
+        self.cli_agent_api_profile_editor_open = false;
+        self.refresh_cli_agent_api_profile_model_picker_dropdown(ctx);
+        if should_sync_active_profile {
+            self.sync_cli_agent_api_profile_settings(&profile_id, "供应商已切换", ctx);
+        }
+        ctx.notify();
+    }
+
+    fn handle_add_cli_agent_api_profile(&mut self, ctx: &mut ViewContext<Self>) {
+        let name = self
+            .cli_agent_api_profile_name_editor
+            .as_ref(ctx)
+            .buffer_text(ctx);
+        let anthropic_base_url = self
+            .cli_agent_api_profile_base_url_editor
+            .as_ref(ctx)
+            .buffer_text(ctx);
+        let openai_base_url = self
+            .cli_agent_api_profile_openai_base_url_editor
+            .as_ref(ctx)
+            .buffer_text(ctx);
+        let base_url = Self::cli_agent_api_profile_base_url_for_agent(
+            self.cli_agent_api_profile_draft_agent,
+            &anthropic_base_url,
+            &openai_base_url,
+        );
+        let api_format = self
+            .cli_agent_api_profile_api_format_editor
+            .as_ref(ctx)
+            .buffer_text(ctx);
+        let auth_env_var = self
+            .cli_agent_api_profile_auth_env_var_editor
+            .as_ref(ctx)
+            .buffer_text(ctx);
+        let full_url_mode = matches!(
+            self.cli_agent_api_profile_full_url_mode_editor
+                .as_ref(ctx)
+                .buffer_text(ctx)
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "1" | "true" | "yes" | "on" | "full"
+        );
+        let api_key = self
+            .cli_agent_api_profile_api_key_editor
+            .as_ref(ctx)
+            .buffer_text(ctx);
+        let model = self
+            .cli_agent_api_profile_model_editor
+            .as_ref(ctx)
+            .buffer_text(ctx);
+        let priority = self
+            .cli_agent_api_profile_priority_editor
+            .as_ref(ctx)
+            .buffer_text(ctx)
+            .trim()
+            .parse::<u32>()
+            .unwrap_or_default();
+        let input_cost_per_million_tokens = Self::parse_cli_agent_api_cost_per_million_tokens(
+            &self
+                .cli_agent_api_profile_input_cost_editor
+                .as_ref(ctx)
+                .buffer_text(ctx),
+        );
+        let output_cost_per_million_tokens = Self::parse_cli_agent_api_cost_per_million_tokens(
+            &self
+                .cli_agent_api_profile_output_cost_editor
+                .as_ref(ctx)
+                .buffer_text(ctx),
+        );
+        let mut extra_env = Self::parse_cli_agent_api_extra_env(
+            &self
+                .cli_agent_api_profile_extra_env_editor
+                .as_ref(ctx)
+                .buffer_text(ctx),
+        );
+        extra_env.remove(CLI_AGENT_API_ANTHROPIC_BASE_URL_ENV_KEY);
+        extra_env.remove(CLI_AGENT_API_OPENAI_BASE_URL_ENV_KEY);
+        if !anthropic_base_url.trim().is_empty() {
+            extra_env.insert(
+                CLI_AGENT_API_ANTHROPIC_BASE_URL_ENV_KEY.to_owned(),
+                anthropic_base_url.trim().to_owned(),
+            );
+        }
+        if !openai_base_url.trim().is_empty() {
+            extra_env.insert(
+                CLI_AGENT_API_OPENAI_BASE_URL_ENV_KEY.to_owned(),
+                openai_base_url.trim().to_owned(),
+            );
+        }
+        let model_catalog = Self::parse_cli_agent_api_model_catalog(
+            &self
+                .cli_agent_api_profile_model_catalog_editor
+                .as_ref(ctx)
+                .buffer_text(ctx),
+        );
+        let mut model_mappings = Self::parse_cli_agent_api_model_mappings(
+            &self
+                .cli_agent_api_profile_model_mappings_editor
+                .as_ref(ctx)
+                .buffer_text(ctx),
+        );
+        if model_mappings.is_empty() && !model.trim().is_empty() {
+            model_mappings = Self::parse_cli_agent_api_model_mappings(
+                &Self::default_cli_agent_api_model_mappings_text(
+                    self.cli_agent_api_profile_draft_agent,
+                    &model,
+                ),
+            );
+        }
+
+        if base_url.trim().is_empty()
+            && api_key.trim().is_empty()
+            && model.trim().is_empty()
+            && model_catalog.is_empty()
+            && model_mappings.is_empty()
+            && extra_env.is_empty()
+        {
+            log::warn!("Ignoring empty CLI agent API profile");
+            self.set_cli_agent_api_profile_save_feedback("请先填写供应商信息再保存", true, ctx);
+            return;
+        }
+
+        let mut profile = CLIAgentApiProfile::new(
+            self.cli_agent_api_profile_draft_agent,
+            self.cli_agent_api_profile_draft_environment_id.clone(),
+            name,
+            base_url,
+            api_key,
+            model,
+        );
+        profile.api_format = api_format;
+        profile.full_url_mode = full_url_mode;
+        profile.auth_env_var = auth_env_var;
+        profile.model_catalog = model_catalog;
+        profile.model_mappings = model_mappings;
+        profile.priority = priority;
+        profile.input_cost_per_million_tokens = input_cost_per_million_tokens;
+        profile.output_cost_per_million_tokens = output_cost_per_million_tokens;
+        profile.extra_env = extra_env;
+        if let Some(profile_id) = self.cli_agent_api_profile_editing_profile_id.clone() {
+            if let Some(existing) = AISettings::as_ref(ctx)
+                .cli_agent_api_profiles()
+                .profiles
+                .into_iter()
+                .find(|profile| profile.id == profile_id)
+            {
+                profile.enabled = existing.enabled;
+                profile.health = existing.health;
+            }
+            profile.id = profile_id;
+        }
+        let make_active = profile.enabled;
+        let saved_profile_id = profile.id.clone();
+        AISettings::handle(ctx).update(ctx, |settings, ctx| {
+            settings.add_cli_agent_api_profile(profile, make_active, ctx);
+        });
+        self.cli_agent_api_profile_editing_profile_id = Some(saved_profile_id.clone());
+        self.cli_agent_api_profile_add_button
+            .update(ctx, |button, ctx| {
+                button.set_label("保存", ctx);
+                button.set_icon(Some(Icon::Check), ctx);
+            });
+        self.sync_cli_agent_api_profile_mouse_state_handles(ctx);
+        self.set_cli_agent_api_profile_save_feedback("供应商已保存", false, ctx);
+        self.sync_saved_cli_agent_api_profile_settings(&saved_profile_id, ctx);
+        ctx.notify();
+    }
+
+    fn set_cli_agent_api_profiles_json_editor_text(
+        &mut self,
+        text: &str,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        self.cli_agent_api_profiles_json_editor
+            .update(ctx, |editor, ctx| editor.set_buffer_text(text, ctx));
+    }
+
+    fn handle_copy_cli_agent_api_profiles_json(&mut self, ctx: &mut ViewContext<Self>) {
+        match AISettings::as_ref(ctx).cli_agent_api_profiles_export_json() {
+            Ok(json) => {
+                ctx.clipboard()
+                    .write(ClipboardContent::plain_text(json.clone()));
+                self.set_cli_agent_api_profiles_json_editor_text(&json, ctx);
+                ctx.notify();
+            }
+            Err(error) => {
+                log::warn!("{error}");
+            }
+        }
+    }
+
+    fn handle_paste_cli_agent_api_profiles_json(&mut self, ctx: &mut ViewContext<Self>) {
+        let clipboard_text = ctx.clipboard().read().plain_text;
+        self.set_cli_agent_api_profiles_json_editor_text(&clipboard_text, ctx);
+        ctx.notify();
+    }
+
+    fn handle_import_cli_agent_api_profiles_json(
+        &mut self,
+        replace_existing: bool,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let raw_json = self
+            .cli_agent_api_profiles_json_editor
+            .as_ref(ctx)
+            .buffer_text(ctx);
+        let mut result = Ok(0);
+        AISettings::handle(ctx).update(ctx, |settings, ctx| {
+            result = if replace_existing {
+                settings.replace_cli_agent_api_profiles_json(&raw_json, ctx)
+            } else {
+                settings.merge_cli_agent_api_profiles_json(&raw_json, ctx)
+            };
+        });
+
+        match result {
+            Ok(profile_count) => {
+                log::info!("Imported {profile_count} Agent API profiles");
+                if let Ok(json) = AISettings::as_ref(ctx).cli_agent_api_profiles_export_json() {
+                    self.set_cli_agent_api_profiles_json_editor_text(&json, ctx);
+                }
+                self.sync_cli_agent_api_profile_mouse_state_handles(ctx);
+                ctx.notify();
+            }
+            Err(error) => {
+                log::warn!("Failed to import Agent API profiles JSON: {error}");
+            }
+        }
+    }
+
+    fn handle_check_cli_agent_api_profile(
+        &mut self,
+        profile_id: &str,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let Some(profile) = AISettings::as_ref(ctx)
+            .cli_agent_api_profiles()
+            .profiles
+            .into_iter()
+            .find(|profile| profile.id == profile_id)
+        else {
+            return;
+        };
+        let profile_id = profile.id.clone();
+        let checking_health =
+            CLIAgentApiProfileHealth::checking(cli_agent_api_health_check_now_ms());
+        AISettings::handle(ctx).update(ctx, |settings, ctx| {
+            settings.record_cli_agent_api_profile_health(&profile_id, checking_health, ctx);
+        });
+        ctx.notify();
+
+        ctx.spawn(
+            check_cli_agent_api_profile_health(profile),
+            move |me, health, ctx| {
+                AISettings::handle(ctx).update(ctx, |settings, ctx| {
+                    settings.record_cli_agent_api_profile_health(&profile_id, health, ctx);
+                });
+                me.sync_cli_agent_api_profile_mouse_state_handles(ctx);
+                ctx.notify();
+            },
+        );
+    }
+
+    fn handle_fetch_cli_agent_api_profile_models(&mut self, ctx: &mut ViewContext<Self>) {
+        let name = self
+            .cli_agent_api_profile_name_editor
+            .as_ref(ctx)
+            .buffer_text(ctx);
+        let anthropic_base_url = self
+            .cli_agent_api_profile_base_url_editor
+            .as_ref(ctx)
+            .buffer_text(ctx);
+        let openai_base_url = self
+            .cli_agent_api_profile_openai_base_url_editor
+            .as_ref(ctx)
+            .buffer_text(ctx);
+        let api_key = self
+            .cli_agent_api_profile_api_key_editor
+            .as_ref(ctx)
+            .buffer_text(ctx);
+        let model = self
+            .cli_agent_api_profile_model_editor
+            .as_ref(ctx)
+            .buffer_text(ctx);
+        let fetch_agent = if openai_base_url.trim().is_empty() {
+            self.cli_agent_api_profile_draft_agent
+        } else {
+            CLIAgent::Codex
+        };
+        let base_url = if openai_base_url.trim().is_empty() {
+            Self::cli_agent_api_profile_base_url_for_agent(
+                self.cli_agent_api_profile_draft_agent,
+                &anthropic_base_url,
+                &openai_base_url,
+            )
+        } else {
+            openai_base_url
+        };
+        let mut profile = CLIAgentApiProfile::new(
+            fetch_agent,
+            self.cli_agent_api_profile_draft_environment_id.clone(),
+            name,
+            base_url,
+            api_key,
+            model,
+        );
+        profile.api_format = self
+            .cli_agent_api_profile_api_format_editor
+            .as_ref(ctx)
+            .buffer_text(ctx);
+        profile.full_url_mode = matches!(
+            self.cli_agent_api_profile_full_url_mode_editor
+                .as_ref(ctx)
+                .buffer_text(ctx)
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "1" | "true" | "yes" | "on" | "full"
+        );
+        self.cli_agent_api_profile_fetching_models = true;
+        self.cli_agent_api_profile_fetch_models_request_id = self
+            .cli_agent_api_profile_fetch_models_request_id
+            .wrapping_add(1);
+        let request_id = self.cli_agent_api_profile_fetch_models_request_id;
+        self.cli_agent_api_profile_fetch_models_error = None;
+        self.cli_agent_api_profile_fetched_models.clear();
+        self.cli_agent_api_profile_selected_fetched_model.clear();
+        self.refresh_cli_agent_api_profile_model_picker_dropdown(ctx);
+        self.cli_agent_api_profile_fetch_models_button
+            .update(ctx, |button, ctx| {
+                button.set_label("获取中", ctx);
+                button.set_disabled(true, ctx);
+            });
+        ctx.notify();
+
+        ctx.spawn(
+            fetch_cli_agent_api_models(profile),
+            move |me, result, ctx| {
+                if me.cli_agent_api_profile_fetch_models_request_id != request_id {
+                    return;
+                }
+                me.cli_agent_api_profile_fetching_models = false;
+                me.cli_agent_api_profile_fetch_models_button
+                    .update(ctx, |button, ctx| {
+                        button.set_label("获取模型", ctx);
+                        button.set_disabled(false, ctx);
+                    });
+                match result {
+                    Ok(models) => {
+                        me.cli_agent_api_profile_fetched_models = models;
+                        me.cli_agent_api_profile_selected_fetched_model = me
+                            .cli_agent_api_profile_fetched_models
+                            .first()
+                            .cloned()
+                            .unwrap_or_default();
+                        if !me
+                            .cli_agent_api_profile_selected_fetched_model
+                            .trim()
+                            .is_empty()
+                            && me
+                                .cli_agent_api_profile_model_editor
+                                .as_ref(ctx)
+                                .buffer_text(ctx)
+                                .trim()
+                                .is_empty()
+                        {
+                            let model = me.cli_agent_api_profile_selected_fetched_model.clone();
+                            me.cli_agent_api_profile_model_editor
+                                .update(ctx, |editor, ctx| editor.set_buffer_text(&model, ctx));
+                        }
+                        me.cli_agent_api_profile_fetch_models_error = None;
+                    }
+                    Err(error) => {
+                        me.cli_agent_api_profile_fetched_models.clear();
+                        me.cli_agent_api_profile_selected_fetched_model.clear();
+                        me.cli_agent_api_profile_fetch_models_error = Some(error.clone());
+                        log::warn!("Failed to fetch Agent API models: {error}");
+                    }
+                }
+                me.refresh_cli_agent_api_profile_model_picker_dropdown(ctx);
+                ctx.notify();
+            },
+        );
+    }
+
+    fn cli_agent_api_environment_label(environment_id: &str, app: &AppContext) -> String {
+        match environment_id {
+            CLI_AGENT_API_ALL_ENVIRONMENTS_ID => "All environments".to_owned(),
+            CLI_AGENT_API_LOCAL_ENVIRONMENT_ID => "Local".to_owned(),
+            _ => SshRemoteModel::as_ref(app)
+                .hosts()
+                .iter()
+                .find(|host| ssh_remote_environment_id(&host.id) == environment_id)
+                .map(|host| format!("SSH {}", host.display_name()))
+                .unwrap_or_else(|| environment_id.to_owned()),
+        }
+    }
+
+    fn masked_api_key(api_key: &str) -> String {
+        let trimmed = api_key.trim();
+        if trimmed.is_empty() {
+            return "No API key".to_owned();
+        }
+
+        let suffix = trimmed
+            .chars()
+            .rev()
+            .take(4)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<String>();
+        format!("**** {suffix}")
+    }
+
     fn create_cli_agent_dropdowns(
         ctx: &mut ViewContext<Self>,
     ) -> Vec<ViewHandle<Dropdown<AISettingsPageAction>>> {
@@ -2785,6 +5390,158 @@ impl AISettingsPageView {
                 })
             })
             .collect()
+    }
+}
+
+fn cli_agent_api_health_check_now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or_default()
+}
+
+fn cli_agent_api_health_check_url(profile: &CLIAgentApiProfile) -> Result<String, String> {
+    let base_url = profile.base_url.trim().trim_end_matches('/');
+    if base_url.is_empty() {
+        return Err("No base URL configured".to_owned());
+    }
+    if !(base_url.starts_with("http://") || base_url.starts_with("https://")) {
+        return Err("Base URL must start with http:// or https://".to_owned());
+    }
+    if base_url.ends_with("/models") {
+        return Ok(base_url.to_owned());
+    }
+
+    let version_path = if profile.agent() == CLIAgent::Gemini {
+        "v1beta"
+    } else {
+        "v1"
+    };
+    if base_url.ends_with("/v1") || base_url.ends_with("/v1beta") {
+        Ok(format!("{base_url}/models"))
+    } else {
+        Ok(format!("{base_url}/{version_path}/models"))
+    }
+}
+
+async fn check_cli_agent_api_profile_health(
+    profile: CLIAgentApiProfile,
+) -> CLIAgentApiProfileHealth {
+    let checked_at_epoch_ms = cli_agent_api_health_check_now_ms();
+    let Ok(url) = cli_agent_api_health_check_url(&profile) else {
+        return CLIAgentApiProfileHealth::failed(
+            checked_at_epoch_ms,
+            0,
+            0,
+            cli_agent_api_health_check_url(&profile)
+                .err()
+                .unwrap_or_else(|| "Invalid health check URL".to_owned()),
+        );
+    };
+
+    let start = Instant::now();
+    let client = http_client::Client::new();
+    let mut request = client.get(url).timeout(Duration::from_secs(10));
+    let api_key = profile.api_key.trim();
+    if !api_key.is_empty() {
+        match profile.agent() {
+            CLIAgent::Claude => {
+                request = request
+                    .header("x-api-key", api_key)
+                    .header("anthropic-version", "2023-06-01");
+            }
+            CLIAgent::Gemini => {
+                request = request.header("x-goog-api-key", api_key);
+            }
+            _ => {
+                request = request.bearer_auth(api_key);
+            }
+        }
+    }
+
+    match request.send().await {
+        Ok(response) => {
+            let latency_ms = start.elapsed().as_millis().min(u64::MAX as u128) as u64;
+            let status = response.status();
+            if status.is_success() {
+                CLIAgentApiProfileHealth::healthy(checked_at_epoch_ms, latency_ms, status.as_u16())
+            } else {
+                CLIAgentApiProfileHealth::failed(
+                    checked_at_epoch_ms,
+                    latency_ms,
+                    status.as_u16(),
+                    format!("HTTP {status}"),
+                )
+            }
+        }
+        Err(error) => {
+            let latency_ms = start.elapsed().as_millis().min(u64::MAX as u128) as u64;
+            CLIAgentApiProfileHealth::failed(checked_at_epoch_ms, latency_ms, 0, error.to_string())
+        }
+    }
+}
+
+async fn fetch_cli_agent_api_models(profile: CLIAgentApiProfile) -> Result<Vec<String>, String> {
+    let url = cli_agent_api_health_check_url(&profile)?;
+    let client = http_client::Client::new();
+    let mut request = client.get(url).timeout(Duration::from_secs(15));
+    let api_key = profile.api_key.trim();
+    if !api_key.is_empty() {
+        match profile.agent() {
+            CLIAgent::Claude => {
+                request = request
+                    .header("x-api-key", api_key)
+                    .header("anthropic-version", "2023-06-01");
+            }
+            CLIAgent::Gemini => {
+                request = request.header("x-goog-api-key", api_key);
+            }
+            _ => {
+                request = request.bearer_auth(api_key);
+            }
+        }
+    }
+
+    let response = request
+        .send()
+        .await
+        .map_err(|error| format!("request failed: {error}"))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|error| format!("failed to read response body: {error}"))?;
+    if !status.is_success() {
+        return Err(format!("HTTP {status}: {body}"));
+    }
+
+    let value = serde_json::from_str::<serde_json::Value>(&body)
+        .map_err(|error| format!("invalid models JSON: {error}"))?;
+    let mut models = Vec::new();
+    if let Some(data) = value.get("data").and_then(serde_json::Value::as_array) {
+        for item in data {
+            if let Some(id) = item.get("id").and_then(serde_json::Value::as_str) {
+                models.push(id.to_owned());
+            }
+        }
+    }
+    if let Some(data) = value.get("models").and_then(serde_json::Value::as_array) {
+        for item in data {
+            if let Some(name) = item.get("name").and_then(serde_json::Value::as_str) {
+                models.push(name.trim_start_matches("models/").to_owned());
+            } else if let Some(name) = item.get("displayName").and_then(serde_json::Value::as_str) {
+                models.push(name.to_owned());
+            }
+        }
+    }
+    models.retain(|model| !model.trim().is_empty());
+    models.sort();
+    models.dedup();
+
+    if models.is_empty() {
+        Err("provider returned no models".to_owned())
+    } else {
+        Ok(models)
     }
 }
 
@@ -2894,6 +5651,40 @@ pub enum AISettingsPageAction {
     ToggleAutoToggleRichInput,
     ToggleAutoOpenRichInputOnCLIAgentStart,
     ToggleAutoDismissRichInputAfterSubmit,
+    SetCLIAgentBuiltinPromptMode {
+        agent: CLIAgent,
+        mode: CLIAgentBuiltinPromptMode,
+    },
+    SetCLIAgentApiProfilePreset(String),
+    SetCLIAgentApiProfileDraftAgent(CLIAgent),
+    SetCLIAgentApiProfileDraftEnvironment(String),
+    OpenAddCLIAgentApiProfileModal,
+    AddCLIAgentApiProfile,
+    FetchCLIAgentApiProfileModels,
+    SelectCLIAgentApiProfileFetchedModel(String),
+    ToggleCLIAgentApiProfileAddModel,
+    ToggleCLIAgentApiProfileModelMapping,
+    AddCLIAgentApiProfileDraftModel,
+    AddCLIAgentApiProfileSelectedFetchedModel,
+    UseCLIAgentApiProfileModel(String),
+    RemoveCLIAgentApiProfileModel(String),
+    EditCLIAgentApiProfile(String),
+    CancelEditCLIAgentApiProfile,
+    RemoveCLIAgentApiProfile(String),
+    CopyCLIAgentApiProfilesJson,
+    PasteCLIAgentApiProfilesJson,
+    MergeCLIAgentApiProfilesJson,
+    ReplaceCLIAgentApiProfilesJson,
+    CheckCLIAgentApiProfile(String),
+    SetCLIAgentApiProfileEnabled {
+        profile_id: String,
+        enabled: bool,
+    },
+    SetActiveCLIAgentApiProfile {
+        agent: CLIAgent,
+        environment_id: String,
+        profile_id: String,
+    },
     SetCLIAgentForCommand {
         pattern: String,
         agent: Option<CLIAgent>,
@@ -3309,6 +6100,203 @@ impl TypedActionView for AISettingsPageView {
                 AISettings::handle(ctx).update(ctx, |settings, ctx| {
                     settings.remove_cli_agent_footer_enabled_command(command, ctx);
                 });
+            }
+            AISettingsPageAction::SetCLIAgentBuiltinPromptMode { agent, mode } => {
+                AISettings::handle(ctx).update(ctx, |settings, ctx| {
+                    settings.set_cli_agent_builtin_prompt_mode(*agent, *mode, ctx);
+                });
+            }
+            AISettingsPageAction::SetCLIAgentApiProfilePreset(preset_id) => {
+                self.handle_set_cli_agent_api_profile_preset(preset_id, ctx);
+            }
+            AISettingsPageAction::SetCLIAgentApiProfileDraftAgent(agent) => {
+                self.set_cli_agent_api_profile_preset_selection(
+                    CLI_AGENT_API_CUSTOM_PRESET_ID,
+                    ctx,
+                );
+                self.cli_agent_api_profile_draft_agent = *agent;
+                self.cli_agent_api_profile_fetched_models.clear();
+                self.cli_agent_api_profile_selected_fetched_model.clear();
+                self.cli_agent_api_profile_fetch_models_error = None;
+                self.cli_agent_api_profile_fetching_models = false;
+                self.cli_agent_api_profile_fetch_models_request_id = self
+                    .cli_agent_api_profile_fetch_models_request_id
+                    .wrapping_add(1);
+                self.refresh_cli_agent_api_profile_model_picker_dropdown(ctx);
+                self.cli_agent_api_profile_fetch_models_button
+                    .update(ctx, |button, ctx| {
+                        button.set_label("获取模型", ctx);
+                        button.set_disabled(false, ctx);
+                    });
+                self.cli_agent_api_profile_api_format_editor
+                    .update(ctx, |editor, ctx| {
+                        editor.set_buffer_text(Self::cli_agent_api_default_api_format(*agent), ctx);
+                    });
+                self.cli_agent_api_profile_auth_env_var_editor
+                    .update(ctx, |editor, ctx| {
+                        editor
+                            .set_buffer_text(Self::cli_agent_api_default_auth_env_var(*agent), ctx);
+                    });
+                ctx.notify();
+            }
+            AISettingsPageAction::SetCLIAgentApiProfileDraftEnvironment(environment_id) => {
+                self.cli_agent_api_profile_draft_environment_id = environment_id.clone();
+                ctx.notify();
+            }
+            AISettingsPageAction::OpenAddCLIAgentApiProfileModal => {
+                self.reset_cli_agent_api_profile_form(ctx);
+                self.cli_agent_api_profile_editor_open = false;
+                ctx.emit(AISettingsPageEvent::HideModal);
+                ctx.notify();
+            }
+            AISettingsPageAction::AddCLIAgentApiProfile => {
+                self.handle_add_cli_agent_api_profile(ctx);
+            }
+            AISettingsPageAction::FetchCLIAgentApiProfileModels => {
+                self.handle_fetch_cli_agent_api_profile_models(ctx);
+            }
+            AISettingsPageAction::SelectCLIAgentApiProfileFetchedModel(model) => {
+                self.cli_agent_api_profile_selected_fetched_model = model.clone();
+                if !model.trim().is_empty() {
+                    self.cli_agent_api_profile_model_editor
+                        .update(ctx, |editor, ctx| editor.set_buffer_text(model, ctx));
+                }
+                ctx.notify();
+            }
+            AISettingsPageAction::ToggleCLIAgentApiProfileAddModel => {
+                self.cli_agent_api_profile_add_model_open =
+                    !self.cli_agent_api_profile_add_model_open;
+                self.sync_cli_agent_api_profile_add_model_button(ctx);
+                ctx.notify();
+            }
+            AISettingsPageAction::ToggleCLIAgentApiProfileModelMapping => {
+                self.cli_agent_api_profile_model_mapping_open =
+                    !self.cli_agent_api_profile_model_mapping_open;
+                ctx.notify();
+            }
+            AISettingsPageAction::AddCLIAgentApiProfileDraftModel => {
+                let model = self
+                    .cli_agent_api_profile_model_editor
+                    .as_ref(ctx)
+                    .buffer_text(ctx);
+                self.handle_add_cli_agent_api_profile_model(&model, true, ctx);
+            }
+            AISettingsPageAction::AddCLIAgentApiProfileSelectedFetchedModel => {
+                let model = self.cli_agent_api_profile_selected_fetched_model.clone();
+                self.handle_add_cli_agent_api_profile_model(&model, false, ctx);
+            }
+            AISettingsPageAction::UseCLIAgentApiProfileModel(model) => {
+                self.handle_add_cli_agent_api_profile_model(model, true, ctx);
+            }
+            AISettingsPageAction::RemoveCLIAgentApiProfileModel(model) => {
+                self.handle_remove_cli_agent_api_profile_model(model, ctx);
+            }
+            AISettingsPageAction::EditCLIAgentApiProfile(profile_id) => {
+                self.handle_edit_cli_agent_api_profile(profile_id, ctx);
+            }
+            AISettingsPageAction::CancelEditCLIAgentApiProfile => {
+                self.reset_cli_agent_api_profile_form(ctx);
+                self.cli_agent_api_profile_editor_open = false;
+                ctx.emit(AISettingsPageEvent::HideModal);
+                ctx.notify();
+            }
+            AISettingsPageAction::RemoveCLIAgentApiProfile(profile_id) => {
+                let was_editing = self.cli_agent_api_profile_editing_profile_id.as_deref()
+                    == Some(profile_id.as_str());
+                AISettings::handle(ctx).update(ctx, |settings, ctx| {
+                    settings.remove_cli_agent_api_profile(profile_id, ctx);
+                });
+                if was_editing {
+                    self.reset_cli_agent_api_profile_form(ctx);
+                    self.cli_agent_api_profile_editor_open = false;
+                    ctx.emit(AISettingsPageEvent::HideModal);
+                }
+                self.sync_cli_agent_api_profile_mouse_state_handles(ctx);
+                ctx.notify();
+            }
+            AISettingsPageAction::CopyCLIAgentApiProfilesJson => {
+                self.handle_copy_cli_agent_api_profiles_json(ctx);
+            }
+            AISettingsPageAction::PasteCLIAgentApiProfilesJson => {
+                self.handle_paste_cli_agent_api_profiles_json(ctx);
+            }
+            AISettingsPageAction::MergeCLIAgentApiProfilesJson => {
+                self.handle_import_cli_agent_api_profiles_json(false, ctx);
+            }
+            AISettingsPageAction::ReplaceCLIAgentApiProfilesJson => {
+                self.handle_import_cli_agent_api_profiles_json(true, ctx);
+            }
+            AISettingsPageAction::CheckCLIAgentApiProfile(profile_id) => {
+                self.handle_check_cli_agent_api_profile(profile_id, ctx);
+            }
+            AISettingsPageAction::SetCLIAgentApiProfileEnabled {
+                profile_id,
+                enabled,
+            } => {
+                let profile_before_change = AISettings::as_ref(ctx)
+                    .cli_agent_api_profiles()
+                    .profiles
+                    .into_iter()
+                    .find(|profile| profile.id == *profile_id);
+                let profile_to_activate = if *enabled {
+                    profile_before_change.clone()
+                } else {
+                    None
+                };
+                let sync_enabled_profile_id = profile_to_activate
+                    .as_ref()
+                    .filter(|profile| profile.agent() == CLIAgent::Claude)
+                    .map(|profile| profile.id.clone());
+                let sync_after_disable = if !*enabled {
+                    profile_before_change
+                        .as_ref()
+                        .filter(|profile| profile.agent() == CLIAgent::Claude)
+                        .map(|profile| (profile.agent(), profile.environment_id.clone()))
+                } else {
+                    None
+                };
+                AISettings::handle(ctx).update(ctx, |settings, ctx| {
+                    settings.set_cli_agent_api_profile_enabled(profile_id, *enabled, ctx);
+                    if let Some(profile) = profile_to_activate.as_ref() {
+                        settings.set_active_cli_agent_api_profile(
+                            profile.agent(),
+                            &profile.environment_id,
+                            &profile.id,
+                            ctx,
+                        );
+                    }
+                });
+                if let Some(profile_id) = sync_enabled_profile_id {
+                    self.sync_cli_agent_api_profile_settings(&profile_id, "供应商已启用", ctx);
+                } else if let Some((agent, environment_id)) = sync_after_disable {
+                    self.sync_active_cli_agent_api_profile_settings(
+                        agent,
+                        &environment_id,
+                        "供应商已禁用",
+                        ctx,
+                    );
+                }
+                ctx.notify();
+            }
+            AISettingsPageAction::SetActiveCLIAgentApiProfile {
+                agent,
+                environment_id,
+                profile_id,
+            } => {
+                AISettings::handle(ctx).update(ctx, |settings, ctx| {
+                    settings.set_active_cli_agent_api_profile(
+                        *agent,
+                        environment_id,
+                        profile_id,
+                        ctx,
+                    );
+                });
+                self.sync_active_cli_agent_api_profile_settings(
+                    *agent,
+                    environment_id,
+                    "供应商已切换",
+                    ctx,
+                );
             }
             AISettingsPageAction::SetCLIAgentForCommand { pattern, agent } => {
                 AISettings::handle(ctx).update(ctx, |settings, ctx| {
@@ -6751,6 +9739,1406 @@ impl SettingsWidget for CLIAgentWidget {
                     appearance,
                 ));
             }
+        }
+
+        column.finish()
+    }
+}
+
+#[derive(Default)]
+struct CLIAgentApiProfilesWidget;
+
+impl CLIAgentApiProfilesWidget {
+    fn render_input(
+        appearance: &Appearance,
+        label: &'static str,
+        editor: ViewHandle<EditorView>,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let input = appearance
+            .ui_builder()
+            .text_input(editor)
+            .with_style(UiComponentStyles {
+                padding: Some(Coords::default().top(6.).bottom(6.).left(10.).right(10.)),
+                background: Some(appearance.theme().surface_2().into()),
+                ..Default::default()
+            })
+            .build()
+            .finish();
+
+        Flex::column()
+            .with_spacing(4.)
+            .with_child(
+                Text::new_inline(label, appearance.ui_font_family(), CONTENT_FONT_SIZE)
+                    .with_color(styles::header_font_color(true, app).into())
+                    .finish(),
+            )
+            .with_child(input)
+            .finish()
+    }
+
+    fn render_multiline_input(
+        appearance: &Appearance,
+        label: &'static str,
+        editor: ViewHandle<EditorView>,
+        height: f32,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let editor = Container::new(
+            ConstrainedBox::new(ChildView::new(&editor).finish())
+                .with_height(height)
+                .finish(),
+        )
+        .with_background(appearance.theme().surface_2())
+        .with_border(Border::all(1.).with_border_fill(appearance.theme().outline()))
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
+        .with_horizontal_padding(8.)
+        .with_vertical_padding(6.)
+        .finish();
+
+        Flex::column()
+            .with_spacing(6.)
+            .with_child(
+                Text::new_inline(label, appearance.ui_font_family(), CONTENT_FONT_SIZE)
+                    .with_color(styles::header_font_color(true, app).into())
+                    .finish(),
+            )
+            .with_child(editor)
+            .finish()
+    }
+
+    fn render_section(
+        appearance: &Appearance,
+        title: &'static str,
+        child: Box<dyn Element>,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        Container::new(
+            Flex::column()
+                .with_spacing(6.)
+                .with_child(
+                    Text::new_inline(title, appearance.ui_font_family(), CONTENT_FONT_SIZE)
+                        .with_color(styles::header_font_color(true, app).into())
+                        .with_style(Properties::default().weight(Weight::Semibold))
+                        .finish(),
+                )
+                .with_child(child)
+                .finish(),
+        )
+        .with_vertical_padding(4.)
+        .finish()
+    }
+
+    fn render_hint_text(
+        appearance: &Appearance,
+        text: impl Into<String>,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        appearance
+            .ui_builder()
+            .paragraph(text.into())
+            .with_style(UiComponentStyles {
+                font_size: Some(CONTENT_FONT_SIZE),
+                font_color: Some(styles::description_font_color(true, app).into()),
+                ..Default::default()
+            })
+            .build()
+            .finish()
+    }
+
+    fn render_icon_action_button(
+        appearance: &Appearance,
+        icon: Icon,
+        action: AISettingsPageAction,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        Hoverable::new(MouseStateHandle::default(), move |state| {
+            let icon_fill = if state.is_hovered() {
+                theme.active_ui_text_color().into()
+            } else {
+                styles::description_font_color(true, app).into()
+            };
+            Container::new(
+                Align::new(
+                    ConstrainedBox::new(icon.to_warpui_icon(icon_fill).finish())
+                        .with_width(14.)
+                        .with_height(14.)
+                        .finish(),
+                )
+                .finish(),
+            )
+            .with_horizontal_padding(5.)
+            .with_vertical_padding(5.)
+            .with_background(if state.is_hovered() {
+                internal_colors::fg_overlay_1(theme)
+            } else {
+                theme.surface_1()
+            })
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
+            .finish()
+        })
+        .with_cursor(Cursor::PointingHand)
+        .on_click(move |ctx, _, _| {
+            ctx.dispatch_typed_action(action.clone());
+        })
+        .finish()
+    }
+
+    fn render_model_row(
+        appearance: &Appearance,
+        model: String,
+        trailing: Box<dyn Element>,
+        _app: &AppContext,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+
+        Container::new(
+            Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
+                .with_main_axis_size(MainAxisSize::Max)
+                .with_children([
+                    Shrinkable::new(
+                        1.,
+                        Text::new_inline(
+                            model,
+                            appearance.monospace_font_family(),
+                            CONTENT_FONT_SIZE,
+                        )
+                        .with_color(theme.active_ui_text_color().into())
+                        .finish(),
+                    )
+                    .finish(),
+                    trailing,
+                ])
+                .finish(),
+        )
+        .with_horizontal_padding(8.)
+        .with_vertical_padding(5.)
+        .with_background(theme.surface_2())
+        .with_border(Border::all(1.).with_border_fill(theme.outline()))
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
+        .finish()
+    }
+
+    fn render_current_models(
+        &self,
+        view: &AISettingsPageView,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let models = AISettingsPageView::parse_cli_agent_api_model_catalog(
+            &view
+                .cli_agent_api_profile_model_catalog_editor
+                .as_ref(app)
+                .buffer_text(app),
+        );
+        let preferred_model = view
+            .cli_agent_api_profile_model_editor
+            .as_ref(app)
+            .buffer_text(app);
+        let mut list = Flex::column().with_spacing(6.);
+
+        if models.is_empty() {
+            list.add_child(Self::render_hint_text(appearance, "还没有添加模型。", app));
+        }
+
+        for model in models {
+            let is_preferred = preferred_model.trim().eq_ignore_ascii_case(&model);
+            let model_for_use = model.clone();
+            let model_for_remove = model.clone();
+            let status_or_use = Self::render_icon_action_button(
+                appearance,
+                Icon::Link,
+                AISettingsPageAction::UseCLIAgentApiProfileModel(model_for_use),
+                app,
+            );
+            let remove_button = Self::render_icon_action_button(
+                appearance,
+                Icon::Trash,
+                AISettingsPageAction::RemoveCLIAgentApiProfileModel(model_for_remove),
+                app,
+            );
+            let trailing = Flex::row()
+                .with_spacing(6.)
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_child(if is_preferred {
+                    Text::new_inline("默认", appearance.ui_font_family(), CONTENT_FONT_SIZE)
+                        .with_color(theme.accent().into())
+                        .with_style(Properties::default().weight(Weight::Semibold))
+                        .finish()
+                } else {
+                    Empty::new().finish()
+                })
+                .with_child(status_or_use)
+                .with_child(remove_button)
+                .finish();
+            list.add_child(Self::render_model_row(appearance, model, trailing, app));
+        }
+
+        let add_model_button = view
+            .cli_agent_api_profile_toggle_add_model_button
+            .as_ref(app)
+            .render(app);
+
+        let mut column = Flex::column()
+            .with_spacing(8.)
+            .with_child(list.finish())
+            .with_child(add_model_button);
+
+        if view.cli_agent_api_profile_add_model_open {
+            column.add_child(self.render_add_model_panel(view, appearance, app));
+        }
+
+        column.finish()
+    }
+
+    fn render_add_model_panel(
+        &self,
+        view: &AISettingsPageView,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let status = if view.cli_agent_api_profile_fetching_models {
+            Some("正在获取模型...")
+        } else if view.cli_agent_api_profile_fetch_models_error.is_some() {
+            Some("获取模型失败，请检查接口地址和 API Key。")
+        } else if view.cli_agent_api_profile_fetched_models.is_empty() {
+            Some("点击获取模型后，可从下拉列表选择并填入。")
+        } else {
+            None
+        };
+
+        let mut content = Flex::column().with_spacing(8.).with_child(
+            Flex::row()
+                .with_spacing(8.)
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_children([
+                    view.cli_agent_api_profile_fetch_models_button
+                        .as_ref(app)
+                        .render(app),
+                    Shrinkable::new(
+                        1.,
+                        status
+                            .map(|status| Self::render_hint_text(appearance, status, app))
+                            .unwrap_or_else(|| {
+                                Self::render_hint_text(
+                                    appearance,
+                                    "选择模型后会自动填入，也可以手动输入。",
+                                    app,
+                                )
+                            }),
+                    )
+                    .finish(),
+                ])
+                .finish(),
+        );
+
+        if !view.cli_agent_api_profile_fetched_models.is_empty() {
+            content.add_child(
+                Flex::row()
+                    .with_spacing(8.)
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_children([
+                        Expanded::new(
+                            1.,
+                            ChildView::new(&view.cli_agent_api_profile_model_picker_dropdown)
+                                .finish(),
+                        )
+                        .finish(),
+                        view.cli_agent_api_profile_add_selected_model_button
+                            .as_ref(app)
+                            .render(app),
+                    ])
+                    .finish(),
+            );
+        }
+
+        content.add_child(
+            Flex::row()
+                .with_spacing(8.)
+                .with_cross_axis_alignment(CrossAxisAlignment::End)
+                .with_children([
+                    Expanded::new(
+                        1.,
+                        Self::render_input(
+                            appearance,
+                            "手动输入模型",
+                            view.cli_agent_api_profile_model_editor.clone(),
+                            app,
+                        ),
+                    )
+                    .finish(),
+                    view.cli_agent_api_profile_add_manual_model_button
+                        .as_ref(app)
+                        .render(app),
+                ])
+                .finish(),
+        );
+
+        Container::new(content.finish())
+            .with_horizontal_padding(10.)
+            .with_vertical_padding(10.)
+            .with_background(theme.surface_2())
+            .with_border(Border::all(1.).with_border_fill(theme.outline()))
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
+            .finish()
+    }
+
+    fn render_model_mapping_section(
+        &self,
+        view: &AISettingsPageView,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let chevron = if view.cli_agent_api_profile_model_mapping_open {
+            Icon::ChevronDown
+        } else {
+            Icon::ChevronRight
+        };
+        let header = Hoverable::new(MouseStateHandle::default(), move |state| {
+            let color = if state.is_hovered() {
+                theme.active_ui_text_color()
+            } else {
+                styles::description_font_color(true, app)
+            };
+            Flex::row()
+                .with_spacing(4.)
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_child(
+                    Text::new_inline(
+                        "Claude 模型映射",
+                        appearance.ui_font_family(),
+                        CONTENT_FONT_SIZE,
+                    )
+                    .with_color(color.into())
+                    .finish(),
+                )
+                .with_child(
+                    ConstrainedBox::new(chevron.to_warpui_icon(color.into()).finish())
+                        .with_width(12.)
+                        .with_height(12.)
+                        .finish(),
+                )
+                .finish()
+        })
+        .with_cursor(Cursor::PointingHand)
+        .on_click(|ctx, _, _| {
+            ctx.dispatch_typed_action(AISettingsPageAction::ToggleCLIAgentApiProfileModelMapping);
+        })
+        .finish();
+
+        let mut column = Flex::column().with_spacing(8.).with_child(header);
+        if view.cli_agent_api_profile_model_mapping_open {
+            column.add_child(Self::render_multiline_input(
+                appearance,
+                "映射配置",
+                view.cli_agent_api_profile_model_mappings_editor.clone(),
+                72.,
+                app,
+            ));
+        }
+
+        Flex::column()
+            .with_spacing(8.)
+            .with_child(column.finish())
+            .finish()
+    }
+
+    fn render_profile_form(
+        &self,
+        view: &AISettingsPageView,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        Flex::column()
+            .with_spacing(12.)
+            .with_child(Self::render_input(
+                appearance,
+                "供应商名称",
+                view.cli_agent_api_profile_name_editor.clone(),
+                app,
+            ))
+            .with_child(Self::render_input(
+                appearance,
+                "Anthropic 接口地址",
+                view.cli_agent_api_profile_base_url_editor.clone(),
+                app,
+            ))
+            .with_child(Self::render_input(
+                appearance,
+                "OpenAI 接口地址",
+                view.cli_agent_api_profile_openai_base_url_editor.clone(),
+                app,
+            ))
+            .with_child(Self::render_input(
+                appearance,
+                "API Key",
+                view.cli_agent_api_profile_api_key_editor.clone(),
+                app,
+            ))
+            .with_child(
+                Flex::row()
+                    .with_spacing(8.)
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_child(ChildView::new(&view.cli_agent_api_profile_agent_dropdown).finish())
+                    .with_child(
+                        ChildView::new(&view.cli_agent_api_profile_environment_dropdown).finish(),
+                    )
+                    .finish(),
+            )
+            .with_child(Self::render_section(
+                appearance,
+                "模型列表",
+                self.render_current_models(view, appearance, app),
+                app,
+            ))
+            .with_child(self.render_model_mapping_section(view, appearance, app))
+            .finish()
+    }
+
+    fn render_status_badge(
+        appearance: &Appearance,
+        label: &str,
+        active: bool,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let background = if active {
+            internal_colors::fg_overlay_1(theme)
+        } else {
+            theme.surface_2()
+        };
+        let color = if active {
+            theme.accent()
+        } else {
+            styles::description_font_color(true, app).into()
+        };
+
+        Container::new(
+            Text::new_inline(
+                label.to_owned(),
+                appearance.ui_font_family(),
+                CONTENT_FONT_SIZE,
+            )
+            .with_color(color.into())
+            .with_style(Properties::default().weight(Weight::Semibold))
+            .finish(),
+        )
+        .with_horizontal_padding(8.)
+        .with_vertical_padding(3.)
+        .with_background(background)
+        .with_border(Border::all(1.).with_border_fill(theme.outline()))
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(999.)))
+        .finish()
+    }
+
+    fn render_provider_sidebar(
+        &self,
+        view: &AISettingsPageView,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let store = AISettings::as_ref(app).cli_agent_api_profiles();
+        let selected_profile_id = view.cli_agent_api_profile_editing_profile_id.as_deref();
+        let description_color = styles::description_font_color(true, app);
+
+        let mut list = Flex::column().with_spacing(6.);
+        if store.profiles.is_empty() {
+            list.add_child(
+                appearance
+                    .ui_builder()
+                    .paragraph("还没有自定义供应商。")
+                    .with_style(UiComponentStyles {
+                        font_size: Some(appearance.ui_font_size()),
+                        font_color: Some(description_color.into()),
+                        ..Default::default()
+                    })
+                    .build()
+                    .finish(),
+            );
+        }
+
+        for (index, profile) in store.profiles.iter().enumerate() {
+            let agent = profile.agent();
+            let environment_id = profile.environment_id.clone();
+            let active_profile_id = AISettings::as_ref(app)
+                .active_cli_agent_api_profile(agent, &environment_id)
+                .map(|profile| profile.id.clone());
+            let is_active = active_profile_id.as_deref() == Some(profile.id.as_str());
+            let is_selected = selected_profile_id == Some(profile.id.as_str());
+            let row_mouse_state = view
+                .cli_agent_api_profile_mouse_state_handles
+                .get(index)
+                .cloned()
+                .unwrap_or_default();
+            let profile_id = profile.id.clone();
+            let profile_name = profile.name.clone();
+            let model = profile.preferred_model();
+            let details = if model.trim().is_empty() {
+                format!(
+                    "{} / {}",
+                    agent.display_name(),
+                    AISettingsPageView::cli_agent_api_environment_label(&environment_id, app)
+                )
+            } else {
+                format!(
+                    "{} / {} / {}",
+                    agent.display_name(),
+                    AISettingsPageView::cli_agent_api_environment_label(&environment_id, app),
+                    model
+                )
+            };
+            let status_fill = if profile.enabled && is_active {
+                theme.accent()
+            } else if profile.enabled {
+                theme.ansi_fg_green().into()
+            } else {
+                theme.nonactive_ui_detail().into()
+            };
+
+            let row = Hoverable::new(row_mouse_state, move |state| {
+                let background = if is_selected {
+                    theme.surface_overlay_1()
+                } else if state.is_hovered() {
+                    internal_colors::fg_overlay_1(theme)
+                } else {
+                    theme.surface_1()
+                };
+                let icon = ConstrainedBox::new(
+                    Icon::Globe
+                        .to_warpui_icon(styles::description_font_color(true, app).into())
+                        .finish(),
+                )
+                .with_width(14.)
+                .with_height(14.)
+                .finish();
+                let title = Text::new_inline(
+                    profile_name.clone(),
+                    appearance.ui_font_family(),
+                    appearance.ui_font_size(),
+                )
+                .with_color(theme.active_ui_text_color().into())
+                .with_style(Properties::default().weight(Weight::Semibold))
+                .finish();
+                let details = Text::new_inline(
+                    details.clone(),
+                    appearance.ui_font_family(),
+                    CONTENT_FONT_SIZE,
+                )
+                .with_color(styles::description_font_color(true, app).into())
+                .finish();
+                let dot =
+                    ConstrainedBox::new(Icon::CircleFilled.to_warpui_icon(status_fill).finish())
+                        .with_width(8.)
+                        .with_height(8.)
+                        .finish();
+
+                Container::new(
+                    Flex::row()
+                        .with_spacing(8.)
+                        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                        .with_children([
+                            icon,
+                            Shrinkable::new(
+                                1.,
+                                Flex::column()
+                                    .with_spacing(2.)
+                                    .with_child(title)
+                                    .with_child(details)
+                                    .finish(),
+                            )
+                            .finish(),
+                            dot,
+                        ])
+                        .finish(),
+                )
+                .with_horizontal_padding(10.)
+                .with_vertical_padding(8.)
+                .with_background(background)
+                .with_border(Border::all(1.).with_border_fill(theme.outline()))
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
+                .finish()
+            })
+            .with_cursor(Cursor::PointingHand)
+            .on_click(move |ctx, _, _| {
+                ctx.dispatch_typed_action(AISettingsPageAction::EditCLIAgentApiProfile(
+                    profile_id.clone(),
+                ));
+            })
+            .finish();
+            list.add_child(row);
+        }
+
+        let header = Text::new_inline(
+            "自定义供应商",
+            appearance.ui_font_family(),
+            CONTENT_FONT_SIZE,
+        )
+        .with_color(styles::header_font_color(true, app).into())
+        .with_style(Properties::default().weight(Weight::Semibold))
+        .finish();
+        let add_button = view
+            .cli_agent_api_profile_open_add_button
+            .as_ref(app)
+            .render(app);
+
+        Container::new(
+            Flex::column()
+                .with_spacing(10.)
+                .with_child(header)
+                .with_child(list.finish())
+                .with_child(add_button)
+                .finish(),
+        )
+        .with_uniform_padding(12.)
+        .with_background(theme.surface_1())
+        .with_border(Border::right(1.).with_border_fill(theme.outline()))
+        .finish()
+    }
+
+    fn render_provider_detail_actions(
+        &self,
+        view: &AISettingsPageView,
+        selected_profile: Option<&CLIAgentApiProfile>,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let description_color = styles::description_font_color(true, app);
+        let mut actions = Flex::row()
+            .with_spacing(8.)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_child(
+                view.cli_agent_api_profile_add_button
+                    .as_ref(app)
+                    .render(app),
+            );
+
+        if let Some(profile) = selected_profile {
+            let toggle_profile_id = profile.id.clone();
+            let toggle_enabled = !profile.enabled;
+            let toggle_button = appearance
+                .ui_builder()
+                .button(ButtonVariant::Text, MouseStateHandle::default())
+                .with_text_label(if profile.enabled {
+                    "禁用".to_owned()
+                } else {
+                    "启用".to_owned()
+                })
+                .with_style(UiComponentStyles {
+                    font_size: Some(CONTENT_FONT_SIZE),
+                    font_weight: Some(Weight::Semibold),
+                    font_color: Some(if profile.enabled {
+                        description_color.into()
+                    } else {
+                        theme.accent().into()
+                    }),
+                    padding: Some(Coords::default().top(4.).bottom(4.).left(6.).right(6.)),
+                    ..Default::default()
+                })
+                .build()
+                .with_cursor(Cursor::PointingHand)
+                .on_click(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(AISettingsPageAction::SetCLIAgentApiProfileEnabled {
+                        profile_id: toggle_profile_id.clone(),
+                        enabled: toggle_enabled,
+                    });
+                })
+                .finish();
+            actions.add_child(toggle_button);
+
+            let remove_profile_id = profile.id.clone();
+            let remove_button = Self::render_icon_action_button(
+                appearance,
+                Icon::Trash,
+                AISettingsPageAction::RemoveCLIAgentApiProfile(remove_profile_id),
+                app,
+            );
+            actions.add_child(remove_button);
+        }
+
+        if let Some(message) = view.cli_agent_api_profile_save_feedback.as_ref() {
+            let color = if view.cli_agent_api_profile_save_feedback_is_error {
+                theme.ansi_fg_red().into()
+            } else {
+                theme.ansi_fg_green().into()
+            };
+            actions.add_child(
+                Text::new_inline(
+                    message.clone(),
+                    appearance.ui_font_family(),
+                    CONTENT_FONT_SIZE,
+                )
+                .with_color(color)
+                .finish(),
+            );
+        }
+
+        actions.finish()
+    }
+
+    fn render_provider_detail(
+        &self,
+        view: &AISettingsPageView,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let store = AISettings::as_ref(app).cli_agent_api_profiles();
+        let selected_profile = view
+            .cli_agent_api_profile_editing_profile_id
+            .as_deref()
+            .and_then(|profile_id| {
+                store
+                    .profiles
+                    .iter()
+                    .find(|profile| profile.id == profile_id)
+            });
+        let draft_title = view
+            .cli_agent_api_profile_name_editor
+            .as_ref(app)
+            .buffer_text(app);
+        let title = if !draft_title.trim().is_empty() {
+            draft_title.trim().to_owned()
+        } else {
+            selected_profile
+                .map(|profile| profile.name.clone())
+                .unwrap_or_else(|| "新供应商".to_owned())
+        };
+        let status_label = selected_profile
+            .map(|profile| {
+                if profile.enabled {
+                    "已启用"
+                } else {
+                    "已禁用"
+                }
+            })
+            .unwrap_or("草稿");
+        let status_active = selected_profile
+            .map(|profile| profile.enabled)
+            .unwrap_or(false);
+
+        let header = Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_child(
+                Flex::row()
+                    .with_spacing(8.)
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_child(
+                        Text::new_inline(title, appearance.ui_font_family(), 18.)
+                            .with_color(theme.active_ui_text_color().into())
+                            .with_style(Properties::default().weight(Weight::Semibold))
+                            .finish(),
+                    )
+                    .with_child(
+                        ConstrainedBox::new(
+                            Icon::Pencil
+                                .to_warpui_icon(styles::description_font_color(true, app).into())
+                                .finish(),
+                        )
+                        .with_width(14.)
+                        .with_height(14.)
+                        .finish(),
+                    )
+                    .with_child(Self::render_status_badge(
+                        appearance,
+                        status_label,
+                        status_active,
+                        app,
+                    ))
+                    .finish(),
+            )
+            .with_child(self.render_provider_detail_actions(
+                view,
+                selected_profile,
+                appearance,
+                app,
+            ))
+            .finish();
+
+        Container::new(
+            Flex::column()
+                .with_spacing(14.)
+                .with_child(header)
+                .with_child(self.render_profile_form(view, appearance, app))
+                .finish(),
+        )
+        .with_uniform_padding(18.)
+        .with_background(theme.surface_1())
+        .finish()
+    }
+
+    fn render_provider_manager(
+        &self,
+        view: &AISettingsPageView,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        Container::new(
+            Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+                .with_children([
+                    ConstrainedBox::new(self.render_provider_sidebar(view, appearance, app))
+                        .with_width(240.)
+                        .finish(),
+                    Expanded::new(1., self.render_provider_detail(view, appearance, app)).finish(),
+                ])
+                .finish(),
+        )
+        .with_background(theme.surface_1())
+        .with_border(Border::all(1.).with_border_fill(theme.outline()))
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
+        .finish()
+    }
+
+    #[allow(dead_code)]
+    fn render_json_tools(
+        &self,
+        _view: &AISettingsPageView,
+        _appearance: &Appearance,
+        _app: &AppContext,
+    ) -> Box<dyn Element> {
+        Empty::new().finish()
+    }
+
+    #[allow(dead_code)]
+    fn render_usage_summary(
+        &self,
+        _view: &AISettingsPageView,
+        _appearance: &Appearance,
+        _app: &AppContext,
+    ) -> Box<dyn Element> {
+        Empty::new().finish()
+    }
+
+    #[allow(dead_code)]
+    fn render_profiles(
+        &self,
+        view: &AISettingsPageView,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let store = AISettings::as_ref(app).cli_agent_api_profiles();
+        if store.profiles.is_empty() {
+            return appearance
+                .ui_builder()
+                .paragraph("No agent API profiles configured yet.")
+                .with_style(UiComponentStyles {
+                    font_size: Some(appearance.ui_font_size()),
+                    font_color: Some(styles::description_font_color(true, app).into()),
+                    margin: Some(Coords::default().top(4.)),
+                    ..Default::default()
+                })
+                .build()
+                .finish();
+        }
+
+        let mut list = Flex::column().with_spacing(8.);
+        for (index, profile) in store.profiles.iter().enumerate() {
+            let agent = profile.agent();
+            let environment_id = profile.environment_id.clone();
+            let active_profile_id = AISettings::as_ref(app)
+                .active_cli_agent_api_profile(agent, &environment_id)
+                .map(|profile| profile.id.clone());
+            let is_active = active_profile_id.as_deref() == Some(profile.id.as_str());
+            let row_mouse_state = view
+                .cli_agent_api_profile_mouse_state_handles
+                .get(index)
+                .cloned()
+                .unwrap_or_default();
+            let remove_mouse_state = view
+                .cli_agent_api_profile_remove_mouse_state_handles
+                .get(index)
+                .cloned()
+                .unwrap_or_default();
+            let edit_mouse_state = view
+                .cli_agent_api_profile_edit_mouse_state_handles
+                .get(index)
+                .cloned()
+                .unwrap_or_default();
+            let check_mouse_state = view
+                .cli_agent_api_profile_check_mouse_state_handles
+                .get(index)
+                .cloned()
+                .unwrap_or_default();
+            let toggle_mouse_state = view
+                .cli_agent_api_profile_toggle_mouse_state_handles
+                .get(index)
+                .cloned()
+                .unwrap_or_default();
+
+            let profile_id = profile.id.clone();
+            let profile_id_for_row = profile_id.clone();
+            let remove_profile_id = profile_id.clone();
+            let edit_profile_id = profile_id.clone();
+            let check_profile_id = profile_id.clone();
+            let toggle_profile_id = profile_id.clone();
+            let profile_name = profile.name.clone();
+            let environment_label =
+                AISettingsPageView::cli_agent_api_environment_label(&environment_id, app);
+            let base_url = if profile.base_url.is_empty() {
+                "Default endpoint".to_owned()
+            } else {
+                profile.base_url.clone()
+            };
+            let model = if profile.model.is_empty() {
+                let preferred_model = profile.preferred_model();
+                if preferred_model.trim().is_empty() {
+                    "Default model".to_owned()
+                } else {
+                    preferred_model
+                }
+            } else {
+                profile.model.clone()
+            };
+            let key_label = AISettingsPageView::masked_api_key(&profile.api_key);
+            let agent_name = agent.display_name().to_owned();
+            let priority_label = format!("priority {}", profile.priority);
+            let pricing_label = if profile.input_cost_per_million_tokens > 0.0
+                || profile.output_cost_per_million_tokens > 0.0
+            {
+                format!(
+                    "${:.4}/${:.4} per 1M",
+                    profile.input_cost_per_million_tokens, profile.output_cost_per_million_tokens
+                )
+            } else {
+                "no price".to_owned()
+            };
+            let extra_env_label = if profile.extra_env.is_empty() {
+                "no extra env".to_owned()
+            } else {
+                format!("{} extra env", profile.extra_env.len())
+            };
+            let mapping_label = if profile.model_mappings.is_empty() {
+                "no mappings".to_owned()
+            } else {
+                format!("{} mappings", profile.model_mappings.len())
+            };
+            let url_mode_label = if profile.full_url_mode {
+                "full URL".to_owned()
+            } else {
+                profile.api_format.clone()
+            };
+            let profile_enabled = profile.enabled;
+            let health_label = profile.health.display_label();
+            let health_checking = profile.health.is_checking();
+            let environment_id_for_action = environment_id.clone();
+            let description_color = styles::description_font_color(true, app);
+            let active_color = theme.accent();
+
+            let row = Hoverable::new(row_mouse_state, move |state| {
+                let background = if state.is_hovered() {
+                    theme.surface_overlay_1()
+                } else {
+                    internal_colors::fg_overlay_1(theme)
+                };
+                let status_text = if is_active {
+                    "Active"
+                } else if profile_enabled {
+                    "Fallback"
+                } else {
+                    "Disabled"
+                };
+                let status_color = if is_active {
+                    active_color
+                } else {
+                    description_color
+                };
+
+                let title = Text::new_inline(
+                    profile_name.clone(),
+                    appearance.ui_font_family(),
+                    appearance.ui_font_size(),
+                )
+                .with_style(Properties::default().weight(Weight::Semibold))
+                .with_color(theme.active_ui_text_color().into())
+                .finish();
+
+                let details = format!(
+                    "{agent_name} / {environment_label} / {url_mode_label} / {base_url} / {model} / {mapping_label} / {key_label} / {priority_label} / {pricing_label} / {extra_env_label} / {health_label}"
+                );
+                let details = appearance
+                    .ui_builder()
+                    .paragraph(details)
+                    .with_style(UiComponentStyles {
+                        font_size: Some(appearance.ui_font_size()),
+                        font_color: Some(description_color.into()),
+                        margin: Some(Coords::default().top(3.)),
+                        ..Default::default()
+                    })
+                    .build()
+                    .finish();
+
+                let status = Text::new_inline(
+                    status_text.to_owned(),
+                    appearance.ui_font_family(),
+                    CONTENT_FONT_SIZE,
+                )
+                .with_style(Properties::default().weight(Weight::Semibold))
+                .with_color(status_color.into())
+                .finish();
+
+                let edit_action =
+                    AISettingsPageAction::EditCLIAgentApiProfile(edit_profile_id.clone());
+                let edit_button = appearance
+                    .ui_builder()
+                    .button(ButtonVariant::Text, edit_mouse_state.clone())
+                    .with_text_label("Edit".to_owned())
+                    .with_style(UiComponentStyles {
+                        font_size: Some(CONTENT_FONT_SIZE),
+                        font_weight: Some(Weight::Semibold),
+                        font_color: Some(description_color.into()),
+                        padding: Some(Coords {
+                            top: 4.,
+                            bottom: 4.,
+                            left: 6.,
+                            right: 6.,
+                        }),
+                        ..Default::default()
+                    })
+                    .build()
+                    .with_cursor(Cursor::PointingHand)
+                    .on_click(move |ctx, _, _| {
+                        ctx.dispatch_typed_action(edit_action.clone());
+                    })
+                    .finish();
+
+                let check_action =
+                    AISettingsPageAction::CheckCLIAgentApiProfile(check_profile_id.clone());
+                let check_button = appearance
+                    .ui_builder()
+                    .button(ButtonVariant::Text, check_mouse_state.clone())
+                    .with_text_label(if health_checking {
+                        "Checking".to_owned()
+                    } else {
+                        "Check".to_owned()
+                    })
+                    .with_style(UiComponentStyles {
+                        font_size: Some(CONTENT_FONT_SIZE),
+                        font_weight: Some(Weight::Semibold),
+                        font_color: Some(if health_checking {
+                            active_color.into()
+                        } else {
+                            description_color.into()
+                        }),
+                        padding: Some(Coords {
+                            top: 4.,
+                            bottom: 4.,
+                            left: 6.,
+                            right: 6.,
+                        }),
+                        ..Default::default()
+                    })
+                    .build()
+                    .with_cursor(Cursor::PointingHand)
+                    .on_click(move |ctx, _, _| {
+                        ctx.dispatch_typed_action(check_action.clone());
+                    })
+                    .finish();
+
+                let toggle_action = AISettingsPageAction::SetCLIAgentApiProfileEnabled {
+                    profile_id: toggle_profile_id.clone(),
+                    enabled: !profile_enabled,
+                };
+                let toggle_button = appearance
+                    .ui_builder()
+                    .button(ButtonVariant::Text, toggle_mouse_state.clone())
+                    .with_text_label(if profile_enabled {
+                        "Disable".to_owned()
+                    } else {
+                        "Enable".to_owned()
+                    })
+                    .with_style(UiComponentStyles {
+                        font_size: Some(CONTENT_FONT_SIZE),
+                        font_weight: Some(Weight::Semibold),
+                        font_color: Some(if profile_enabled {
+                            description_color.into()
+                        } else {
+                            active_color.into()
+                        }),
+                        padding: Some(Coords {
+                            top: 4.,
+                            bottom: 4.,
+                            left: 6.,
+                            right: 6.,
+                        }),
+                        ..Default::default()
+                    })
+                    .build()
+                    .with_cursor(Cursor::PointingHand)
+                    .on_click(move |ctx, _, _| {
+                        ctx.dispatch_typed_action(toggle_action.clone());
+                    })
+                    .finish();
+
+                let remove_action =
+                    AISettingsPageAction::RemoveCLIAgentApiProfile(remove_profile_id.clone());
+                let remove_button = appearance
+                    .ui_builder()
+                    .close_button(16., remove_mouse_state.clone())
+                    .build()
+                    .on_click(move |ctx, _, _| {
+                        ctx.dispatch_typed_action(remove_action.clone());
+                    })
+                    .finish();
+
+                Container::new(
+                    Flex::row()
+                        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                        .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
+                        .with_main_axis_size(MainAxisSize::Max)
+                        .with_children([
+                            Shrinkable::new(
+                                1.,
+                                Flex::column()
+                                    .with_spacing(2.)
+                                    .with_child(title)
+                                    .with_child(details)
+                                    .finish(),
+                            )
+                            .finish(),
+                            Flex::row()
+                                .with_spacing(8.)
+                                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                                .with_child(status)
+                                .with_child(edit_button)
+                                .with_child(check_button)
+                                .with_child(toggle_button)
+                                .with_child(remove_button)
+                                .finish(),
+                        ])
+                        .finish(),
+                )
+                .with_uniform_padding(12.)
+                .with_background(background)
+                .with_border(Border::all(1.).with_border_fill(theme.outline()))
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
+                .finish()
+            });
+            let row = if profile_enabled {
+                row.with_cursor(Cursor::PointingHand)
+                    .on_click(move |ctx, _, _| {
+                        ctx.dispatch_typed_action(
+                            AISettingsPageAction::SetActiveCLIAgentApiProfile {
+                                agent,
+                                environment_id: environment_id_for_action.clone(),
+                                profile_id: profile_id_for_row.clone(),
+                            },
+                        );
+                    })
+            } else {
+                row
+            }
+            .finish();
+
+            list.add_child(row);
+        }
+
+        list.finish()
+    }
+}
+
+impl SettingsWidget for CLIAgentApiProfilesWidget {
+    type View = AISettingsPageView;
+
+    fn search_terms(&self) -> &str {
+        "agent api profile provider switch local ssh remote claude codex gemini opencode hermes base url key model"
+    }
+
+    fn render(
+        &self,
+        view: &Self::View,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let description = appearance
+            .ui_builder()
+            .paragraph(
+                "管理自定义模型供应商，配置后本地和 SSH remote 的 Agent 端点会统一注入并可直接使用。",
+            )
+            .with_style(UiComponentStyles {
+                font_size: Some(appearance.ui_font_size()),
+                font_color: Some(styles::description_font_color(true, app).into()),
+                margin: Some(
+                    Coords::default()
+                        .bottom(styles::DESCRIPTION_MARGIN_BOTTOM)
+                        .right(styles::TOGGLE_WIDTH_MARGIN),
+                ),
+                ..Default::default()
+            })
+            .build()
+            .finish();
+
+        Flex::column()
+            .with_spacing(12.)
+            .with_child(
+                build_sub_header(
+                    appearance,
+                    "模型供应商",
+                    Some(styles::header_font_color(true, app)),
+                )
+                .with_padding_bottom(HEADER_PADDING)
+                .finish(),
+            )
+            .with_child(description)
+            .with_child(self.render_provider_manager(view, appearance, app))
+            .finish()
+    }
+}
+
+#[derive(Default)]
+struct CLIAgentBuiltinPromptsWidget;
+
+impl SettingsWidget for CLIAgentBuiltinPromptsWidget {
+    type View = AISettingsPageView;
+
+    fn search_terms(&self) -> &str {
+        "system prompts built in prompts custom prompt append replace claude code codex opencode coding agent"
+    }
+
+    fn render(
+        &self,
+        view: &Self::View,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let mut column = Flex::column()
+            .with_spacing(12.)
+            .with_child(
+                build_sub_header(
+                    appearance,
+                    "System prompts",
+                    Some(styles::header_font_color(true, app)),
+                )
+                .with_padding_bottom(HEADER_PADDING)
+                .finish(),
+            )
+            .with_child(
+                appearance
+                    .ui_builder()
+                    .paragraph(
+                        "Configure custom instructions for third-party coding agents. Vendor default prompts are embedded or generated by each CLI, so Warp shows inspection status separately from your custom prompt text.",
+                    )
+                    .with_style(UiComponentStyles {
+                        font_size: Some(appearance.ui_font_size()),
+                        font_color: Some(styles::description_font_color(true, app).into()),
+                        margin: Some(
+                            Coords::default()
+                                .bottom(styles::DESCRIPTION_MARGIN_BOTTOM)
+                                .right(styles::TOGGLE_WIDTH_MARGIN),
+                        ),
+                        ..Default::default()
+                    })
+                    .build()
+                    .finish(),
+            );
+
+        for (idx, agent) in AISettings::cli_agent_builtin_prompt_agents()
+            .into_iter()
+            .enumerate()
+        {
+            let Some(editor) = view.cli_agent_builtin_prompt_editors.get(idx) else {
+                continue;
+            };
+            let Some(mode_dropdown) = view.cli_agent_builtin_prompt_mode_dropdowns.get(idx) else {
+                continue;
+            };
+
+            let prompt_setting = AISettings::as_ref(app).cli_agent_builtin_prompt(agent);
+            let agent_name = appearance
+                .ui_builder()
+                .span(agent.display_name().to_string())
+                .with_style(UiComponentStyles {
+                    font_size: Some(CONTENT_FONT_SIZE),
+                    font_color: Some(theme.active_ui_text_color().into()),
+                    ..Default::default()
+                })
+                .build()
+                .finish();
+            let mode_description = appearance
+                .ui_builder()
+                .paragraph(prompt_setting.mode.description())
+                .with_style(UiComponentStyles {
+                    font_size: Some(appearance.ui_font_size()),
+                    font_color: Some(styles::description_font_color(true, app).into()),
+                    margin: Some(Coords::default().top(2.).bottom(6.)),
+                    ..Default::default()
+                })
+                .build()
+                .finish();
+            let default_prompt_status = appearance
+                .ui_builder()
+                .paragraph(AISettings::cli_agent_default_prompt_status(agent))
+                .with_style(UiComponentStyles {
+                    font_size: Some(appearance.ui_font_size()),
+                    font_color: Some(styles::description_font_color(true, app).into()),
+                    margin: Some(Coords::default().top(2.)),
+                    ..Default::default()
+                })
+                .build()
+                .finish();
+            let application_status = appearance
+                .ui_builder()
+                .paragraph(AISettings::cli_agent_builtin_prompt_application_status(
+                    agent,
+                ))
+                .with_style(UiComponentStyles {
+                    font_size: Some(appearance.ui_font_size()),
+                    font_color: Some(styles::description_font_color(true, app).into()),
+                    margin: Some(Coords::default().top(2.).bottom(6.)),
+                    ..Default::default()
+                })
+                .build()
+                .finish();
+
+            let header = Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
+                .with_main_axis_size(MainAxisSize::Max)
+                .with_children([
+                    Shrinkable::new(1., agent_name).finish(),
+                    ChildView::new(mode_dropdown).finish(),
+                ])
+                .finish();
+
+            let editor_box = Container::new(
+                ConstrainedBox::new(ChildView::new(editor).finish())
+                    .with_height(96.)
+                    .finish(),
+            )
+            .with_background(theme.surface_1())
+            .with_border(Border::all(1.).with_border_fill(theme.outline()))
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
+            .with_horizontal_padding(8.)
+            .with_vertical_padding(6.)
+            .finish();
+
+            let section = Container::new(
+                Flex::column()
+                    .with_spacing(4.)
+                    .with_child(header)
+                    .with_child(mode_description)
+                    .with_child(default_prompt_status)
+                    .with_child(application_status)
+                    .with_child(editor_box)
+                    .finish(),
+            )
+            .with_vertical_padding(10.)
+            .with_border(Border::bottom(1.).with_border_fill(theme.outline()))
+            .finish();
+
+            column.add_child(section);
         }
 
         column.finish()

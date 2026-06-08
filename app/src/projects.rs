@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::SyncSender;
 
 use chrono::Utc;
@@ -73,6 +73,42 @@ impl ProjectManagementModel {
         ctx.emit(ProjectEvent::Added { path });
     }
 
+    pub fn remove_project(&mut self, path: &Path, ctx: &mut ModelContext<Self>) {
+        let path = path.to_path_buf();
+        if self.projects.remove(&path).is_none() {
+            return;
+        }
+
+        self.delete_project(path.to_string_lossy().to_string());
+        ctx.emit(ProjectEvent::Removed { path });
+    }
+
+    pub fn rename_project(
+        &mut self,
+        old_path: &Path,
+        new_path: PathBuf,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        if old_path == new_path.as_path() {
+            self.upsert_project(new_path, ctx);
+            return;
+        }
+
+        let now = Utc::now().naive_utc();
+        let mut project = self.projects.remove(old_path).unwrap_or(Project {
+            path: new_path.to_string_lossy().to_string(),
+            added_ts: now,
+            last_opened_ts: None,
+        });
+        project.path = new_path.to_string_lossy().to_string();
+        project.last_opened_ts = Some(now);
+
+        self.delete_project(old_path.to_string_lossy().to_string());
+        self.projects.insert(new_path.clone(), project.clone());
+        self.save_project(project);
+        ctx.emit(ProjectEvent::Updated { path: new_path });
+    }
+
     pub fn all_projects(&self) -> impl Iterator<Item = &Project> {
         self.projects.values()
     }
@@ -83,6 +119,15 @@ impl ProjectManagementModel {
             let event = ModelEvent::UpsertProject { project };
             if let Err(err) = sender.send(event) {
                 log::error!("Failed to save project to database: {err}");
+            }
+        }
+    }
+
+    fn delete_project(&self, path: String) {
+        if let Some(sender) = &self.model_event_sender {
+            let event = ModelEvent::DeleteProject { path };
+            if let Err(err) = sender.send(event) {
+                log::error!("Failed to delete project from database: {err}");
             }
         }
     }

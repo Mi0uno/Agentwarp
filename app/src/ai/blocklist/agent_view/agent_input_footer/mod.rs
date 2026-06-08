@@ -8,8 +8,7 @@ use std::env;
 #[cfg(not(target_family = "wasm"))]
 use std::path::PathBuf;
 use std::sync::Arc;
-#[cfg(not(target_family = "wasm"))]
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ai::document::{AIDocumentId, AIDocumentVersion};
 use parking_lot::FairMutex;
@@ -31,15 +30,16 @@ use warp_core::ui::theme::color::internal_colors;
 use warp_core::ui::theme::{AnsiColorIdentifier, Fill};
 use warpui::elements::{
     Border, ChildAnchor, ChildView, Clipped, ConstrainedBox, Container, CornerRadius,
-    CrossAxisAlignment, DispatchEventResult, Element, EventHandler, Expanded, Flex,
+    CrossAxisAlignment, DispatchEventResult, Element, Empty, EventHandler, Expanded, Flex,
     MainAxisAlignment, MainAxisSize, OffsetPositioning, ParentElement, PositionedElementAnchor,
     PositionedElementOffsetBounds, Radius, Shrinkable, Stack, Text, Wrap, WrapFill,
-    WrapFillEntireRun, DEFAULT_UI_LINE_HEIGHT_RATIO,
+    DEFAULT_UI_LINE_HEIGHT_RATIO,
 };
 #[cfg(feature = "voice_input")]
 use warpui::r#async::SpawnedFutureHandle;
 #[cfg(not(target_family = "wasm"))]
 use warpui::r#async::Timer;
+use warpui::ui_components::components::Coords;
 use warpui::{
     AppContext, Entity, EntityId, ModelHandle, SingletonEntity, TypedActionView, View, ViewContext,
     ViewHandle,
@@ -65,6 +65,7 @@ use crate::context_chips::display_chip::{DisplayChip, DisplayChipConfig};
 use crate::context_chips::prompt_type::PromptType;
 use crate::context_chips::{self, ContextChipKind};
 use crate::features::FeatureFlag;
+use crate::menu::{MenuItem, MenuItemFields};
 use crate::network::NetworkStatus;
 use crate::send_telemetry_from_ctx;
 #[cfg(feature = "voice_input")]
@@ -76,6 +77,7 @@ use crate::settings::{
     AISettings, AISettingsChangedEvent, PrivacySettings, PrivacySettingsChangedEvent,
 };
 use crate::settings_view::SettingsSection;
+use crate::terminal::cli_agent::{AgentReasoningEffort, AgentReasoningEffortModel};
 #[cfg(not(target_family = "wasm"))]
 use crate::terminal::cli_agent_sessions::plugin_manager::{
     compare_versions, plugin_manager_for, plugin_manager_for_with_shell, CliAgentPluginManager,
@@ -88,6 +90,9 @@ use crate::terminal::input::models::InlineModelSelectorTab;
 use crate::terminal::input::{HandoffComposeState, MenuPositioningProvider};
 #[cfg(not(target_family = "wasm"))]
 use crate::terminal::local_shell::LocalShellState;
+use crate::terminal::model::grid::{Dimensions as _, RespectDisplayedOutput};
+use crate::terminal::model::index::Point;
+use crate::terminal::model::secrets::RespectObfuscatedSecrets;
 use crate::terminal::model_events::ModelEvent;
 use crate::terminal::profile_model_selector::{ProfileModelSelector, ProfileModelSelectorEvent};
 use crate::terminal::session_settings::{
@@ -107,9 +112,11 @@ use crate::view_components::action_button::{
     ActionButton, ActionButtonTheme, AdjoinedSide, ButtonSize, KeystrokeSource, NakedTheme,
     TooltipAlignment,
 };
-use crate::view_components::DismissibleToast;
+use crate::view_components::dropdown::DropdownStyle;
 #[cfg(not(target_family = "wasm"))]
 use crate::view_components::ToastLink;
+use crate::view_components::{DismissibleToast, Dropdown, DropdownAction, DropdownEvent};
+use crate::workspace::view::ssh_remote::SshRemoteModel;
 use crate::workspace::view::TOGGLE_PROJECT_EXPLORER_BINDING_NAME;
 use crate::workspace::ToastStack;
 #[cfg(not(target_family = "wasm"))]
@@ -145,12 +152,41 @@ enum CLIVoiceInputState {
 /// Gives the plugin time to connect and send its `SessionStart` event.
 #[cfg(not(target_family = "wasm"))]
 const PLUGIN_CHIP_DEBOUNCE: Duration = Duration::from_secs(3);
+const REASONING_EFFORT_PENDING_TIMEOUT: Duration = Duration::from_millis(1200);
 
 #[cfg_attr(target_family = "wasm", allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PluginChipKind {
     Install,
     Update,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SshRemoteTransferPhase {
+    Uploading,
+    Complete,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SshRemoteTransferStatus {
+    label: String,
+    phase: SshRemoteTransferPhase,
+    progress: Option<f32>,
+}
+
+impl SshRemoteTransferStatus {
+    pub(crate) fn new(
+        label: impl Into<String>,
+        phase: SshRemoteTransferPhase,
+        progress: Option<f32>,
+    ) -> Self {
+        Self {
+            label: label.into(),
+            phase,
+            progress,
+        }
+    }
 }
 
 impl From<PluginChipKind> for PluginChipTelemetryKind {
@@ -222,6 +258,9 @@ pub struct AgentInputFooter {
     // CLI agent-specific buttons (rendered when a CLI agent session is active).
     file_explorer_button: ViewHandle<ActionButton>,
     rich_input_button: ViewHandle<ActionButton>,
+    reasoning_effort_dropdown: ViewHandle<Dropdown<AgentInputFooterAction>>,
+    pending_reasoning_effort: Option<PendingReasoningEffort>,
+    last_known_reasoning_effort: Option<AgentReasoningEffort>,
     settings_button: ViewHandle<ActionButton>,
     install_plugin_button: ViewHandle<ActionButton>,
     plugin_instructions_button: ViewHandle<ActionButton>,
@@ -229,6 +268,7 @@ pub struct AgentInputFooter {
     update_instructions_button: ViewHandle<ActionButton>,
     dismiss_plugin_chip_button: ViewHandle<ActionButton>,
     plugin_operation_in_progress: bool,
+    ssh_remote_transfer_status: Option<SshRemoteTransferStatus>,
     /// When `true`, the install chip is allowed to render.
     /// Starts `false` and is set to `true` after a debounce timer fires,
     /// giving the plugin time to connect before we prompt installation.
@@ -249,6 +289,11 @@ pub struct AgentInputFooter {
     #[cfg(feature = "voice_input")]
     cli_transcription_handle: Option<SpawnedFutureHandle>,
     v2_model_selector: Option<ViewHandle<ModelSelector>>,
+}
+
+struct PendingReasoningEffort {
+    effort: AgentReasoningEffort,
+    set_at: Instant,
 }
 
 impl AgentInputFooter {
@@ -412,6 +457,47 @@ impl AgentInputFooter {
                     ctx.dispatch_typed_action(AgentInputFooterAction::ToggleRichInput);
                 })
         });
+        let reasoning_effort_dropdown = ctx.add_typed_action_view(|ctx| {
+            let mut dropdown = Dropdown::new(ctx).with_drop_shadow();
+            dropdown.set_top_bar_max_width(30.);
+            dropdown.set_menu_width(158., ctx);
+            dropdown.set_menu_max_height(220., ctx);
+            dropdown.set_main_axis_size(MainAxisSize::Min, ctx);
+            dropdown.set_style(DropdownStyle::ActionButtonSecondary, ctx);
+            dropdown.set_top_bar_icon(Icon::Psychology, ctx);
+            dropdown.set_top_bar_icon_only(true, ctx);
+            dropdown.set_menu_header_text_override(|label| format!("Reasoning: {label}"));
+            dropdown.set_menu_position(
+                PositionedElementAnchor::TopLeft,
+                ChildAnchor::BottomLeft,
+                ctx,
+            );
+            dropdown.set_top_bar_height(24., ctx);
+            dropdown.set_vertical_margin(0., ctx);
+            dropdown.set_padding(
+                Coords {
+                    top: 4.,
+                    bottom: 4.,
+                    left: 6.,
+                    right: 6.,
+                },
+                ctx,
+            );
+            dropdown.set_font_size(12., ctx);
+            dropdown
+        });
+        ctx.subscribe_to_view(
+            &reasoning_effort_dropdown,
+            |me, _, event, ctx| match event {
+                DropdownEvent::ToggleExpanded => {
+                    me.schedule_reasoning_effort_dropdown_sync(ctx);
+                    ctx.emit(AgentInputFooterEvent::ToggledChipMenu { open: true });
+                }
+                DropdownEvent::Close => {
+                    ctx.emit(AgentInputFooterEvent::ToggledChipMenu { open: false });
+                }
+            },
+        );
         let settings_button = ctx.add_typed_action_view(|_ctx| {
             ActionButton::new("", AgentInputButtonTheme)
                 .with_icon(Icon::Settings)
@@ -544,6 +630,8 @@ impl AgentInputFooter {
                     }
                 }
 
+                me.sync_reasoning_effort_dropdown(ctx);
+                me.schedule_reasoning_effort_dropdown_sync(ctx);
                 let CLIAgentSessionsModelEvent::InputSessionChanged {
                     new_input_state, ..
                 } = event
@@ -718,6 +806,10 @@ impl AgentInputFooter {
                 ctx.notify()
             }
         });
+        ctx.subscribe_to_model(&AgentReasoningEffortModel::handle(ctx), |me, _, _, ctx| {
+            me.schedule_reasoning_effort_dropdown_sync(ctx);
+            ctx.notify();
+        });
         ctx.subscribe_to_model(&PrivacySettings::handle(ctx), |_, _, event, ctx| {
             if matches!(
                 event,
@@ -838,6 +930,9 @@ impl AgentInputFooter {
             file_button,
             file_explorer_button,
             rich_input_button,
+            reasoning_effort_dropdown,
+            pending_reasoning_effort: None,
+            last_known_reasoning_effort: None,
             settings_button,
             start_remote_control_button,
             stop_remote_control_button,
@@ -847,6 +942,7 @@ impl AgentInputFooter {
             update_instructions_button,
             dismiss_plugin_chip_button,
             plugin_operation_in_progress: false,
+            ssh_remote_transfer_status: None,
             plugin_chip_ready: false,
             context_window_button,
             model_selector: profile_model_selector_full,
@@ -880,6 +976,8 @@ impl AgentInputFooter {
         me.sync_remote_control_button(ctx);
         me.update_context_window_button(ctx);
         me.update_display_chips(&prompt, ctx);
+        me.sync_reasoning_effort_dropdown(ctx);
+        me.schedule_reasoning_effort_dropdown_sync(ctx);
         me.update_ftu_callout_render_state(ctx);
         me
     }
@@ -1010,6 +1108,20 @@ impl AgentInputFooter {
         }
     }
 
+    pub(crate) fn set_ssh_remote_transfer_status(
+        &mut self,
+        status: SshRemoteTransferStatus,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        self.ssh_remote_transfer_status = Some(status);
+        ctx.notify();
+    }
+
+    pub(crate) fn clear_ssh_remote_transfer_status(&mut self, ctx: &mut ViewContext<Self>) {
+        self.ssh_remote_transfer_status = None;
+        ctx.notify();
+    }
+
     fn has_active_cli_agent_input_session(&self, app: &AppContext) -> bool {
         CLIAgentSessionsModel::as_ref(app).is_input_open(self.terminal_view_id)
     }
@@ -1024,6 +1136,90 @@ impl AgentInputFooter {
         CLIAgentSessionsModel::as_ref(app)
             .session(self.terminal_view_id)
             .is_some()
+    }
+
+    fn render_ssh_remote_transfer_status(&self, app: &AppContext) -> Box<dyn Element> {
+        let Some(status) = self.ssh_remote_transfer_status.as_ref() else {
+            return Empty::new().finish();
+        };
+        let appearance = Appearance::as_ref(app);
+        let theme = appearance.theme();
+        let (icon, color) = match status.phase {
+            SshRemoteTransferPhase::Uploading => (Icon::UploadCloud, theme.accent().into_solid()),
+            SshRemoteTransferPhase::Complete => (Icon::Check, theme.ansi_fg_green()),
+            SshRemoteTransferPhase::Failed => (Icon::X, theme.ui_error_color()),
+        };
+        let bar_width = 92.;
+        let progress = status.progress.unwrap_or(match status.phase {
+            SshRemoteTransferPhase::Uploading => 0.42,
+            SshRemoteTransferPhase::Complete | SshRemoteTransferPhase::Failed => 1.,
+        });
+        let fill_width = (bar_width * progress.clamp(0., 1.)).max(3.);
+        let bar_background = theme.surface_3();
+        let bar_fill = Fill::Solid(color);
+
+        let progress_bar = ConstrainedBox::new(
+            Stack::new()
+                .with_child(
+                    ConstrainedBox::new(
+                        Container::new(Empty::new().finish())
+                            .with_background(bar_background)
+                            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(2.)))
+                            .finish(),
+                    )
+                    .with_width(bar_width)
+                    .with_height(3.)
+                    .finish(),
+                )
+                .with_child(
+                    ConstrainedBox::new(
+                        Container::new(Empty::new().finish())
+                            .with_background(bar_fill)
+                            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(2.)))
+                            .finish(),
+                    )
+                    .with_width(fill_width)
+                    .with_height(3.)
+                    .finish(),
+                )
+                .finish(),
+        )
+        .with_width(bar_width)
+        .with_height(3.)
+        .finish();
+
+        Container::new(
+            Flex::row()
+                .with_main_axis_size(MainAxisSize::Min)
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_spacing(7.)
+                .with_child(
+                    ConstrainedBox::new(icon.to_warpui_icon(Fill::Solid(color)).finish())
+                        .with_width(12.)
+                        .with_height(12.)
+                        .finish(),
+                )
+                .with_child(
+                    Flex::column()
+                        .with_main_axis_size(MainAxisSize::Min)
+                        .with_spacing(3.)
+                        .with_child(
+                            Text::new_inline(
+                                status.label.clone(),
+                                appearance.ui_font_family(),
+                                11.,
+                            )
+                            .with_color(theme.sub_text_color(theme.surface_1()).into())
+                            .finish(),
+                        )
+                        .with_child(progress_bar)
+                        .finish(),
+                )
+                .finish(),
+        )
+        .with_horizontal_padding(8.)
+        .with_vertical_padding(4.)
+        .finish()
     }
 
     fn select_cli_file(&mut self, ctx: &mut ViewContext<Self>) {
@@ -1416,6 +1612,230 @@ impl AgentInputFooter {
             .map(|chip| ChildView::new(chip).finish())
     }
 
+    fn schedule_reasoning_effort_dropdown_sync(&mut self, ctx: &mut ViewContext<Self>) {
+        self.schedule_reasoning_effort_dropdown_sync_after(Duration::from_millis(50), ctx);
+    }
+
+    fn schedule_reasoning_effort_dropdown_sync_after(
+        &mut self,
+        delay: Duration,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        #[cfg(not(target_family = "wasm"))]
+        ctx.spawn(Timer::after(delay), |me, _, ctx: &mut ViewContext<Self>| {
+            me.sync_reasoning_effort_dropdown(ctx);
+        });
+
+        #[cfg(target_family = "wasm")]
+        {
+            ctx.notify();
+        }
+    }
+
+    fn schedule_reasoning_effort_reconciliation(&mut self, ctx: &mut ViewContext<Self>) {
+        self.schedule_reasoning_effort_dropdown_sync_after(Duration::from_millis(50), ctx);
+        self.schedule_reasoning_effort_dropdown_sync_after(Duration::from_millis(300), ctx);
+        self.schedule_reasoning_effort_dropdown_sync_after(
+            REASONING_EFFORT_PENDING_TIMEOUT + Duration::from_millis(100),
+            ctx,
+        );
+    }
+
+    fn current_terminal_reasoning_effort(&self, agent: CLIAgent) -> Option<AgentReasoningEffort> {
+        if agent != CLIAgent::Codex {
+            return None;
+        }
+
+        let terminal_model = self.terminal_model.lock();
+        let grid = terminal_model.raw_grid_for_ref_tests();
+        let rows = grid.total_rows();
+        let columns = grid.columns();
+        if rows == 0 || columns == 0 {
+            return None;
+        }
+
+        let output = grid.bounds_to_string(
+            Point::new(0, 0),
+            Point::new(rows - 1, columns - 1),
+            false,
+            RespectObfuscatedSecrets::Yes,
+            false,
+            RespectDisplayedOutput::No,
+        );
+
+        Self::parse_codex_reasoning_effort_from_output(&output)
+    }
+
+    fn parse_codex_reasoning_effort_from_output(output: &str) -> Option<AgentReasoningEffort> {
+        let lines = output.lines().collect::<Vec<_>>();
+        lines
+            .iter()
+            .take(12)
+            .chain(lines.iter().rev().take(12))
+            .find_map(|line| Self::parse_codex_reasoning_effort_status_line(line))
+    }
+
+    fn parse_codex_reasoning_effort_status_line(line: &str) -> Option<AgentReasoningEffort> {
+        let line = line.to_ascii_lowercase();
+        let status_like = line.contains('\u{00b7}')
+            || line.contains("selected effort")
+            || line.contains("gpt-")
+            || line.contains("current:")
+            || line.contains("reasoning is already");
+        if !status_like {
+            return None;
+        }
+
+        line.split(|c: char| !c.is_ascii_alphanumeric())
+            .filter_map(AgentReasoningEffort::from_command_value)
+            .find(|effort| CLIAgent::Codex.supports_reasoning_effort(*effort))
+    }
+
+    fn selected_reasoning_effort_for_agent(
+        &mut self,
+        agent: CLIAgent,
+        app: &AppContext,
+        live_effort: Option<AgentReasoningEffort>,
+    ) -> Option<AgentReasoningEffort> {
+        self.reconcile_pending_reasoning_effort(agent, live_effort);
+
+        if let Some(pending_effort) = self
+            .active_pending_reasoning_effort()
+            .filter(|effort| agent.supports_reasoning_effort(*effort))
+        {
+            return Some(pending_effort);
+        }
+
+        if let Some(live_effort) =
+            live_effort.filter(|effort| agent.supports_reasoning_effort(*effort))
+        {
+            return Some(live_effort);
+        }
+
+        let effort = AgentReasoningEffortModel::as_ref(app).effort();
+        if effort != AgentReasoningEffort::Auto && agent.supports_reasoning_effort(effort) {
+            Some(effort)
+        } else {
+            agent.default_reasoning_effort()
+        }
+    }
+
+    fn reconcile_pending_reasoning_effort(
+        &mut self,
+        agent: CLIAgent,
+        live_effort: Option<AgentReasoningEffort>,
+    ) {
+        let Some(pending) = self.pending_reasoning_effort.as_ref() else {
+            return;
+        };
+
+        let pending_is_invalid = !agent.supports_reasoning_effort(pending.effort);
+        let pending_matched_live = live_effort == Some(pending.effort);
+        let pending_timed_out = pending.set_at.elapsed() > REASONING_EFFORT_PENDING_TIMEOUT;
+        if pending_is_invalid || pending_matched_live || pending_timed_out {
+            self.pending_reasoning_effort = None;
+        }
+    }
+
+    fn active_pending_reasoning_effort(&self) -> Option<AgentReasoningEffort> {
+        self.pending_reasoning_effort
+            .as_ref()
+            .filter(|pending| pending.set_at.elapsed() <= REASONING_EFFORT_PENDING_TIMEOUT)
+            .map(|pending| pending.effort)
+    }
+
+    fn fallback_reasoning_effort_for_command(
+        &self,
+        agent: CLIAgent,
+        app: &AppContext,
+    ) -> Option<AgentReasoningEffort> {
+        self.last_known_reasoning_effort
+            .or_else(|| {
+                let effort = AgentReasoningEffortModel::as_ref(app).effort();
+                (effort != AgentReasoningEffort::Auto).then_some(effort)
+            })
+            .filter(|effort| agent.supports_reasoning_effort(*effort))
+    }
+
+    fn sync_reasoning_effort_dropdown(&mut self, ctx: &mut ViewContext<Self>) {
+        let Some(agent) = self.cli_agent(ctx) else {
+            self.reasoning_effort_dropdown.update(ctx, |dropdown, ctx| {
+                dropdown.set_rich_items(Vec::<MenuItem<DropdownAction>>::new(), ctx);
+                dropdown.set_selected_to_none(ctx);
+            });
+            ctx.notify();
+            return;
+        };
+
+        let options = agent.reasoning_effort_options();
+        let live_effort = self.current_terminal_reasoning_effort(agent);
+        if let Some(live_effort) = live_effort {
+            self.last_known_reasoning_effort = Some(live_effort);
+        }
+        let Some(selected_effort) =
+            self.selected_reasoning_effort_for_agent(agent, ctx, live_effort)
+        else {
+            self.reasoning_effort_dropdown.update(ctx, |dropdown, ctx| {
+                dropdown.set_rich_items(Vec::<MenuItem<DropdownAction>>::new(), ctx);
+                dropdown.set_selected_to_none(ctx);
+            });
+            ctx.notify();
+            return;
+        };
+        let current_effort = AgentReasoningEffortModel::as_ref(ctx).effort();
+        if self.pending_reasoning_effort.is_none()
+            && live_effort.is_some()
+            && current_effort != selected_effort
+        {
+            AgentReasoningEffortModel::handle(ctx).update(ctx, |model, ctx| {
+                model.set_effort(selected_effort, ctx);
+            });
+        }
+
+        let appearance = Appearance::as_ref(ctx);
+        let header_color = appearance
+            .theme()
+            .sub_text_color(appearance.theme().background())
+            .into_solid();
+        let mut items = vec![
+            MenuItem::Header {
+                fields: MenuItemFields::new("Reasoning").with_override_text_color(header_color),
+                clickable: false,
+                right_side_fields: None,
+            },
+            MenuItem::Separator,
+        ];
+
+        for effort in options {
+            let action = AgentInputFooterAction::SetReasoningEffort(*effort);
+            let mut fields = MenuItemFields::new(effort.label())
+                .with_on_select_action(DropdownAction::select_action_and_close(action));
+            if *effort == selected_effort {
+                fields = fields.with_icon(Icon::Check);
+            } else {
+                fields = fields.with_indent();
+            }
+            items.push(MenuItem::Item(fields));
+        }
+
+        self.reasoning_effort_dropdown.update(ctx, |dropdown, ctx| {
+            dropdown.set_rich_items(items, ctx);
+            dropdown.set_selected_by_action(
+                AgentInputFooterAction::SetReasoningEffort(selected_effort),
+                ctx,
+            );
+        });
+        ctx.notify();
+    }
+
+    fn render_cli_reasoning_effort_selector(&self, agent: CLIAgent) -> Option<Box<dyn Element>> {
+        if agent.reasoning_effort_options().is_empty() {
+            return None;
+        }
+
+        Some(ChildView::new(&self.reasoning_effort_dropdown).finish())
+    }
+
     fn render_cli_toolbar_item(
         &self,
         item: &AgentToolbarItemKind,
@@ -1574,6 +1994,12 @@ impl AgentInputFooter {
             left_buttons.add_child(chip_with_dismiss);
         }
 
+        if let Some(agent) = self.cli_agent(app) {
+            if let Some(element) = self.render_cli_reasoning_effort_selector(agent) {
+                left_buttons.add_child(element);
+            }
+        }
+
         for item in &left_items {
             if let Some(element) = self.render_cli_toolbar_item(
                 item,
@@ -1601,13 +2027,14 @@ impl AgentInputFooter {
             }
         }
 
-        let content = Wrap::row()
+        let content = Flex::row()
             .with_main_axis_size(MainAxisSize::Max)
             .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
-            .with_child(WrapFillEntireRun::new(left_buttons.finish()).finish())
-            .with_child(WrapFill::new(0., right_buttons.finish()).finish())
-            .with_run_spacing(context_chips::spacing::UDI_ROW_RUN_SPACING)
+            .with_spacing(8.)
+            .with_child(left_buttons.finish())
+            .with_child(Expanded::new(1., self.render_ssh_remote_transfer_status(app)).finish())
+            .with_child(right_buttons.finish())
             .finish();
         let content = EventHandler::new(content)
             .on_right_mouse_down(|ctx, _, position| {
@@ -2384,7 +2811,7 @@ fn render_ftu_callout(
         .finish()
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum AgentInputFooterAction {
     #[cfg(feature = "voice_input")]
     ToggleVoiceInput,
@@ -2393,6 +2820,7 @@ pub enum AgentInputFooterAction {
     ToggleCodeReview,
     ToggleFileExplorer,
     ToggleRichInput,
+    SetReasoningEffort(AgentReasoningEffort),
     ToggleAutodetectionSetting,
     DismissFtuModelCallout,
     InstallPlugin,
@@ -2448,6 +2876,12 @@ impl TypedActionView for AgentInputFooter {
                         ctx
                     );
                 }
+                if SshRemoteModel::as_ref(ctx).active_host().is_some() {
+                    ctx.emit(AgentInputFooterEvent::UploadLocalFilesToSshRemote(vec![
+                        path.clone(),
+                    ]));
+                    return;
+                }
                 let path_with_space = format!("{path} ");
                 if self.has_active_cli_agent_input_session(ctx) {
                     ctx.emit(AgentInputFooterEvent::InsertIntoCLIRichInput(
@@ -2473,6 +2907,31 @@ impl TypedActionView for AgentInputFooter {
                 } else {
                     ctx.emit(AgentInputFooterEvent::OpenRichInput);
                 }
+            }
+            AgentInputFooterAction::SetReasoningEffort(effort) => {
+                let Some(agent) = self.cli_agent(ctx) else {
+                    return;
+                };
+                if !agent.supports_reasoning_effort(*effort) {
+                    return;
+                }
+
+                let current_effort = self
+                    .current_terminal_reasoning_effort(agent)
+                    .or_else(|| self.fallback_reasoning_effort_for_command(agent, ctx));
+                let command = agent.in_session_reasoning_effort_command(*effort, current_effort);
+                self.pending_reasoning_effort = command.as_ref().map(|_| PendingReasoningEffort {
+                    effort: *effort,
+                    set_at: Instant::now(),
+                });
+                AgentReasoningEffortModel::handle(ctx).update(ctx, |model, ctx| {
+                    model.set_effort(*effort, ctx);
+                });
+
+                if let Some(command) = command {
+                    ctx.emit(AgentInputFooterEvent::WriteToPty(command));
+                }
+                self.schedule_reasoning_effort_reconciliation(ctx);
             }
             AgentInputFooterAction::ToggleAutodetectionSetting => {
                 let ai_settings = AISettings::handle(ctx);
@@ -2631,6 +3090,7 @@ pub enum AgentInputFooterEvent {
     WriteToPty(String),
     /// Insert text into the CLI agent rich input.
     InsertIntoCLIRichInput(String),
+    UploadLocalFilesToSshRemote(Vec<String>),
     ToggleCodeReviewPane(CLIAgent),
     ToggleFileExplorer(CLIAgent),
     StartRemoteControl,
@@ -2927,5 +3387,26 @@ impl ActionButtonTheme for NLDButtonTheme {
 
     fn should_opt_out_of_contrast_adjustment(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod reasoning_effort_tests {
+    use super::*;
+
+    #[test]
+    fn parses_codex_status_line_reasoning_effort() {
+        assert_eq!(
+            AgentInputFooter::parse_codex_reasoning_effort_status_line(
+                "gpt-5.5 xhigh · ~/Desktop/src",
+            ),
+            Some(AgentReasoningEffort::ExtraHigh)
+        );
+        assert_eq!(
+            AgentInputFooter::parse_codex_reasoning_effort_status_line(
+                "Reasoning is already at the lowest level (low).",
+            ),
+            Some(AgentReasoningEffort::Low)
+        );
     }
 }

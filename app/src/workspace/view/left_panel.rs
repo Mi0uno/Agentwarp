@@ -8,7 +8,7 @@ use warp_util::path::LineAndColumnArg;
 use warpui::elements::{
     resizable_state_handle, ChildView, ConstrainedBox, Container, CrossAxisAlignment, DragBarSide,
     Element, Empty, Flex, MainAxisAlignment, MainAxisSize, MouseStateHandle, ParentElement,
-    Resizable, ResizableStateHandle, Shrinkable,
+    Resizable, ResizableStateHandle, SavePosition, Shrinkable,
 };
 use warpui::platform::Cursor;
 use warpui::ui_components::components::{Coords, UiComponent, UiComponentStyles};
@@ -53,11 +53,16 @@ use crate::workspace::view::conversation_list::view::{
 use crate::workspace::view::global_search::view::{
     Event as GlobalSearchViewEvent, GlobalSearchEntryFocus, GlobalSearchView,
 };
+use crate::workspace::view::ssh_remote::{
+    SshRemoteHost, SshRemoteModel, SshRemoteView, SshRemoteViewEvent,
+};
 use crate::workspace::view::{
     LEFT_PANEL_AGENT_CONVERSATIONS_BINDING_NAME, LEFT_PANEL_GLOBAL_SEARCH_BINDING_NAME,
-    LEFT_PANEL_PROJECT_EXPLORER_BINDING_NAME, LEFT_PANEL_WARP_DRIVE_BINDING_NAME,
-    OPEN_GLOBAL_SEARCH_BINDING_NAME, TOGGLE_CONVERSATION_LIST_VIEW_BINDING_NAME,
-    TOGGLE_PROJECT_EXPLORER_BINDING_NAME, TOGGLE_WARP_DRIVE_BINDING_NAME,
+    LEFT_PANEL_PROJECT_EXPLORER_BINDING_NAME, LEFT_PANEL_SSH_REMOTE_BINDING_NAME,
+    LEFT_PANEL_WARP_DRIVE_BINDING_NAME, OPEN_GLOBAL_SEARCH_BINDING_NAME,
+    SSH_REMOTE_PANEL_POSITION_ID, TOGGLE_CONVERSATION_LIST_VIEW_BINDING_NAME,
+    TOGGLE_PROJECT_EXPLORER_BINDING_NAME, TOGGLE_SSH_REMOTE_BINDING_NAME,
+    TOGGLE_WARP_DRIVE_BINDING_NAME,
 };
 use crate::workspace::WorkspaceAction;
 use crate::TelemetryEvent;
@@ -66,6 +71,7 @@ use crate::TelemetryEvent;
 struct MouseStateHandles {
     project_explorer_button: MouseStateHandle,
     conversation_list_view_button: MouseStateHandle,
+    ssh_remote_button: MouseStateHandle,
     global_search_button: MouseStateHandle,
     warp_drive_button: MouseStateHandle,
 }
@@ -76,6 +82,7 @@ pub enum LeftPanelAction {
     GlobalSearch { entry_focus: GlobalSearchEntryFocus },
     WarpDrive,
     ConversationListView,
+    SshRemote,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -90,6 +97,8 @@ pub enum LeftPanelEvent {
         line_col: Option<LineAndColumnArg>,
     },
     NewConversationInNewTab,
+    ConnectSshRemoteHost(String),
+    DisconnectSshRemoteHost(String),
     ShowDeleteConfirmationDialog {
         conversation_id: AIConversationId,
         conversation_title: String,
@@ -103,6 +112,7 @@ pub enum ToolPanelView {
     GlobalSearch { entry_focus: GlobalSearchEntryFocus },
     WarpDrive,
     ConversationListView,
+    SshRemote,
 }
 
 /// Encapsulates the active view state to enforce that all mutations go through
@@ -170,6 +180,7 @@ pub struct LeftPanelView {
     close_button_mouse_state: MouseStateHandle,
     warp_drive_view: ViewHandle<DrivePanel>,
     conversation_list_view: ViewHandle<ConversationListView>,
+    ssh_remote_view: ViewHandle<SshRemoteView>,
     active_view: active_view_state::ActiveViewState,
     toolbelt_buttons: Vec<ToolbeltButtonConfig>,
     active_pane_group: Option<WeakViewHandle<PaneGroup>>,
@@ -196,6 +207,26 @@ fn toolbelt_tooltip_keybinding(binding_names: &[&'static str], app: &AppContext)
 }
 
 impl LeftPanelView {
+    fn ssh_remote_file_tree_root(
+        pane_group: &ViewHandle<PaneGroup>,
+        host: &SshRemoteHost,
+        ctx: &AppContext,
+    ) -> String {
+        pane_group
+            .as_ref(ctx)
+            .active_session_view(ctx)
+            .and_then(|terminal| terminal.as_ref(ctx).pwd())
+            .filter(|pwd| !pwd.trim().is_empty())
+            .unwrap_or_else(|| {
+                let setup_dir = host.remote_setup_dir.trim();
+                if setup_dir.is_empty() {
+                    "/".to_owned()
+                } else {
+                    setup_dir.to_owned()
+                }
+            })
+    }
+
     pub fn new(
         working_directories_model: ModelHandle<WorkingDirectoriesModel>,
         views: Vec<ToolPanelView>,
@@ -214,6 +245,7 @@ impl LeftPanelView {
         };
         let warp_drive_view = ctx.add_typed_action_view(DrivePanel::new);
         let conversation_list_view = ctx.add_typed_action_view(ConversationListView::new);
+        let ssh_remote_view = ctx.add_typed_action_view(SshRemoteView::new);
 
         ctx.subscribe_to_view(&warp_drive_view, |_me, _, event, ctx| {
             ctx.emit(LeftPanelEvent::WarpDrive(event.clone()));
@@ -233,6 +265,15 @@ impl LeftPanelView {
                     conversation_title: conversation_title.clone(),
                     terminal_view_id: *terminal_view_id,
                 });
+            }
+        });
+
+        ctx.subscribe_to_view(&ssh_remote_view, |_me, _, event, ctx| match event {
+            SshRemoteViewEvent::ConnectHost(host_id) => {
+                ctx.emit(LeftPanelEvent::ConnectSshRemoteHost(host_id.clone()));
+            }
+            SshRemoteViewEvent::DisconnectHost(host_id) => {
+                ctx.emit(LeftPanelEvent::DisconnectSshRemoteHost(host_id.clone()));
             }
         });
 
@@ -273,24 +314,39 @@ impl LeftPanelView {
                 }
                 let has_terminal_session = directories.iter().any(|dir| dir.terminal_id.is_some());
 
-                // Split directories into local and remote.
-                let local_paths: Vec<PathBuf> = directories
-                    .iter()
-                    .filter_map(|d| d.path.to_local_path().map(|p| p.to_path_buf()))
-                    .collect();
+                let active_ssh_host = SshRemoteModel::as_ref(ctx).active_host().cloned();
+                let ssh_remote_root = active_ssh_host
+                    .as_ref()
+                    .map(|host| Self::ssh_remote_file_tree_root(&active_pane_group, host, ctx));
+
+                // Split directories into local and remote. Embedded SSH remotes
+                // use an SFTP-backed tree instead of local cwd/repo metadata.
+                let local_paths: Vec<PathBuf> = if active_ssh_host.is_some() {
+                    Vec::new()
+                } else {
+                    directories
+                        .iter()
+                        .filter_map(|d| d.path.to_local_path().map(|p| p.to_path_buf()))
+                        .collect()
+                };
                 #[allow(unused_variables)]
-                let remote_repos: Vec<repo_metadata::RemoteRepositoryIdentifier> = directories
-                    .iter()
-                    .filter_map(|d| match &d.path {
-                        LocalOrRemotePath::Remote(remote_path) => {
-                            Some(repo_metadata::RemoteRepositoryIdentifier::new(
-                                remote_path.host_id.clone(),
-                                remote_path.path.clone(),
-                            ))
-                        }
-                        _ => None,
-                    })
-                    .collect();
+                let remote_repos: Vec<repo_metadata::RemoteRepositoryIdentifier> =
+                    if active_ssh_host.is_some() {
+                        Vec::new()
+                    } else {
+                        directories
+                            .iter()
+                            .filter_map(|d| match &d.path {
+                                LocalOrRemotePath::Remote(remote_path) => {
+                                    Some(repo_metadata::RemoteRepositoryIdentifier::new(
+                                        remote_path.host_id.clone(),
+                                        remote_path.path.clone(),
+                                    ))
+                                }
+                                _ => None,
+                            })
+                            .collect()
+                    };
 
                 // Update GlobalSearchView root directories (local only).
                 let global_search_view =
@@ -307,9 +363,19 @@ impl LeftPanelView {
                 let is_visible =
                     active_pane_group.as_ref(ctx).left_panel_open && me.is_file_tree_active();
                 file_tree_view.update(ctx, |view, ctx| {
-                    view.set_root_directories(local_directories, ctx);
-                    #[cfg(feature = "local_fs")]
-                    view.set_remote_root_directories(&remote_repos, ctx);
+                    if let (Some(host), Some(root)) =
+                        (active_ssh_host.clone(), ssh_remote_root.clone())
+                    {
+                        view.set_root_directories(Vec::new(), ctx);
+                        #[cfg(feature = "local_fs")]
+                        view.set_remote_root_directories(&[], ctx);
+                        view.set_ssh_remote_root_directory(host, root, ctx);
+                    } else {
+                        view.clear_ssh_remote_root_directories(ctx);
+                        view.set_root_directories(local_directories, ctx);
+                        #[cfg(feature = "local_fs")]
+                        view.set_remote_root_directories(&remote_repos, ctx);
+                    }
                     view.set_has_terminal_session(has_terminal_session, ctx);
                     view.set_is_active(is_visible, ctx);
 
@@ -327,6 +393,7 @@ impl LeftPanelView {
             close_button_mouse_state: Default::default(),
             warp_drive_view,
             conversation_list_view,
+            ssh_remote_view,
             active_view: active_view_state::new(active_view),
             toolbelt_buttons,
             active_pane_group: None,
@@ -454,6 +521,22 @@ impl LeftPanelView {
                     active_icon: Some(Icon::Conversation),
                     tooltip_text: "Agent conversations".to_string(),
                     action: LeftPanelAction::ConversationListView,
+                    render_with_active_state: false,
+                    tooltip_keybinding: toolbelt_tooltip_keybinding(&tooltip_keybinding_names, ctx),
+                    tooltip_keybinding_names,
+                }
+            }
+            ToolPanelView::SshRemote => {
+                let tooltip_keybinding_names = vec![
+                    LEFT_PANEL_SSH_REMOTE_BINDING_NAME,
+                    TOGGLE_SSH_REMOTE_BINDING_NAME,
+                ];
+
+                ToolbeltButtonConfig {
+                    icon: Icon::Cloud,
+                    active_icon: Some(Icon::CloudFilled),
+                    tooltip_text: "SSH remote".to_string(),
+                    action: LeftPanelAction::SshRemote,
                     render_with_active_state: false,
                     tooltip_keybinding: toolbelt_tooltip_keybinding(&tooltip_keybinding_names, ctx),
                     tooltip_keybinding_names,
@@ -610,24 +693,39 @@ impl LeftPanelView {
             .iter()
             .any(|dir| dir.terminal_id.is_some());
 
-        // Split directories into local and remote.
-        let local_paths: Vec<PathBuf> = active_directories
-            .iter()
-            .filter_map(|d| d.path.to_local_path().map(|p| p.to_path_buf()))
-            .collect();
+        let active_ssh_host = SshRemoteModel::as_ref(ctx).active_host().cloned();
+        let ssh_remote_root = active_ssh_host
+            .as_ref()
+            .map(|host| Self::ssh_remote_file_tree_root(&pane_group, host, ctx));
+
+        // Split directories into local and remote. Embedded SSH remotes
+        // are backed by SFTP directly.
+        let local_paths: Vec<PathBuf> = if active_ssh_host.is_some() {
+            Vec::new()
+        } else {
+            active_directories
+                .iter()
+                .filter_map(|d| d.path.to_local_path().map(|p| p.to_path_buf()))
+                .collect()
+        };
         #[allow(unused_variables)]
-        let remote_repos: Vec<repo_metadata::RemoteRepositoryIdentifier> = active_directories
-            .iter()
-            .filter_map(|d| match &d.path {
-                LocalOrRemotePath::Remote(remote_path) => {
-                    Some(repo_metadata::RemoteRepositoryIdentifier::new(
-                        remote_path.host_id.clone(),
-                        remote_path.path.clone(),
-                    ))
-                }
-                _ => None,
-            })
-            .collect();
+        let remote_repos: Vec<repo_metadata::RemoteRepositoryIdentifier> =
+            if active_ssh_host.is_some() {
+                Vec::new()
+            } else {
+                active_directories
+                    .iter()
+                    .filter_map(|d| match &d.path {
+                        LocalOrRemotePath::Remote(remote_path) => {
+                            Some(repo_metadata::RemoteRepositoryIdentifier::new(
+                                remote_path.host_id.clone(),
+                                remote_path.path.clone(),
+                            ))
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            };
 
         // Update GlobalSearchView root directories (local only).
         let global_search_view =
@@ -643,9 +741,17 @@ impl LeftPanelView {
         let left_panel_open = pane_group.as_ref(ctx).left_panel_open;
         let is_visible = left_panel_open && self.is_file_tree_active();
         file_tree_view.update(ctx, |view, ctx| {
-            view.set_root_directories(local_directories, ctx);
-            #[cfg(feature = "local_fs")]
-            view.set_remote_root_directories(&remote_repos, ctx);
+            if let (Some(host), Some(root)) = (active_ssh_host.clone(), ssh_remote_root.clone()) {
+                view.set_root_directories(Vec::new(), ctx);
+                #[cfg(feature = "local_fs")]
+                view.set_remote_root_directories(&[], ctx);
+                view.set_ssh_remote_root_directory(host, root, ctx);
+            } else {
+                view.clear_ssh_remote_root_directories(ctx);
+                view.set_root_directories(local_directories, ctx);
+                #[cfg(feature = "local_fs")]
+                view.set_remote_root_directories(&remote_repos, ctx);
+            }
             view.set_has_terminal_session(has_terminal_session, ctx);
             view.set_active_file_model(active_file_model, ctx);
             view.set_is_active(is_visible, ctx);
@@ -715,6 +821,11 @@ impl LeftPanelView {
             ToolPanelView::ConversationListView => {
                 self.conversation_list_view.update(ctx, |view, ctx| {
                     view.on_left_panel_focused(ctx);
+                });
+            }
+            ToolPanelView::SshRemote => {
+                self.ssh_remote_view.update(ctx, |view, ctx| {
+                    view.focus_first_field(ctx);
                 });
             }
         }
@@ -869,6 +980,7 @@ impl LeftPanelView {
                 LeftPanelAction::ConversationListView => {
                     self.active_view.get() == ToolPanelView::ConversationListView
                 }
+                LeftPanelAction::SshRemote => self.active_view.get() == ToolPanelView::SshRemote,
             };
         }
     }
@@ -1010,6 +1122,9 @@ impl LeftPanelView {
                 active_view_state::set(self, ToolPanelView::ConversationListView, ctx);
                 send_telemetry_from_ctx!(TelemetryEvent::ConversationListViewOpened, ctx);
             }
+            LeftPanelAction::SshRemote => {
+                active_view_state::set(self, ToolPanelView::SshRemote, ctx);
+            }
         }
     }
 
@@ -1109,6 +1224,7 @@ impl View for LeftPanelView {
                 }
                 ToolPanelView::WarpDrive => ctx.focus(&self.warp_drive_view),
                 ToolPanelView::ConversationListView => ctx.focus(&self.conversation_list_view),
+                ToolPanelView::SshRemote => ctx.focus(&self.ssh_remote_view),
             }
         }
     }
@@ -1121,6 +1237,7 @@ impl View for LeftPanelView {
             self.mouse_state_handles
                 .conversation_list_view_button
                 .clone(),
+            self.mouse_state_handles.ssh_remote_button.clone(),
             self.mouse_state_handles.global_search_button.clone(),
             self.mouse_state_handles.warp_drive_button.clone(),
         ];
@@ -1181,6 +1298,15 @@ impl View for LeftPanelView {
             ToolPanelView::ConversationListView => {
                 Shrinkable::new(1.0, ChildView::new(&self.conversation_list_view).finish()).finish()
             }
+            ToolPanelView::SshRemote => Shrinkable::new(
+                1.0,
+                SavePosition::new(
+                    ChildView::new(&self.ssh_remote_view).finish(),
+                    SSH_REMOTE_PANEL_POSITION_ID,
+                )
+                .finish(),
+            )
+            .finish(),
         };
 
         let panel_content = Container::new({

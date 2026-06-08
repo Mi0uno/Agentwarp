@@ -1,4 +1,5 @@
 use chrono::Utc;
+use std::path::PathBuf;
 use warp_graphql::scalars::time::ServerTimestamp;
 use warpui::{App, SingletonEntity};
 
@@ -353,6 +354,567 @@ fn test_toolbar_command_map_roundtrip() {
     let file_value = original.to_file_value();
     let restored = ToolbarCommandMap::from_file_value(&file_value).unwrap();
     assert_eq!(original, restored);
+}
+
+#[test]
+fn test_cli_agent_builtin_prompt_applies_append_mode() {
+    let prompt = CLIAgentBuiltinPrompt {
+        mode: CLIAgentBuiltinPromptMode::Append,
+        prompt: "Prefer concise answers.".to_string(),
+    };
+
+    assert_eq!(
+        prompt.apply_to_prompt("Explain the diff.".to_string()),
+        "Explain the diff.\n\nAdditional built-in instructions:\nPrefer concise answers."
+    );
+}
+
+#[test]
+fn test_cli_agent_builtin_prompt_applies_replace_mode() {
+    let prompt = CLIAgentBuiltinPrompt {
+        mode: CLIAgentBuiltinPromptMode::Replace,
+        prompt: "You are a careful code reviewer.".to_string(),
+    };
+
+    assert_eq!(
+        prompt.apply_to_prompt("Review this patch.".to_string()),
+        "Built-in system prompt:\nYou are a careful code reviewer.\n\nUser request:\nReview this patch."
+    );
+}
+
+#[test]
+fn test_cli_agent_builtin_prompt_builds_claude_native_launch_suffix() {
+    let append_prompt = CLIAgentBuiltinPrompt {
+        mode: CLIAgentBuiltinPromptMode::Append,
+        prompt: "Prefer concise answers.".to_string(),
+    };
+    assert_eq!(
+        append_prompt
+            .native_launch_suffix(CLIAgent::Claude)
+            .as_deref(),
+        Some("--append-system-prompt 'Prefer concise answers.'")
+    );
+
+    let replace_prompt = CLIAgentBuiltinPrompt {
+        mode: CLIAgentBuiltinPromptMode::Replace,
+        prompt: "You are a reviewer.".to_string(),
+    };
+    assert_eq!(
+        replace_prompt
+            .native_launch_suffix(CLIAgent::Claude)
+            .as_deref(),
+        Some("--system-prompt 'You are a reviewer.'")
+    );
+}
+
+#[test]
+fn test_cli_agent_builtin_prompt_builds_codex_native_launch_suffix() {
+    let prompt = CLIAgentBuiltinPrompt {
+        mode: CLIAgentBuiltinPromptMode::Append,
+        prompt: "Prefer concise answers.".to_string(),
+    };
+
+    assert_eq!(
+        prompt.native_launch_suffix(CLIAgent::Codex).as_deref(),
+        Some("-c 'developer_instructions=\"Prefer concise answers.\"'")
+    );
+}
+
+#[test]
+fn test_cli_agent_builtin_prompt_has_no_opencode_native_launch_suffix() {
+    let prompt = CLIAgentBuiltinPrompt {
+        mode: CLIAgentBuiltinPromptMode::Append,
+        prompt: "Prefer concise answers.".to_string(),
+    };
+
+    assert_eq!(prompt.native_launch_suffix(CLIAgent::OpenCode), None);
+}
+
+#[test]
+fn test_cli_agent_builtin_prompt_supported_agents() {
+    assert!(AISettings::supports_cli_agent_builtin_prompt(
+        CLIAgent::Claude
+    ));
+    assert!(AISettings::supports_cli_agent_builtin_prompt(
+        CLIAgent::Codex
+    ));
+    assert!(AISettings::supports_cli_agent_builtin_prompt(
+        CLIAgent::OpenCode
+    ));
+    assert!(!AISettings::supports_cli_agent_builtin_prompt(
+        CLIAgent::Gemini
+    ));
+}
+
+#[test]
+fn test_cli_agent_api_profile_store_prefers_environment_specific_profile() {
+    let mut store = CLIAgentApiProfilesStore::default();
+    let all_profile = CLIAgentApiProfile::new(
+        CLIAgent::Codex,
+        CLI_AGENT_API_ALL_ENVIRONMENTS_ID.to_owned(),
+        "Shared".to_owned(),
+        "https://shared.example.com".to_owned(),
+        "shared-key".to_owned(),
+        "gpt-shared".to_owned(),
+    );
+    let remote_profile = CLIAgentApiProfile::new(
+        CLIAgent::Codex,
+        "ssh:devbox".to_owned(),
+        "Remote".to_owned(),
+        "https://remote.example.com".to_owned(),
+        "remote-key".to_owned(),
+        "gpt-remote".to_owned(),
+    );
+
+    store.upsert_profile(all_profile.clone(), true);
+    store.upsert_profile(remote_profile.clone(), true);
+
+    assert_eq!(
+        store
+            .active_profile(CLIAgent::Codex, "ssh:devbox")
+            .map(|profile| profile.id.as_str()),
+        Some(remote_profile.id.as_str())
+    );
+    assert_eq!(
+        store
+            .active_profile(CLIAgent::Codex, "ssh:other")
+            .map(|profile| profile.id.as_str()),
+        Some(all_profile.id.as_str())
+    );
+}
+
+#[test]
+fn test_cli_agent_api_profile_store_ignores_disabled_profiles() {
+    let mut store = CLIAgentApiProfilesStore::default();
+    let mut disabled_profile = CLIAgentApiProfile::new(
+        CLIAgent::Codex,
+        CLI_AGENT_API_LOCAL_ENVIRONMENT_ID.to_owned(),
+        "Disabled".to_owned(),
+        "https://disabled.example.com".to_owned(),
+        "disabled-key".to_owned(),
+        "gpt-disabled".to_owned(),
+    );
+    disabled_profile.enabled = false;
+
+    store.upsert_profile(disabled_profile, true);
+
+    assert!(store
+        .active_profile(CLIAgent::Codex, CLI_AGENT_API_LOCAL_ENVIRONMENT_ID)
+        .is_none());
+    assert!(store
+        .fallback_profiles(CLIAgent::Codex, CLI_AGENT_API_LOCAL_ENVIRONMENT_ID)
+        .is_empty());
+}
+
+#[test]
+fn test_cli_agent_api_profile_store_disabling_profile_clears_active_profile() {
+    let mut store = CLIAgentApiProfilesStore::default();
+    let profile = CLIAgentApiProfile::new(
+        CLIAgent::Codex,
+        CLI_AGENT_API_LOCAL_ENVIRONMENT_ID.to_owned(),
+        "Primary".to_owned(),
+        "https://primary.example.com".to_owned(),
+        "primary-key".to_owned(),
+        "gpt-primary".to_owned(),
+    );
+    let profile_id = profile.id.clone();
+
+    store.upsert_profile(profile, true);
+    store.set_profile_enabled(&profile_id, false);
+
+    assert!(store
+        .active_profile(CLIAgent::Codex, CLI_AGENT_API_LOCAL_ENVIRONMENT_ID)
+        .is_none());
+    assert!(store
+        .fallback_profiles(CLIAgent::Codex, CLI_AGENT_API_LOCAL_ENVIRONMENT_ID)
+        .is_empty());
+    assert!(store.active_profile_ids.is_empty());
+}
+
+#[test]
+fn test_cli_agent_api_profile_store_upsert_scope_change_clears_stale_active_profile() {
+    let mut store = CLIAgentApiProfilesStore::default();
+    let profile = CLIAgentApiProfile::new(
+        CLIAgent::Codex,
+        CLI_AGENT_API_LOCAL_ENVIRONMENT_ID.to_owned(),
+        "Primary".to_owned(),
+        "https://primary.example.com".to_owned(),
+        "primary-key".to_owned(),
+        "gpt-primary".to_owned(),
+    );
+    let mut moved_profile = profile.clone();
+    moved_profile.environment_id = "ssh:devbox".to_owned();
+
+    store.upsert_profile(profile, true);
+    store.upsert_profile(moved_profile, false);
+
+    assert!(store
+        .active_profile(CLIAgent::Codex, CLI_AGENT_API_LOCAL_ENVIRONMENT_ID)
+        .is_none());
+    assert!(store.active_profile_ids.is_empty());
+}
+
+#[test]
+fn test_cli_agent_api_profile_store_imports_profile_list_json() {
+    let profile = CLIAgentApiProfile::new(
+        CLIAgent::Claude,
+        CLI_AGENT_API_LOCAL_ENVIRONMENT_ID.to_owned(),
+        "Claude relay".to_owned(),
+        "https://claude.example.com".to_owned(),
+        "claude-key".to_owned(),
+        "sonnet".to_owned(),
+    );
+    let json = serde_json::to_string(&vec![profile.clone()]).unwrap();
+
+    let imported_store = CLIAgentApiProfilesStore::from_import_json(&json).unwrap();
+
+    assert_eq!(imported_store.profiles.len(), 1);
+    assert_eq!(imported_store.profiles[0].id, profile.id);
+    assert_eq!(imported_store.profiles[0].agent(), CLIAgent::Claude);
+}
+
+#[test]
+fn test_cli_agent_api_profile_store_imports_store_json_with_active_profile() {
+    let mut store = CLIAgentApiProfilesStore::default();
+    let profile = CLIAgentApiProfile::new(
+        CLIAgent::Gemini,
+        CLI_AGENT_API_ALL_ENVIRONMENTS_ID.to_owned(),
+        "Gemini relay".to_owned(),
+        "https://gemini.example.com".to_owned(),
+        "gemini-key".to_owned(),
+        "gemini-pro".to_owned(),
+    );
+    let profile_id = profile.id.clone();
+
+    store.upsert_profile(profile, true);
+    let json = serde_json::to_string(&store).unwrap();
+    let imported_store = CLIAgentApiProfilesStore::from_import_json(&json).unwrap();
+
+    assert_eq!(
+        imported_store
+            .active_profile(CLIAgent::Gemini, CLI_AGENT_API_LOCAL_ENVIRONMENT_ID)
+            .map(|profile| profile.id.as_str()),
+        Some(profile_id.as_str())
+    );
+}
+
+#[test]
+fn test_cli_agent_api_profile_store_merge_imported_profiles() {
+    let existing_profile = CLIAgentApiProfile::new(
+        CLIAgent::Codex,
+        CLI_AGENT_API_LOCAL_ENVIRONMENT_ID.to_owned(),
+        "Existing".to_owned(),
+        "https://existing.example.com".to_owned(),
+        "existing-key".to_owned(),
+        "gpt-existing".to_owned(),
+    );
+    let imported_profile = CLIAgentApiProfile::new(
+        CLIAgent::Codex,
+        "ssh:devbox".to_owned(),
+        "Imported".to_owned(),
+        "https://imported.example.com".to_owned(),
+        "imported-key".to_owned(),
+        "gpt-imported".to_owned(),
+    );
+    let imported_profile_id = imported_profile.id.clone();
+    let mut store = CLIAgentApiProfilesStore::default();
+    let mut imported_store = CLIAgentApiProfilesStore::default();
+
+    store.upsert_profile(existing_profile, true);
+    imported_store.upsert_profile(imported_profile, true);
+    let imported_count = store.merge_store(imported_store);
+
+    assert_eq!(imported_count, 1);
+    assert_eq!(store.profiles.len(), 2);
+    assert_eq!(
+        store
+            .active_profile(CLIAgent::Codex, "ssh:devbox")
+            .map(|profile| profile.id.as_str()),
+        Some(imported_profile_id.as_str())
+    );
+}
+
+#[test]
+fn test_cli_agent_api_profile_health_display_labels() {
+    assert_eq!(
+        CLIAgentApiProfileHealth::default().display_label(),
+        "health unchecked"
+    );
+    assert_eq!(
+        CLIAgentApiProfileHealth::checking(123).display_label(),
+        "health checking"
+    );
+    assert_eq!(
+        CLIAgentApiProfileHealth::healthy(123, 45, 200).display_label(),
+        "healthy 45ms HTTP 200"
+    );
+    assert_eq!(
+        CLIAgentApiProfileHealth::failed(123, 45, 401, "Unauthorized").display_label(),
+        "failed HTTP 401 Unauthorized"
+    );
+}
+
+#[test]
+fn test_cli_agent_api_usage_summary_display_label() {
+    let summary = CLIAgentApiUsageSummary {
+        log_path: PathBuf::from("/tmp/agent-api-usage.ndjson"),
+        event_count: 3,
+        successful_events: 2,
+        failed_events: 1,
+        retry_events: 1,
+        total_latency_ms: 90,
+        total_request_bytes: 120,
+        total_response_bytes: 300,
+        total_prompt_tokens: 40,
+        total_completion_tokens: 20,
+        total_tokens: 60,
+        total_estimated_cost_usd: 0.0123,
+        last_profile_name: "Primary".to_owned(),
+        last_status: 200,
+        last_error: String::new(),
+    };
+
+    assert_eq!(
+        summary.display_label(),
+        "3 events / 2 success / 1 failed / 1 failover / avg 30ms / in 120B / out 300B / last HTTP 200 via Primary / 60 tokens (40 in / 20 out) / est $0.0123"
+    );
+}
+
+#[test]
+fn test_cli_agent_api_usage_summary_reads_token_usage() {
+    let contents = r#"{"profile_name":"Primary","status":200,"success":true,"final_attempt":true,"latency_ms":10,"prompt_tokens":7,"completion_tokens":3,"estimated_cost_usd":0.0001}"#;
+
+    let summary =
+        cli_agent_api_usage_summary_from_contents(PathBuf::from("/tmp/usage.ndjson"), contents);
+
+    assert_eq!(summary.total_prompt_tokens, 7);
+    assert_eq!(summary.total_completion_tokens, 3);
+    assert_eq!(summary.total_tokens, 10);
+    assert_eq!(summary.total_estimated_cost_usd, 0.0001);
+    assert_eq!(
+        summary.display_label(),
+        "1 events / 1 success / 0 failed / 0 failover / avg 10ms / in 0B / out 0B / last HTTP 200 via Primary / 10 tokens (7 in / 3 out) / est $0.0001"
+    );
+}
+
+#[test]
+fn test_cli_agent_api_environment_vars_use_agent_native_names() {
+    App::test((), |mut app| async move {
+        initialize_settings_for_tests(&mut app);
+
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings.add_cli_agent_api_profile(
+                CLIAgentApiProfile::new(
+                    CLIAgent::Claude,
+                    CLI_AGENT_API_LOCAL_ENVIRONMENT_ID.to_owned(),
+                    "Claude relay".to_owned(),
+                    "https://claude.example.com/".to_owned(),
+                    "claude-key".to_owned(),
+                    "claude-sonnet".to_owned(),
+                ),
+                true,
+                ctx,
+            );
+            settings.add_cli_agent_api_profile(
+                CLIAgentApiProfile::new(
+                    CLIAgent::Gemini,
+                    CLI_AGENT_API_LOCAL_ENVIRONMENT_ID.to_owned(),
+                    "Gemini relay".to_owned(),
+                    "https://gemini.example.com".to_owned(),
+                    "gemini-key".to_owned(),
+                    "gemini-pro".to_owned(),
+                ),
+                true,
+                ctx,
+            );
+        });
+
+        AISettings::handle(&app).read(&app, |settings, _ctx| {
+            let claude_env = settings.cli_agent_api_environment_vars(
+                CLIAgent::Claude,
+                CLI_AGENT_API_LOCAL_ENVIRONMENT_ID,
+            );
+            assert_eq!(
+                claude_env.get("ANTHROPIC_API_KEY").map(String::as_str),
+                Some("claude-key")
+            );
+            assert_eq!(
+                claude_env.get("ANTHROPIC_AUTH_TOKEN").map(String::as_str),
+                Some("claude-key")
+            );
+            assert_eq!(
+                claude_env.get("ANTHROPIC_BASE_URL").map(String::as_str),
+                Some("https://claude.example.com")
+            );
+            assert_eq!(
+                claude_env.get("ANTHROPIC_MODEL").map(String::as_str),
+                Some("claude-sonnet")
+            );
+            assert_eq!(
+                claude_env
+                    .get("ANTHROPIC_DEFAULT_SONNET_MODEL")
+                    .map(String::as_str),
+                Some("claude-sonnet")
+            );
+            assert_eq!(
+                claude_env
+                    .get("ANTHROPIC_DEFAULT_HAIKU_MODEL")
+                    .map(String::as_str),
+                Some("claude-sonnet")
+            );
+            assert_eq!(
+                claude_env
+                    .get("ANTHROPIC_DEFAULT_OPUS_MODEL")
+                    .map(String::as_str),
+                Some("claude-sonnet")
+            );
+
+            let gemini_env = settings.cli_agent_api_environment_vars(
+                CLIAgent::Gemini,
+                CLI_AGENT_API_LOCAL_ENVIRONMENT_ID,
+            );
+            assert_eq!(
+                gemini_env.get("GEMINI_API_KEY").map(String::as_str),
+                Some("gemini-key")
+            );
+            assert_eq!(
+                gemini_env.get("GOOGLE_GEMINI_BASE_URL").map(String::as_str),
+                Some("https://gemini.example.com")
+            );
+        });
+    });
+}
+
+#[test]
+fn test_cli_agent_api_environment_vars_include_claude_model_mappings() {
+    App::test((), |mut app| async move {
+        initialize_settings_for_tests(&mut app);
+
+        let mut profile = CLIAgentApiProfile::new(
+            CLIAgent::Claude,
+            CLI_AGENT_API_LOCAL_ENVIRONMENT_ID.to_owned(),
+            "Claude relay".to_owned(),
+            "https://claude.example.com".to_owned(),
+            "claude-key".to_owned(),
+            "fallback-model".to_owned(),
+        );
+        profile.model_mappings = vec![
+            CLIAgentApiModelMapping {
+                role: "Sonnet".to_owned(),
+                display_name: "DeepSeek V4 Pro".to_owned(),
+                model: "deepseek-v4-pro".to_owned(),
+                supports_one_million_context: true,
+                context_window_tokens: 0,
+            },
+            CLIAgentApiModelMapping {
+                role: "Opus".to_owned(),
+                display_name: "DeepSeek V4 Ultra".to_owned(),
+                model: "deepseek-v4-ultra[1M]".to_owned(),
+                supports_one_million_context: true,
+                context_window_tokens: 0,
+            },
+            CLIAgentApiModelMapping {
+                role: "Haiku".to_owned(),
+                display_name: String::new(),
+                model: "deepseek-v4-flash".to_owned(),
+                supports_one_million_context: false,
+                context_window_tokens: 0,
+            },
+        ];
+
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings.add_cli_agent_api_profile(profile, true, ctx);
+        });
+
+        AISettings::handle(&app).read(&app, |settings, _ctx| {
+            let env = settings.cli_agent_api_environment_vars(
+                CLIAgent::Claude,
+                CLI_AGENT_API_LOCAL_ENVIRONMENT_ID,
+            );
+            assert_eq!(
+                env.get("ANTHROPIC_DEFAULT_SONNET_MODEL")
+                    .map(String::as_str),
+                Some("deepseek-v4-pro[1M]")
+            );
+            assert_eq!(
+                env.get("ANTHROPIC_DEFAULT_SONNET_MODEL_NAME")
+                    .map(String::as_str),
+                Some("DeepSeek V4 Pro")
+            );
+            assert_eq!(
+                env.get("ANTHROPIC_DEFAULT_OPUS_MODEL").map(String::as_str),
+                Some("deepseek-v4-ultra[1M]")
+            );
+            assert_eq!(
+                env.get("ANTHROPIC_DEFAULT_OPUS_MODEL_NAME")
+                    .map(String::as_str),
+                Some("DeepSeek V4 Ultra")
+            );
+            assert_eq!(
+                env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL").map(String::as_str),
+                Some("deepseek-v4-flash")
+            );
+            assert!(!env.contains_key("ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME"));
+        });
+    });
+}
+
+#[test]
+fn test_cli_agent_api_environment_vars_include_failover_chain() {
+    App::test((), |mut app| async move {
+        initialize_settings_for_tests(&mut app);
+
+        let mut primary = CLIAgentApiProfile::new(
+            CLIAgent::Codex,
+            CLI_AGENT_API_LOCAL_ENVIRONMENT_ID.to_owned(),
+            "Primary".to_owned(),
+            "https://primary.example.com".to_owned(),
+            "primary-key".to_owned(),
+            "gpt-primary".to_owned(),
+        );
+        primary.priority = 10;
+        let mut fallback = CLIAgentApiProfile::new(
+            CLIAgent::Codex,
+            CLI_AGENT_API_LOCAL_ENVIRONMENT_ID.to_owned(),
+            "Fallback".to_owned(),
+            "https://fallback.example.com".to_owned(),
+            "fallback-key".to_owned(),
+            "gpt-fallback".to_owned(),
+        );
+        fallback.priority = 20;
+        let primary_id = primary.id.clone();
+        let fallback_id = fallback.id.clone();
+
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings.add_cli_agent_api_profile(primary, true, ctx);
+            settings.add_cli_agent_api_profile(fallback, false, ctx);
+        });
+
+        AISettings::handle(&app).read(&app, |settings, _ctx| {
+            let env = settings.cli_agent_api_environment_vars(
+                CLIAgent::Codex,
+                CLI_AGENT_API_LOCAL_ENVIRONMENT_ID,
+            );
+            assert_eq!(
+                env.get("AGENTWARP_AGENT_API_FAILOVER_ENABLED")
+                    .map(String::as_str),
+                Some("1")
+            );
+            assert_eq!(
+                env.get("AGENTWARP_AGENT_API_PROFILE_COUNT")
+                    .map(String::as_str),
+                Some("2")
+            );
+
+            let fallback_profiles = serde_json::from_str::<Vec<CLIAgentApiProfile>>(
+                env.get("AGENTWARP_AGENT_API_FALLBACKS").unwrap(),
+            )
+            .unwrap();
+            assert_eq!(fallback_profiles[0].id, primary_id);
+            assert_eq!(fallback_profiles[1].id, fallback_id);
+            assert_eq!(fallback_profiles[1].api_key, "fallback-key");
+        });
+    });
 }
 
 #[test]

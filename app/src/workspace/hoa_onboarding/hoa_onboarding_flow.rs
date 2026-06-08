@@ -28,6 +28,7 @@ use crate::appearance::Appearance;
 use crate::settings::AISettings;
 use crate::tab_configs::session_config::{is_git_repo, SessionConfigSelection, SessionType};
 use crate::tab_configs::session_config_rendering;
+use crate::terminal::cli_agent::AgentReasoningEffort;
 use crate::ui_components::icons::Icon;
 use crate::view_components::action_button::{
     ActionButton, ActionButtonTheme, ButtonSize, KeystrokeSource,
@@ -302,6 +303,7 @@ impl HoaOnboardingFlow {
                 directory: self.selected_directory.clone(),
                 enable_worktree: self.enable_worktree,
                 autogenerate_worktree_branch_name: self.autogenerate_worktree_branch_name,
+                reasoning_effort: AgentReasoningEffort::Auto,
             },
         )));
     }

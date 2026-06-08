@@ -17,7 +17,7 @@ use warp_completer::parsers::simple::top_level_command;
 use warp_editor::content::buffer::Buffer;
 use warp_editor::content::markdown::MarkdownStyle;
 use warp_util::path::EscapeChar;
-use warpui::{AppContext, SingletonEntity};
+use warpui::{AppContext, Entity, ModelContext, SingletonEntity};
 
 use crate::ai::agent::{AgentReviewCommentBatch, DiffSetHunk};
 use crate::ai::blocklist::CLAUDE_ORANGE;
@@ -147,6 +147,97 @@ pub enum CLIAgent {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AgentReasoningEffort {
+    Auto,
+    Off,
+    NoReasoning,
+    Low,
+    Medium,
+    High,
+    ExtraHigh,
+    Max,
+    Ultracode,
+}
+
+impl AgentReasoningEffort {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::Off => "Off",
+            Self::NoReasoning => "None",
+            Self::Low => "Low",
+            Self::Medium => "Medium",
+            Self::High => "High",
+            Self::ExtraHigh => "Extra High",
+            Self::Max => "Max",
+            Self::Ultracode => "Ultracode",
+        }
+    }
+
+    pub(crate) fn command_value(&self) -> Option<&'static str> {
+        match self {
+            Self::Auto => None,
+            Self::Off => Some("off"),
+            Self::NoReasoning => Some("none"),
+            Self::Low => Some("low"),
+            Self::Medium => Some("medium"),
+            Self::High => Some("high"),
+            Self::ExtraHigh => Some("xhigh"),
+            Self::Max => Some("max"),
+            Self::Ultracode => Some("ultracode"),
+        }
+    }
+
+    pub(crate) fn from_command_value(value: &str) -> Option<Self> {
+        match value {
+            "off" => Some(Self::Off),
+            "none" => Some(Self::NoReasoning),
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "xhigh" => Some(Self::ExtraHigh),
+            "max" => Some(Self::Max),
+            "ultracode" => Some(Self::Ultracode),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentReasoningEffortModelEvent;
+
+pub struct AgentReasoningEffortModel {
+    effort: AgentReasoningEffort,
+}
+
+impl Entity for AgentReasoningEffortModel {
+    type Event = AgentReasoningEffortModelEvent;
+}
+
+impl SingletonEntity for AgentReasoningEffortModel {}
+
+impl AgentReasoningEffortModel {
+    pub fn new(_ctx: &mut ModelContext<Self>) -> Self {
+        Self {
+            effort: AgentReasoningEffort::Auto,
+        }
+    }
+
+    pub fn effort(&self) -> AgentReasoningEffort {
+        self.effort
+    }
+
+    pub fn set_effort(&mut self, effort: AgentReasoningEffort, ctx: &mut ModelContext<Self>) {
+        if self.effort == effort {
+            return;
+        }
+
+        self.effort = effort;
+        ctx.emit(AgentReasoningEffortModelEvent);
+    }
+}
+
 impl CLIAgent {
     /// The command prefix used to invoke this CLI agent.
     pub fn command_prefix(&self) -> &'static str {
@@ -165,6 +256,113 @@ impl CLIAgent {
             CLIAgent::Hermes => "hermes",
             CLIAgent::Vibe => "vibe",
             CLIAgent::Unknown => "",
+        }
+    }
+
+    pub fn command_with_reasoning_effort(&self, effort: AgentReasoningEffort) -> String {
+        let prefix = self.command_prefix();
+        if !self.supports_reasoning_effort(effort) {
+            return prefix.to_owned();
+        }
+
+        if matches!(
+            (self, effort),
+            (CLIAgent::Claude, AgentReasoningEffort::Ultracode)
+        ) {
+            return format!("{prefix} --settings '{{\"ultracode\":true}}'");
+        }
+
+        let Some(effort) = effort.command_value() else {
+            return prefix.to_owned();
+        };
+
+        match self {
+            CLIAgent::Claude => format!("{prefix} --effort {effort}"),
+            CLIAgent::Codex => format!("{prefix} -c model_reasoning_effort={effort}"),
+            CLIAgent::Droid => format!("{prefix} --reasoning-effort {effort}"),
+            _ => prefix.to_owned(),
+        }
+    }
+
+    pub fn reasoning_effort_options(&self) -> &'static [AgentReasoningEffort] {
+        const CODEX_OPTIONS: &[AgentReasoningEffort] = &[
+            AgentReasoningEffort::Low,
+            AgentReasoningEffort::Medium,
+            AgentReasoningEffort::High,
+            AgentReasoningEffort::ExtraHigh,
+        ];
+        const CLAUDE_OPTIONS: &[AgentReasoningEffort] = &[
+            AgentReasoningEffort::Low,
+            AgentReasoningEffort::Medium,
+            AgentReasoningEffort::High,
+            AgentReasoningEffort::ExtraHigh,
+            AgentReasoningEffort::Max,
+            AgentReasoningEffort::Ultracode,
+        ];
+        const DROID_OPTIONS: &[AgentReasoningEffort] = &[
+            AgentReasoningEffort::Off,
+            AgentReasoningEffort::NoReasoning,
+            AgentReasoningEffort::Low,
+            AgentReasoningEffort::Medium,
+            AgentReasoningEffort::High,
+        ];
+
+        match self {
+            CLIAgent::Claude => CLAUDE_OPTIONS,
+            CLIAgent::Codex => CODEX_OPTIONS,
+            CLIAgent::Droid => DROID_OPTIONS,
+            _ => &[],
+        }
+    }
+
+    pub fn supports_reasoning_effort(&self, effort: AgentReasoningEffort) -> bool {
+        effort == AgentReasoningEffort::Auto || self.reasoning_effort_options().contains(&effort)
+    }
+
+    pub fn default_reasoning_effort(&self) -> Option<AgentReasoningEffort> {
+        let options = self.reasoning_effort_options();
+        if options.contains(&AgentReasoningEffort::High) {
+            Some(AgentReasoningEffort::High)
+        } else {
+            options.first().copied()
+        }
+    }
+
+    pub fn in_session_reasoning_effort_command(
+        &self,
+        effort: AgentReasoningEffort,
+        current_effort: Option<AgentReasoningEffort>,
+    ) -> Option<String> {
+        match self {
+            CLIAgent::Claude => Some(format!("/effort {}\n", effort.command_value()?)),
+            CLIAgent::Codex => self.codex_reasoning_effort_shortcut_input(effort, current_effort?),
+            _ => None,
+        }
+    }
+
+    fn codex_reasoning_effort_shortcut_input(
+        &self,
+        effort: AgentReasoningEffort,
+        current_effort: AgentReasoningEffort,
+    ) -> Option<String> {
+        const CODEX_REASONING_ORDER: &[AgentReasoningEffort] = &[
+            AgentReasoningEffort::Low,
+            AgentReasoningEffort::Medium,
+            AgentReasoningEffort::High,
+            AgentReasoningEffort::ExtraHigh,
+        ];
+
+        let current_index = CODEX_REASONING_ORDER
+            .iter()
+            .position(|candidate| *candidate == current_effort)?;
+        let target_index = CODEX_REASONING_ORDER
+            .iter()
+            .position(|candidate| *candidate == effort)?;
+
+        match target_index.cmp(&current_index) {
+            std::cmp::Ordering::Less => Some("\x1b,".repeat(current_index - target_index)),
+            std::cmp::Ordering::Greater => Some("\x1b.".repeat(target_index - current_index)),
+            std::cmp::Ordering::Equal => None,
         }
     }
 

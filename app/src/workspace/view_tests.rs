@@ -82,6 +82,7 @@ use crate::util::traffic_lights::windows::RendererState;
 use crate::warp_managed_paths_watcher::WarpManagedPathsWatcher;
 use crate::workflows::local_workflows::LocalWorkflows;
 use crate::workspace::view::agent_sessions::AgentSessionsModel;
+use crate::workspace::view::ssh_remote::SshRemoteModel;
 use crate::workspaces::team_tester::TeamTesterStatus;
 use crate::workspaces::update_manager::TeamUpdateManager;
 use crate::workspaces::user_profiles::UserProfiles;
@@ -146,6 +147,7 @@ fn initialize_app(app: &mut App) {
     app.add_singleton_model(|ctx| OrchestrationPillBarModel::new(Default::default(), ctx));
     app.add_singleton_model(|_| CLIAgentSessionsModel::new());
     app.add_singleton_model(AgentSessionsModel::new);
+    app.add_singleton_model(SshRemoteModel::new);
     app.add_singleton_model(|ctx| ProjectManagementModel::new(vec![], None, ctx));
     app.add_singleton_model(|_| ActiveAgentViewsModel::new());
     app.add_singleton_model(AgentNotificationsModel::new);

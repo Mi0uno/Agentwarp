@@ -1,6 +1,6 @@
 use warpui::elements::{
-    Container, CornerRadius, CrossAxisAlignment, Flex, Icon, MainAxisAlignment, MainAxisSize,
-    MouseStateHandle, ParentElement, Radius, Shrinkable, Text,
+    Container, CornerRadius, CrossAxisAlignment, Empty, Flex, Icon, MainAxisAlignment,
+    MainAxisSize, MouseStateHandle, ParentElement, Radius, Shrinkable, Text,
 };
 use warpui::ui_components::button::ButtonVariant;
 use warpui::ui_components::components::{Coords, UiComponent, UiComponentStyles};
@@ -49,6 +49,10 @@ impl AnonymousUserAISignUpBannerState {
     }
 
     pub fn render(&self, appearance: &Appearance) -> Box<dyn Element> {
+        if cfg!(feature = "skip_login") {
+            return Empty::new().finish();
+        }
+
         render_three_column_inline_banner(
             appearance,
             TITLE,

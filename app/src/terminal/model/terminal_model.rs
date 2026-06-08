@@ -448,12 +448,149 @@ impl TmuxControlModeContext {
     }
 }
 
+const CODEX_WEBSOCKET_FALLBACK_WARNING: &[u8] = b"Falling back from WebSockets to HTTPS transport";
+const CODEX_WEBSOCKET_FALLBACK_WARNING_MAX_BYTES: usize = 16 * 1024;
+const CODEX_CLIPBOARD_UNAVAILABLE_WARNING: &[u8] = b"Failed to paste image: clipboard unavailable";
+const CODEX_CLIPBOARD_UNAVAILABLE_WARNING_MAX_BYTES: usize = 2 * 1024;
+
+#[derive(Default)]
+struct PtyNoiseFilter {
+    pending: Vec<u8>,
+    suppressing_codex_websocket_warning: bool,
+    suppressing_codex_clipboard_warning: bool,
+}
+
+impl PtyNoiseFilter {
+    fn filter(&mut self, bytes: &[u8]) -> Vec<u8> {
+        if bytes.is_empty() {
+            return Vec::new();
+        }
+
+        let mut buffer = Vec::with_capacity(self.pending.len() + bytes.len());
+        buffer.append(&mut self.pending);
+        buffer.extend_from_slice(bytes);
+
+        let mut output = Vec::with_capacity(buffer.len());
+        loop {
+            if self.suppressing_codex_websocket_warning {
+                if let Some(end) = codex_websocket_warning_end(&buffer) {
+                    buffer.drain(..end);
+                    self.suppressing_codex_websocket_warning = false;
+                    continue;
+                }
+
+                if buffer.len() > CODEX_WEBSOCKET_FALLBACK_WARNING_MAX_BYTES {
+                    buffer.clear();
+                    self.suppressing_codex_websocket_warning = false;
+                }
+
+                self.pending = buffer;
+                return output;
+            }
+
+            if self.suppressing_codex_clipboard_warning {
+                if let Some(end) = codex_clipboard_warning_end(&buffer) {
+                    buffer.drain(..end);
+                    self.suppressing_codex_clipboard_warning = false;
+                    continue;
+                }
+
+                if buffer.len() > CODEX_CLIPBOARD_UNAVAILABLE_WARNING_MAX_BYTES {
+                    buffer.clear();
+                    self.suppressing_codex_clipboard_warning = false;
+                }
+
+                self.pending = buffer;
+                return output;
+            }
+
+            if let Some((marker_start, is_clipboard_warning)) = earliest_noise_marker(&buffer) {
+                let line_start = buffer[..marker_start]
+                    .iter()
+                    .rposition(|byte| *byte == b'\n')
+                    .map(|index| index + 1)
+                    .unwrap_or(0);
+                output.extend_from_slice(&buffer[..line_start]);
+                buffer.drain(..line_start);
+                if is_clipboard_warning {
+                    self.suppressing_codex_clipboard_warning = true;
+                } else {
+                    self.suppressing_codex_websocket_warning = true;
+                }
+                continue;
+            }
+
+            let suffix_len =
+                longest_suffix_matching_prefix(&buffer, CODEX_WEBSOCKET_FALLBACK_WARNING).max(
+                    longest_suffix_matching_prefix(&buffer, CODEX_CLIPBOARD_UNAVAILABLE_WARNING),
+                );
+            let emit_len = buffer.len().saturating_sub(suffix_len);
+            output.extend_from_slice(&buffer[..emit_len]);
+            self.pending = buffer[emit_len..].to_vec();
+            return output;
+        }
+    }
+}
+
+fn earliest_noise_marker(buffer: &[u8]) -> Option<(usize, bool)> {
+    let websocket =
+        find_subsequence(buffer, CODEX_WEBSOCKET_FALLBACK_WARNING).map(|index| (index, false));
+    let clipboard =
+        find_subsequence(buffer, CODEX_CLIPBOARD_UNAVAILABLE_WARNING).map(|index| (index, true));
+    match (websocket, clipboard) {
+        (Some(left), Some(right)) => Some(if left.0 <= right.0 { left } else { right }),
+        (Some(marker), None) | (None, Some(marker)) => Some(marker),
+        (None, None) => None,
+    }
+}
+
+fn codex_websocket_warning_end(buffer: &[u8]) -> Option<usize> {
+    find_subsequence(buffer, b"cf-ray:").and_then(|start| {
+        buffer[start..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|offset| start + offset + 1)
+    })
+}
+
+fn codex_clipboard_warning_end(buffer: &[u8]) -> Option<usize> {
+    find_subsequence(
+        buffer,
+        b"X11 server connection timed out because it was unreachable",
+    )
+    .and_then(|start| {
+        buffer[start..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|offset| start + offset + 1)
+    })
+}
+
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn longest_suffix_matching_prefix(haystack: &[u8], needle: &[u8]) -> usize {
+    let max = haystack.len().min(needle.len().saturating_sub(1));
+    (1..=max)
+        .rev()
+        .find(|length| haystack[haystack.len() - length..] == needle[..*length])
+        .unwrap_or(0)
+}
+
 pub struct TerminalModel {
     /// For fullscreen programs like vim.
     alt_screen: AltScreen,
 
     /// True if the local user has made edits in the input editor since the last submit (shell or AI).
     is_input_dirty: bool,
+
+    pty_noise_filter: PtyNoiseFilter,
 
     /// List of blocks. All blocks are immutable except for the current block.
     /// Always non-empty (includes an invisible block).
@@ -1018,6 +1155,10 @@ pub enum TerminalInputState {
 }
 
 impl TerminalModel {
+    pub fn filter_unrelated_pty_warning_bytes(&mut self, bytes: &[u8]) -> Vec<u8> {
+        self.pty_noise_filter.filter(bytes)
+    }
+
     pub fn is_input_dirty(&self) -> bool {
         self.is_input_dirty
     }
@@ -1126,6 +1267,7 @@ impl TerminalModel {
         Self {
             alt_screen,
             is_input_dirty: false,
+            pty_noise_filter: PtyNoiseFilter::default(),
             block_list,
             blocklist_has_been_cleared: false,
             alt_screen_active: false,

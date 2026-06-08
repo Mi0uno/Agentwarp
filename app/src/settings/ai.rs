@@ -3,7 +3,7 @@
 //! These settings are currently used to configure the underlying model/API used to power the AI
 //! UX, as well as small UX configurations.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
@@ -12,6 +12,7 @@ pub use cloud_object_models::{
     DEFAULT_COMMAND_EXECUTION_DENYLIST,
 };
 use indexmap::IndexMap;
+use itertools::Itertools;
 use regex::Regex;
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
@@ -20,6 +21,7 @@ use settings::{
 };
 use strum::IntoEnumIterator;
 use strum_macros::EnumIter;
+use uuid::Uuid;
 use warp_core::execution_mode::AppExecutionMode;
 use warp_core::features::FeatureFlag;
 use warpui::platform::keyboard::KeyCode;
@@ -32,6 +34,15 @@ use crate::report_if_error;
 use crate::settings::PrivacySettings;
 use crate::terminal::CLIAgent;
 use crate::workspaces::user_workspaces::UserWorkspaces;
+
+pub const CLI_AGENT_API_ALL_ENVIRONMENTS_ID: &str = "*";
+pub const CLI_AGENT_API_LOCAL_ENVIRONMENT_ID: &str = "local";
+
+pub fn cli_agent_api_usage_log_path() -> PathBuf {
+    warp_core::paths::data_dir()
+        .join("agent-api")
+        .join("usage.ndjson")
+}
 
 pub enum FocusedTerminalInfoEvent {
     TerminalInfoUpdated,
@@ -456,6 +467,1046 @@ impl PromptSubmissionMode {
     }
 }
 
+/// How a custom system prompt should be applied to a CLI agent.
+#[derive(
+    Default,
+    Debug,
+    serde::Serialize,
+    serde::Deserialize,
+    PartialEq,
+    Copy,
+    Clone,
+    EnumIter,
+    schemars::JsonSchema,
+    settings_value::SettingsValue,
+)]
+#[schemars(
+    description = "How a custom system prompt should be applied to a CLI agent prompt.",
+    rename_all = "snake_case"
+)]
+pub enum CLIAgentBuiltinPromptMode {
+    /// Add the custom prompt to the agent's default instructions.
+    #[default]
+    Append,
+    /// Prefer the custom prompt over the agent's default instructions.
+    Replace,
+}
+
+impl CLIAgentBuiltinPromptMode {
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            Self::Append => "Append",
+            Self::Replace => "Replace",
+        }
+    }
+
+    pub fn description(&self) -> &'static str {
+        match self {
+            Self::Append => "Add these instructions to the agent's default prompt.",
+            Self::Replace => "Use these instructions as the primary prompt for new agent sessions.",
+        }
+    }
+}
+
+/// User-configured system prompt override for a supported third-party CLI agent.
+#[derive(
+    Debug,
+    Serialize,
+    Deserialize,
+    Clone,
+    PartialEq,
+    Default,
+    schemars::JsonSchema,
+    settings_value::SettingsValue,
+)]
+#[schemars(description = "System prompt override for a CLI agent.")]
+pub struct CLIAgentBuiltinPrompt {
+    #[serde(default)]
+    #[schemars(description = "Whether the prompt replaces or appends to the default prompt.")]
+    pub mode: CLIAgentBuiltinPromptMode,
+    #[serde(default)]
+    #[schemars(description = "Prompt text to apply to CLI agent sessions.")]
+    pub prompt: String,
+}
+
+impl CLIAgentBuiltinPrompt {
+    pub fn is_empty(&self) -> bool {
+        self.prompt.trim().is_empty()
+    }
+
+    pub fn apply_to_prompt(&self, user_prompt: String) -> String {
+        let prompt = self.prompt.trim();
+        if prompt.is_empty() {
+            return user_prompt;
+        }
+
+        match self.mode {
+            CLIAgentBuiltinPromptMode::Append => {
+                format!("{user_prompt}\n\nAdditional built-in instructions:\n{prompt}")
+            }
+            CLIAgentBuiltinPromptMode::Replace => {
+                format!("Built-in system prompt:\n{prompt}\n\nUser request:\n{user_prompt}")
+            }
+        }
+    }
+
+    pub fn native_launch_suffix(&self, agent: CLIAgent) -> Option<String> {
+        let prompt = self.prompt.trim();
+        if prompt.is_empty() {
+            return None;
+        }
+
+        match agent {
+            CLIAgent::Claude => {
+                let flag = match self.mode {
+                    CLIAgentBuiltinPromptMode::Append => "--append-system-prompt",
+                    CLIAgentBuiltinPromptMode::Replace => "--system-prompt",
+                };
+                Some(format!("{flag} {}", shell_words::quote(prompt)))
+            }
+            CLIAgent::Codex => {
+                let instructions = match self.mode {
+                    CLIAgentBuiltinPromptMode::Append => prompt.to_owned(),
+                    CLIAgentBuiltinPromptMode::Replace => format!(
+                        "Use the following prompt as the primary built-in instructions for this coding-agent session. When default instructions conflict with it, prefer this prompt.\n\n{prompt}"
+                    ),
+                };
+                let config_value = format!(
+                    "developer_instructions={}",
+                    toml::Value::String(instructions)
+                );
+                Some(format!("-c {}", shell_words::quote(&config_value)))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// API configuration for a supported third-party CLI agent.
+#[derive(
+    Debug,
+    Serialize,
+    Deserialize,
+    Clone,
+    PartialEq,
+    schemars::JsonSchema,
+    settings_value::SettingsValue,
+)]
+#[schemars(description = "API profile for a third-party CLI agent.")]
+pub struct CLIAgentApiProfile {
+    #[serde(default)]
+    #[schemars(description = "Stable profile identifier.")]
+    pub id: String,
+    #[serde(default)]
+    #[schemars(description = "User-facing profile name.")]
+    pub name: String,
+    #[serde(default)]
+    #[schemars(description = "Serialized CLIAgent name.")]
+    pub agent: String,
+    #[serde(default = "default_cli_agent_api_environment_id")]
+    #[schemars(description = "Environment id, such as local, ssh:<host_id>, or *.")]
+    pub environment_id: String,
+    #[serde(default)]
+    #[schemars(description = "Provider base URL.")]
+    pub base_url: String,
+    #[serde(default)]
+    #[schemars(description = "Provider API format, such as anthropic_messages or openai_chat.")]
+    pub api_format: String,
+    #[serde(default)]
+    #[schemars(description = "Whether base_url is an exact request URL instead of a base URL.")]
+    pub full_url_mode: bool,
+    #[serde(default)]
+    #[schemars(description = "Environment variable name used by the agent for API key injection.")]
+    pub auth_env_var: String,
+    #[serde(default)]
+    #[schemars(description = "Provider API key.")]
+    pub api_key: String,
+    #[serde(default)]
+    #[schemars(description = "Preferred model for this profile.")]
+    pub model: String,
+    #[serde(default)]
+    #[schemars(description = "Known models returned or added for this provider.")]
+    pub model_catalog: Vec<String>,
+    #[serde(default)]
+    #[schemars(description = "Role/display to upstream model mappings.")]
+    pub model_mappings: Vec<CLIAgentApiModelMapping>,
+    #[serde(default)]
+    #[schemars(description = "Estimated input-token price in USD per one million tokens.")]
+    pub input_cost_per_million_tokens: f64,
+    #[serde(default)]
+    #[schemars(description = "Estimated output-token price in USD per one million tokens.")]
+    pub output_cost_per_million_tokens: f64,
+    #[serde(default)]
+    #[schemars(description = "Additional provider-specific environment variables.")]
+    pub extra_env: HashMap<String, String>,
+    #[serde(default)]
+    #[schemars(description = "Last health check result for this profile.")]
+    pub health: CLIAgentApiProfileHealth,
+    #[serde(default = "default_cli_agent_api_profile_enabled")]
+    #[schemars(description = "Whether this profile can be selected or used for failover.")]
+    pub enabled: bool,
+    #[serde(default)]
+    #[schemars(description = "Lower numbers are preferred when building a failover chain.")]
+    pub priority: u32,
+}
+
+#[derive(
+    Debug,
+    Serialize,
+    Deserialize,
+    Clone,
+    PartialEq,
+    Default,
+    schemars::JsonSchema,
+    settings_value::SettingsValue,
+)]
+#[schemars(description = "Model mapping for a third-party CLI agent API profile.")]
+pub struct CLIAgentApiModelMapping {
+    #[serde(default)]
+    #[schemars(
+        description = "Agent model role or source model family, such as Sonnet, Opus, or Haiku."
+    )]
+    pub role: String,
+    #[serde(default)]
+    #[schemars(description = "Display name shown in model menus.")]
+    pub display_name: String,
+    #[serde(default)]
+    #[schemars(description = "Actual upstream model sent to the provider.")]
+    pub model: String,
+    #[serde(default)]
+    #[schemars(description = "Whether this mapping supports a 1M-token context declaration.")]
+    pub supports_one_million_context: bool,
+    #[serde(default)]
+    #[schemars(description = "Optional context window size in tokens.")]
+    pub context_window_tokens: u32,
+}
+
+fn default_cli_agent_api_environment_id() -> String {
+    CLI_AGENT_API_LOCAL_ENVIRONMENT_ID.to_owned()
+}
+
+fn default_cli_agent_api_profile_enabled() -> bool {
+    true
+}
+
+fn normalize_cli_agent_api_cost_per_million_tokens(value: f64) -> f64 {
+    if value.is_finite() && value > 0.0 {
+        value
+    } else {
+        0.0
+    }
+}
+
+/// Last health check result for an Agent API profile.
+#[derive(
+    Debug,
+    Serialize,
+    Deserialize,
+    Clone,
+    PartialEq,
+    Default,
+    schemars::JsonSchema,
+    settings_value::SettingsValue,
+)]
+#[schemars(description = "Agent API profile health check result.")]
+pub struct CLIAgentApiProfileHealth {
+    #[serde(default)]
+    #[schemars(description = "Status: unchecked, checking, healthy, or failed.")]
+    pub status: String,
+    #[serde(default)]
+    #[schemars(description = "Unix timestamp in milliseconds for the last check.")]
+    pub checked_at_epoch_ms: i64,
+    #[serde(default)]
+    #[schemars(description = "Observed latency in milliseconds.")]
+    pub latency_ms: u64,
+    #[serde(default)]
+    #[schemars(description = "HTTP status code returned by the provider.")]
+    pub http_status: u16,
+    #[serde(default)]
+    #[schemars(description = "Short health check message.")]
+    pub message: String,
+}
+
+impl CLIAgentApiProfileHealth {
+    pub fn checking(checked_at_epoch_ms: i64) -> Self {
+        Self {
+            status: "checking".to_owned(),
+            checked_at_epoch_ms,
+            message: "Checking".to_owned(),
+            ..Default::default()
+        }
+    }
+
+    pub fn healthy(checked_at_epoch_ms: i64, latency_ms: u64, http_status: u16) -> Self {
+        Self {
+            status: "healthy".to_owned(),
+            checked_at_epoch_ms,
+            latency_ms,
+            http_status,
+            message: format!("HTTP {http_status}"),
+        }
+    }
+
+    pub fn failed(
+        checked_at_epoch_ms: i64,
+        latency_ms: u64,
+        http_status: u16,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            status: "failed".to_owned(),
+            checked_at_epoch_ms,
+            latency_ms,
+            http_status,
+            message: message.into(),
+        }
+    }
+
+    pub fn is_checking(&self) -> bool {
+        self.status == "checking"
+    }
+
+    pub fn is_healthy(&self) -> bool {
+        self.status == "healthy"
+    }
+
+    pub fn display_label(&self) -> String {
+        match self.status.as_str() {
+            "checking" => "health checking".to_owned(),
+            "healthy" => {
+                if self.latency_ms > 0 {
+                    format!("healthy {}ms HTTP {}", self.latency_ms, self.http_status)
+                } else {
+                    format!("healthy HTTP {}", self.http_status)
+                }
+            }
+            "failed" => {
+                if self.http_status > 0 {
+                    format!("failed HTTP {} {}", self.http_status, self.message)
+                } else {
+                    format!("failed {}", self.message)
+                }
+            }
+            _ => "health unchecked".to_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CLIAgentApiUsageSummary {
+    pub log_path: PathBuf,
+    pub event_count: u64,
+    pub successful_events: u64,
+    pub failed_events: u64,
+    pub retry_events: u64,
+    pub total_latency_ms: u64,
+    pub total_request_bytes: u64,
+    pub total_response_bytes: u64,
+    pub total_prompt_tokens: u64,
+    pub total_completion_tokens: u64,
+    pub total_tokens: u64,
+    pub total_estimated_cost_usd: f64,
+    pub last_profile_name: String,
+    pub last_status: u16,
+    pub last_error: String,
+}
+
+impl CLIAgentApiUsageSummary {
+    pub fn absorb(&mut self, other: CLIAgentApiUsageSummary) {
+        self.event_count = self.event_count.saturating_add(other.event_count);
+        self.successful_events = self
+            .successful_events
+            .saturating_add(other.successful_events);
+        self.failed_events = self.failed_events.saturating_add(other.failed_events);
+        self.retry_events = self.retry_events.saturating_add(other.retry_events);
+        self.total_latency_ms = self.total_latency_ms.saturating_add(other.total_latency_ms);
+        self.total_request_bytes = self
+            .total_request_bytes
+            .saturating_add(other.total_request_bytes);
+        self.total_response_bytes = self
+            .total_response_bytes
+            .saturating_add(other.total_response_bytes);
+        self.total_prompt_tokens = self
+            .total_prompt_tokens
+            .saturating_add(other.total_prompt_tokens);
+        self.total_completion_tokens = self
+            .total_completion_tokens
+            .saturating_add(other.total_completion_tokens);
+        self.total_tokens = self.total_tokens.saturating_add(other.total_tokens);
+        self.total_estimated_cost_usd += other.total_estimated_cost_usd;
+        if other.event_count > 0 {
+            self.last_profile_name = other.last_profile_name;
+            self.last_status = other.last_status;
+            self.last_error = other.last_error;
+        }
+    }
+
+    pub fn average_latency_ms(&self) -> u64 {
+        if self.event_count == 0 {
+            0
+        } else {
+            self.total_latency_ms / self.event_count
+        }
+    }
+
+    pub fn display_label(&self) -> String {
+        if self.event_count == 0 {
+            return format!("No local usage events yet / {}", self.log_path.display());
+        }
+
+        let last_status = if self.last_status == 0 {
+            "network error".to_owned()
+        } else {
+            format!("HTTP {}", self.last_status)
+        };
+        let last_profile = if self.last_profile_name.trim().is_empty() {
+            "unknown profile"
+        } else {
+            self.last_profile_name.as_str()
+        };
+        let mut label = format!(
+            "{} events / {} success / {} failed / {} failover / avg {}ms / in {}B / out {}B / last {last_status} via {last_profile}",
+            self.event_count,
+            self.successful_events,
+            self.failed_events,
+            self.retry_events,
+            self.average_latency_ms(),
+            self.total_request_bytes,
+            self.total_response_bytes,
+        );
+        if self.total_tokens > 0 {
+            label.push_str(&format!(
+                " / {} tokens ({} in / {} out)",
+                self.total_tokens, self.total_prompt_tokens, self.total_completion_tokens
+            ));
+        }
+        if self.total_estimated_cost_usd > 0.0 {
+            label.push_str(&format!(" / est ${:.4}", self.total_estimated_cost_usd));
+        }
+        label
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct CLIAgentApiUsageLogEvent {
+    #[serde(default)]
+    profile_name: String,
+    #[serde(default)]
+    status: u16,
+    #[serde(default)]
+    success: bool,
+    #[serde(default)]
+    retryable: bool,
+    #[serde(default)]
+    final_attempt: bool,
+    #[serde(default)]
+    latency_ms: u64,
+    #[serde(default)]
+    request_bytes: usize,
+    #[serde(default)]
+    response_bytes: usize,
+    #[serde(default)]
+    prompt_tokens: u64,
+    #[serde(default)]
+    completion_tokens: u64,
+    #[serde(default)]
+    total_tokens: u64,
+    #[serde(default)]
+    estimated_cost_usd: f64,
+    #[serde(default)]
+    error: String,
+}
+
+pub fn cli_agent_api_usage_summary_from_log() -> CLIAgentApiUsageSummary {
+    let log_path = cli_agent_api_usage_log_path();
+    let Ok(contents) = std::fs::read_to_string(&log_path) else {
+        return CLIAgentApiUsageSummary {
+            log_path,
+            ..Default::default()
+        };
+    };
+    cli_agent_api_usage_summary_from_contents(log_path, &contents)
+}
+
+pub fn cli_agent_api_usage_summary_from_contents(
+    log_path: PathBuf,
+    contents: &str,
+) -> CLIAgentApiUsageSummary {
+    let mut summary = CLIAgentApiUsageSummary {
+        log_path: log_path.clone(),
+        ..Default::default()
+    };
+
+    for line in contents.lines().filter(|line| !line.trim().is_empty()) {
+        let Ok(event) = serde_json::from_str::<CLIAgentApiUsageLogEvent>(line) else {
+            continue;
+        };
+        summary.event_count += 1;
+        if event.success {
+            summary.successful_events += 1;
+        } else if event.final_attempt {
+            summary.failed_events += 1;
+        }
+        if event.retryable && !event.final_attempt {
+            summary.retry_events += 1;
+        }
+        summary.total_latency_ms = summary.total_latency_ms.saturating_add(event.latency_ms);
+        summary.total_request_bytes = summary
+            .total_request_bytes
+            .saturating_add(event.request_bytes as u64);
+        summary.total_response_bytes = summary
+            .total_response_bytes
+            .saturating_add(event.response_bytes as u64);
+        summary.total_prompt_tokens = summary
+            .total_prompt_tokens
+            .saturating_add(event.prompt_tokens);
+        summary.total_completion_tokens = summary
+            .total_completion_tokens
+            .saturating_add(event.completion_tokens);
+        let total_tokens = if event.total_tokens == 0 {
+            event.prompt_tokens.saturating_add(event.completion_tokens)
+        } else {
+            event.total_tokens
+        };
+        summary.total_tokens = summary.total_tokens.saturating_add(total_tokens);
+        if event.estimated_cost_usd.is_finite() && event.estimated_cost_usd > 0.0 {
+            summary.total_estimated_cost_usd += event.estimated_cost_usd;
+        }
+        summary.last_profile_name = event.profile_name;
+        summary.last_status = event.status;
+        summary.last_error = event.error;
+    }
+
+    summary
+}
+
+impl Default for CLIAgentApiProfile {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            agent: String::new(),
+            environment_id: default_cli_agent_api_environment_id(),
+            base_url: String::new(),
+            api_format: String::new(),
+            full_url_mode: false,
+            auth_env_var: String::new(),
+            api_key: String::new(),
+            model: String::new(),
+            model_catalog: Vec::new(),
+            model_mappings: Vec::new(),
+            input_cost_per_million_tokens: 0.0,
+            output_cost_per_million_tokens: 0.0,
+            extra_env: HashMap::default(),
+            health: CLIAgentApiProfileHealth::default(),
+            enabled: true,
+            priority: 0,
+        }
+    }
+}
+
+impl CLIAgentApiProfile {
+    pub fn new(
+        agent: CLIAgent,
+        environment_id: String,
+        name: String,
+        base_url: String,
+        api_key: String,
+        model: String,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            name,
+            agent: agent.to_serialized_name(),
+            environment_id,
+            base_url,
+            api_format: default_cli_agent_api_format(agent).to_owned(),
+            full_url_mode: false,
+            auth_env_var: default_cli_agent_api_auth_env_var(agent).to_owned(),
+            api_key,
+            model,
+            model_catalog: Vec::new(),
+            model_mappings: Vec::new(),
+            input_cost_per_million_tokens: 0.0,
+            output_cost_per_million_tokens: 0.0,
+            extra_env: HashMap::default(),
+            health: CLIAgentApiProfileHealth::default(),
+            enabled: true,
+            priority: 0,
+        }
+        .normalized()
+    }
+
+    pub fn agent(&self) -> CLIAgent {
+        CLIAgent::from_serialized_name(&self.agent)
+    }
+
+    pub fn preferred_model(&self) -> String {
+        if !self.model.trim().is_empty() {
+            return self.model.trim().to_owned();
+        }
+        self.model_mappings
+            .iter()
+            .find(|mapping| mapping.role.eq_ignore_ascii_case("sonnet"))
+            .or_else(|| {
+                self.model_mappings
+                    .iter()
+                    .find(|mapping| mapping.role.eq_ignore_ascii_case("default"))
+            })
+            .or_else(|| {
+                self.model_mappings
+                    .iter()
+                    .find(|mapping| !mapping.model.trim().is_empty())
+            })
+            .map(|mapping| mapping.model.trim().to_owned())
+            .unwrap_or_default()
+    }
+
+    pub fn is_scoped_to_all_environments(&self) -> bool {
+        self.environment_id == CLI_AGENT_API_ALL_ENVIRONMENTS_ID
+    }
+
+    pub fn matches_agent_environment(&self, agent: CLIAgent, environment_id: &str) -> bool {
+        self.enabled
+            && self.agent() == agent
+            && (self.environment_id == normalize_cli_agent_api_environment_id(environment_id)
+                || self.is_scoped_to_all_environments())
+    }
+
+    fn normalized(mut self) -> Self {
+        if self.id.trim().is_empty() {
+            self.id = Uuid::new_v4().to_string();
+        } else {
+            self.id = self.id.trim().to_owned();
+        }
+
+        let agent = self.agent();
+        self.agent = if AISettings::supports_cli_agent_api_profile(agent) {
+            agent.to_serialized_name()
+        } else {
+            CLIAgent::Unknown.to_serialized_name()
+        };
+
+        self.environment_id = normalize_cli_agent_api_environment_id(&self.environment_id);
+        self.name = self.name.trim().to_owned();
+        if self.name.is_empty() {
+            self.name = format!("{} API", agent.display_name());
+        }
+        self.base_url = self.base_url.trim().trim_end_matches('/').to_owned();
+        self.api_format = self.api_format.trim().to_owned();
+        if self.api_format.is_empty() {
+            self.api_format = default_cli_agent_api_format(agent).to_owned();
+        }
+        self.auth_env_var = self.auth_env_var.trim().to_owned();
+        if self.auth_env_var.is_empty() {
+            self.auth_env_var = default_cli_agent_api_auth_env_var(agent).to_owned();
+        }
+        self.api_key = self.api_key.trim().to_owned();
+        self.model = self.model.trim().to_owned();
+        self.model_catalog = self
+            .model_catalog
+            .into_iter()
+            .map(|model| model.trim().to_owned())
+            .filter(|model| !model.is_empty())
+            .unique()
+            .collect();
+        self.model_mappings = self
+            .model_mappings
+            .into_iter()
+            .filter_map(CLIAgentApiModelMapping::normalized)
+            .collect();
+        self.input_cost_per_million_tokens =
+            normalize_cli_agent_api_cost_per_million_tokens(self.input_cost_per_million_tokens);
+        self.output_cost_per_million_tokens =
+            normalize_cli_agent_api_cost_per_million_tokens(self.output_cost_per_million_tokens);
+        self.extra_env.retain(|key, value| {
+            let normalized_key = key.trim();
+            !normalized_key.is_empty() && !value.trim().is_empty()
+        });
+        self
+    }
+}
+
+impl CLIAgentApiModelMapping {
+    fn normalized(mut self) -> Option<Self> {
+        self.role = self.role.trim().to_owned();
+        self.display_name = self.display_name.trim().to_owned();
+        self.model = self.model.trim().to_owned();
+        if self.context_window_tokens == 0 && self.supports_one_million_context {
+            self.context_window_tokens = 1_000_000;
+        }
+        (!self.role.is_empty() || !self.display_name.is_empty() || !self.model.is_empty())
+            .then_some(self)
+    }
+}
+
+fn default_cli_agent_api_format(agent: CLIAgent) -> &'static str {
+    match agent {
+        CLIAgent::Claude => "anthropic_messages",
+        CLIAgent::Gemini => "gemini",
+        CLIAgent::Codex | CLIAgent::OpenCode | CLIAgent::Hermes => "openai_chat",
+        _ => "openai_chat",
+    }
+}
+
+fn default_cli_agent_api_auth_env_var(agent: CLIAgent) -> &'static str {
+    match agent {
+        CLIAgent::Claude => "ANTHROPIC_AUTH_TOKEN",
+        CLIAgent::Gemini => "GEMINI_API_KEY",
+        CLIAgent::Codex | CLIAgent::OpenCode | CLIAgent::Hermes => "OPENAI_API_KEY",
+        _ => "OPENAI_API_KEY",
+    }
+}
+
+/// Local-only store for CLI agent API profiles and active selections.
+#[derive(
+    Debug,
+    Serialize,
+    Deserialize,
+    Clone,
+    PartialEq,
+    Default,
+    schemars::JsonSchema,
+    settings_value::SettingsValue,
+)]
+#[schemars(description = "Local CLI agent API profile store.")]
+pub struct CLIAgentApiProfilesStore {
+    #[serde(default)]
+    #[schemars(description = "Stored API profiles.")]
+    pub profiles: Vec<CLIAgentApiProfile>,
+    #[serde(default)]
+    #[schemars(description = "Active profile ids keyed by agent/environment.")]
+    pub active_profile_ids: HashMap<String, String>,
+}
+
+impl CLIAgentApiProfilesStore {
+    fn normalized(mut self) -> Self {
+        self.profiles = self
+            .profiles
+            .into_iter()
+            .map(CLIAgentApiProfile::normalized)
+            .filter(|profile| AISettings::supports_cli_agent_api_profile(profile.agent()))
+            .collect();
+
+        self.active_profile_ids.retain(|_, profile_id| {
+            self.profiles
+                .iter()
+                .any(|profile| profile.enabled && profile.id == profile_id.trim())
+        });
+        self
+    }
+
+    fn upsert_profile(&mut self, profile: CLIAgentApiProfile, make_active: bool) {
+        let profile = profile.normalized();
+        if !AISettings::supports_cli_agent_api_profile(profile.agent()) {
+            return;
+        }
+
+        if let Some(existing_index) = self
+            .profiles
+            .iter()
+            .position(|existing| existing.id == profile.id)
+        {
+            let existing = &self.profiles[existing_index];
+            let scope_changed = existing.agent != profile.agent
+                || existing.environment_id != profile.environment_id;
+            if scope_changed || !profile.enabled {
+                self.active_profile_ids
+                    .retain(|_, active_profile_id| active_profile_id != &profile.id);
+            }
+            self.profiles[existing_index] = profile.clone();
+        } else {
+            self.profiles.push(profile.clone());
+        }
+
+        if make_active {
+            self.set_active_profile(profile.agent(), &profile.environment_id, &profile.id);
+        }
+    }
+
+    fn remove_profile(&mut self, profile_id: &str) {
+        self.profiles.retain(|profile| profile.id != profile_id);
+        self.active_profile_ids
+            .retain(|_, active_profile_id| active_profile_id != profile_id);
+    }
+
+    fn set_profile_enabled(&mut self, profile_id: &str, enabled: bool) {
+        let profile_id = profile_id.trim();
+        if let Some(profile) = self
+            .profiles
+            .iter_mut()
+            .find(|profile| profile.id == profile_id)
+        {
+            profile.enabled = enabled;
+            if !enabled {
+                self.active_profile_ids
+                    .retain(|_, active_profile_id| active_profile_id != profile_id);
+            }
+        }
+    }
+
+    fn record_profile_health(&mut self, profile_id: &str, health: CLIAgentApiProfileHealth) {
+        let profile_id = profile_id.trim();
+        if let Some(profile) = self
+            .profiles
+            .iter_mut()
+            .find(|profile| profile.id == profile_id)
+        {
+            profile.health = health;
+        }
+    }
+
+    fn set_active_profile(&mut self, agent: CLIAgent, environment_id: &str, profile_id: &str) {
+        let environment_id = normalize_cli_agent_api_environment_id(environment_id);
+        let Some(profile) = self.profiles.iter().find(|profile| {
+            profile.enabled
+                && profile.id == profile_id
+                && profile.matches_agent_environment(agent, &environment_id)
+        }) else {
+            return;
+        };
+        let key = cli_agent_api_active_profile_key(agent, &environment_id);
+        self.active_profile_ids.insert(key, profile.id.clone());
+    }
+
+    fn active_profile(&self, agent: CLIAgent, environment_id: &str) -> Option<&CLIAgentApiProfile> {
+        let environment_id = normalize_cli_agent_api_environment_id(environment_id);
+        let exact_key = cli_agent_api_active_profile_key(agent, &environment_id);
+        let all_key = cli_agent_api_active_profile_key(agent, CLI_AGENT_API_ALL_ENVIRONMENTS_ID);
+
+        self.active_profile_ids
+            .get(&exact_key)
+            .and_then(|profile_id| {
+                self.profiles.iter().find(|profile| {
+                    profile.id == *profile_id
+                        && profile.enabled
+                        && profile.matches_agent_environment(agent, &environment_id)
+                })
+            })
+            .or_else(|| {
+                self.profiles.iter().find(|profile| {
+                    profile.enabled
+                        && profile.agent() == agent
+                        && profile.environment_id == environment_id
+                })
+            })
+            .or_else(|| {
+                self.active_profile_ids
+                    .get(&all_key)
+                    .and_then(|profile_id| {
+                        self.profiles.iter().find(|profile| {
+                            profile.id == *profile_id
+                                && profile.enabled
+                                && profile.agent() == agent
+                                && profile.is_scoped_to_all_environments()
+                        })
+                    })
+            })
+            .or_else(|| {
+                self.profiles.iter().find(|profile| {
+                    profile.enabled
+                        && profile.agent() == agent
+                        && profile.is_scoped_to_all_environments()
+                })
+            })
+    }
+
+    fn fallback_profiles(&self, agent: CLIAgent, environment_id: &str) -> Vec<CLIAgentApiProfile> {
+        let environment_id = normalize_cli_agent_api_environment_id(environment_id);
+        let active_profile_id = self
+            .active_profile(agent, &environment_id)
+            .map(|profile| profile.id.clone());
+
+        let mut profiles = self
+            .profiles
+            .iter()
+            .filter(|profile| profile.matches_agent_environment(agent, &environment_id))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        profiles.sort_by(|left, right| {
+            let left_active = active_profile_id.as_deref() == Some(left.id.as_str());
+            let right_active = active_profile_id.as_deref() == Some(right.id.as_str());
+            right_active
+                .cmp(&left_active)
+                .then_with(|| {
+                    let left_exact = left.environment_id == environment_id;
+                    let right_exact = right.environment_id == environment_id;
+                    right_exact.cmp(&left_exact)
+                })
+                .then_with(|| left.priority.cmp(&right.priority))
+                .then_with(|| left.name.cmp(&right.name))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+
+        profiles
+    }
+
+    fn from_import_json(raw: &str) -> Result<Self, String> {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return Err("Agent API profile JSON is empty".to_owned());
+        }
+
+        serde_json::from_str::<Self>(raw)
+            .map(Self::normalized)
+            .or_else(|store_error| {
+                serde_json::from_str::<Vec<CLIAgentApiProfile>>(raw)
+                    .map(|profiles| Self {
+                        profiles,
+                        active_profile_ids: HashMap::default(),
+                    })
+                    .map(Self::normalized)
+                    .map_err(|profiles_error| {
+                        format!(
+                            "Could not parse Agent API profiles JSON as a store ({store_error}) or profile list ({profiles_error})"
+                        )
+                    })
+            })
+    }
+
+    fn merge_store(&mut self, imported_store: Self) -> usize {
+        let imported_store = imported_store.normalized();
+        let active_profile_ids = imported_store
+            .active_profile_ids
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let profile_count = imported_store.profiles.len();
+
+        for profile in imported_store.profiles {
+            let make_active = active_profile_ids
+                .iter()
+                .any(|active_profile_id| active_profile_id == &profile.id);
+            self.upsert_profile(profile, make_active);
+        }
+
+        profile_count
+    }
+}
+
+pub fn normalize_cli_agent_api_environment_id(environment_id: &str) -> String {
+    let environment_id = environment_id.trim();
+    if environment_id.is_empty() {
+        CLI_AGENT_API_LOCAL_ENVIRONMENT_ID.to_owned()
+    } else {
+        environment_id.to_owned()
+    }
+}
+
+pub fn cli_agent_api_active_profile_key(agent: CLIAgent, environment_id: &str) -> String {
+    format!(
+        "{}@{}",
+        agent.to_serialized_name(),
+        normalize_cli_agent_api_environment_id(environment_id)
+    )
+}
+
+fn cli_agent_api_claude_mapping_env_var_names(role: &str) -> Option<(&'static str, &'static str)> {
+    if role.eq_ignore_ascii_case("sonnet") {
+        Some((
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME",
+        ))
+    } else if role.eq_ignore_ascii_case("opus") {
+        Some((
+            "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME",
+        ))
+    } else if role.eq_ignore_ascii_case("haiku") {
+        Some((
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME",
+        ))
+    } else {
+        None
+    }
+}
+
+fn cli_agent_api_claude_mapping_model_value(mapping: &CLIAgentApiModelMapping) -> String {
+    let mut model = mapping.model.trim().to_owned();
+    if model.is_empty() {
+        return model;
+    }
+
+    let declares_one_million =
+        mapping.supports_one_million_context || mapping.context_window_tokens >= 1_000_000;
+    if declares_one_million && !model.to_ascii_lowercase().contains("[1m]") {
+        model.push_str("[1M]");
+    }
+
+    model
+}
+
+fn cli_agent_api_env_var_mapping(
+    agent: CLIAgent,
+    profile: &CLIAgentApiProfile,
+) -> Vec<(String, String)> {
+    let mut env_vars = Vec::new();
+    let mut push_if_present = |key: &str, value: &str| {
+        if !value.trim().is_empty() {
+            env_vars.push((key.to_owned(), value.trim().to_owned()));
+        }
+    };
+
+    match agent {
+        CLIAgent::Claude => {
+            push_if_present("ANTHROPIC_API_KEY", &profile.api_key);
+            push_if_present("ANTHROPIC_BASE_URL", &profile.base_url);
+            let preferred_model = profile.preferred_model();
+            push_if_present("ANTHROPIC_MODEL", &preferred_model);
+            let mut mapped_model_keys = HashSet::new();
+            for mapping in &profile.model_mappings {
+                let Some((model_key, display_name_key)) =
+                    cli_agent_api_claude_mapping_env_var_names(mapping.role.trim())
+                else {
+                    continue;
+                };
+                let model = cli_agent_api_claude_mapping_model_value(mapping);
+                push_if_present(model_key, &model);
+                if !model.trim().is_empty() {
+                    mapped_model_keys.insert(model_key);
+                }
+                push_if_present(display_name_key, &mapping.display_name);
+            }
+            for (model_key, display_name_key) in [
+                (
+                    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+                    "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME",
+                ),
+                (
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME",
+                ),
+                (
+                    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+                    "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME",
+                ),
+            ] {
+                if mapped_model_keys.contains(model_key) {
+                    continue;
+                }
+                push_if_present(model_key, &preferred_model);
+                push_if_present(display_name_key, &preferred_model);
+            }
+        }
+        CLIAgent::Gemini => {
+            push_if_present("GEMINI_API_KEY", &profile.api_key);
+            push_if_present("GOOGLE_API_KEY", &profile.api_key);
+            push_if_present("GOOGLE_GEMINI_BASE_URL", &profile.base_url);
+            push_if_present("GEMINI_MODEL", &profile.preferred_model());
+        }
+        CLIAgent::Codex | CLIAgent::OpenCode | CLIAgent::Hermes => {
+            push_if_present("OPENAI_API_KEY", &profile.api_key);
+            push_if_present("OPENAI_BASE_URL", &profile.base_url);
+            push_if_present("OPENAI_MODEL", &profile.preferred_model());
+        }
+        _ => {}
+    }
+
+    env_vars
+}
+
 /// Tracks the state of the quota reset banner
 #[derive(
     Debug,
@@ -591,8 +1642,8 @@ impl schemars::JsonSchema for ToolbarCommandMap {
         std::borrow::Cow::Borrowed("ToolbarCommandMap")
     }
 
-    fn json_schema(gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
-        gen.subschema_for::<HashMap<String, String>>()
+    fn json_schema(r#gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        r#gen.subschema_for::<HashMap<String, String>>()
     }
 }
 
@@ -1210,6 +2261,32 @@ define_settings_group!(AISettings, settings: [
         description: "Whether CLI agent Rich Input automatically closes after the user submits a prompt.",
     }
 
+    // User-defined system prompts for supported third-party CLI agents.
+    // Keys are serialized CLIAgent names (e.g. "Claude", "Codex", "OpenCode").
+    cli_agent_builtin_prompts: CLIAgentBuiltinPrompts {
+        type: HashMap<String, CLIAgentBuiltinPrompt>,
+        default: HashMap::default(),
+        supported_platforms: SupportedPlatforms::DESKTOP,
+        sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        private: false,
+        toml_path: "agents.third_party.builtin_prompts",
+        max_table_depth: 2,
+        description: "Custom system prompts applied to supported CLI agent sessions.",
+    }
+
+    // Local-only API profiles for supported third-party CLI agents.
+    // Includes API keys, so it must not sync to cloud.
+    cli_agent_api_profiles: CLIAgentApiProfiles {
+        type: CLIAgentApiProfilesStore,
+        default: CLIAgentApiProfilesStore::default(),
+        supported_platforms: SupportedPlatforms::DESKTOP,
+        sync_to_cloud: SyncToCloud::Never,
+        private: true,
+        toml_path: "agents.third_party.api_profiles",
+        max_table_depth: 3,
+        description: "Local API profiles for third-party CLI agents.",
+    }
+
     // Maps custom toolbar command regex patterns to specific CLI agents.
     // Keys are regex patterns matched against the full command string.
     // Values are serialized CLIAgent names (empty string = any agent).
@@ -1420,6 +2497,357 @@ define_settings_group!(AISettings, settings: [
 ]);
 
 impl AISettings {
+    pub fn cli_agent_builtin_prompt_agents() -> [CLIAgent; 3] {
+        [CLIAgent::Claude, CLIAgent::Codex, CLIAgent::OpenCode]
+    }
+
+    pub fn supports_cli_agent_builtin_prompt(agent: CLIAgent) -> bool {
+        Self::cli_agent_builtin_prompt_agents().contains(&agent)
+    }
+
+    pub fn cli_agent_builtin_prompt(&self, agent: CLIAgent) -> CLIAgentBuiltinPrompt {
+        self.cli_agent_builtin_prompts
+            .get(&agent.to_serialized_name())
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn apply_cli_agent_builtin_prompt(&self, agent: CLIAgent, user_prompt: String) -> String {
+        if !Self::supports_cli_agent_builtin_prompt(agent) {
+            return user_prompt;
+        }
+
+        if Self::uses_native_cli_agent_builtin_prompt_launch(agent) {
+            return user_prompt;
+        }
+
+        self.cli_agent_builtin_prompt(agent)
+            .apply_to_prompt(user_prompt)
+    }
+
+    pub fn apply_cli_agent_builtin_prompt_to_launch_command(
+        &self,
+        agent: CLIAgent,
+        launch_command: String,
+    ) -> String {
+        if !Self::supports_cli_agent_builtin_prompt(agent) {
+            return launch_command;
+        }
+
+        let Some(suffix) = self
+            .cli_agent_builtin_prompt(agent)
+            .native_launch_suffix(agent)
+        else {
+            return launch_command;
+        };
+
+        format!("{launch_command} {suffix}")
+    }
+
+    pub fn uses_native_cli_agent_builtin_prompt_launch(agent: CLIAgent) -> bool {
+        matches!(agent, CLIAgent::Claude | CLIAgent::Codex)
+    }
+
+    pub fn cli_agent_default_prompt_status(agent: CLIAgent) -> &'static str {
+        match agent {
+            CLIAgent::Claude => {
+                "Default prompt is embedded in Claude Code's native binary and cannot be reliably parsed by Warp."
+            }
+            CLIAgent::Codex => {
+                "Codex builds its model-visible prompt at runtime from permissions, AGENTS.md, skills, and config; inspect it with codex debug prompt-input."
+            }
+            CLIAgent::OpenCode => {
+                "Warp has no stable native prompt-inspection interface for OpenCode; its default prompt cannot be reliably parsed here."
+            }
+            _ => "Default prompt inspection is not supported for this agent.",
+        }
+    }
+
+    pub fn cli_agent_builtin_prompt_application_status(agent: CLIAgent) -> &'static str {
+        match agent {
+            CLIAgent::Claude => {
+                "New sessions launched from Agents use Claude Code's native --append-system-prompt or --system-prompt flag."
+            }
+            CLIAgent::Codex => {
+                "New sessions launched from Agents use Codex's -c developer_instructions override."
+            }
+            CLIAgent::OpenCode => {
+                "Warp applies this prompt when submitting through coding agent Rich Input."
+            }
+            _ => "Warp applies this prompt through Rich Input when supported.",
+        }
+    }
+
+    pub fn set_cli_agent_builtin_prompt_text(
+        &mut self,
+        agent: CLIAgent,
+        prompt: String,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        if !Self::supports_cli_agent_builtin_prompt(agent) {
+            return;
+        }
+
+        let key = agent.to_serialized_name();
+        let mut map = self.cli_agent_builtin_prompts.value().clone();
+        let entry = map.entry(key.clone()).or_default();
+        entry.prompt = prompt;
+        if entry.is_empty() && matches!(entry.mode, CLIAgentBuiltinPromptMode::Append) {
+            map.remove(&key);
+        }
+        report_if_error!(self.cli_agent_builtin_prompts.set_value(map, ctx));
+    }
+
+    pub fn set_cli_agent_builtin_prompt_mode(
+        &mut self,
+        agent: CLIAgent,
+        mode: CLIAgentBuiltinPromptMode,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        if !Self::supports_cli_agent_builtin_prompt(agent) {
+            return;
+        }
+
+        let key = agent.to_serialized_name();
+        let mut map = self.cli_agent_builtin_prompts.value().clone();
+        let entry = map.entry(key.clone()).or_default();
+        entry.mode = mode;
+        if entry.is_empty() && matches!(entry.mode, CLIAgentBuiltinPromptMode::Append) {
+            map.remove(&key);
+        }
+        report_if_error!(self.cli_agent_builtin_prompts.set_value(map, ctx));
+    }
+
+    pub fn cli_agent_api_profile_agents() -> [CLIAgent; 5] {
+        [
+            CLIAgent::Claude,
+            CLIAgent::Codex,
+            CLIAgent::Gemini,
+            CLIAgent::OpenCode,
+            CLIAgent::Hermes,
+        ]
+    }
+
+    pub fn supports_cli_agent_api_profile(agent: CLIAgent) -> bool {
+        Self::cli_agent_api_profile_agents().contains(&agent)
+    }
+
+    pub fn cli_agent_api_profiles(&self) -> CLIAgentApiProfilesStore {
+        self.cli_agent_api_profiles.value().clone().normalized()
+    }
+
+    pub fn cli_agent_api_profiles_export_json(&self) -> Result<String, String> {
+        serde_json::to_string_pretty(&self.cli_agent_api_profiles())
+            .map_err(|error| format!("Could not serialize Agent API profiles: {error}"))
+    }
+
+    pub fn active_cli_agent_api_profile(
+        &self,
+        agent: CLIAgent,
+        environment_id: &str,
+    ) -> Option<CLIAgentApiProfile> {
+        self.cli_agent_api_profiles()
+            .active_profile(agent, environment_id)
+            .cloned()
+    }
+
+    pub fn cli_agent_api_fallback_profiles(
+        &self,
+        agent: CLIAgent,
+        environment_id: &str,
+    ) -> Vec<CLIAgentApiProfile> {
+        self.cli_agent_api_profiles()
+            .fallback_profiles(agent, environment_id)
+    }
+
+    pub fn add_cli_agent_api_profile(
+        &mut self,
+        profile: CLIAgentApiProfile,
+        make_active: bool,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let mut store = self.cli_agent_api_profiles();
+        store.upsert_profile(profile, make_active);
+        report_if_error!(self.cli_agent_api_profiles.set_value(store, ctx));
+    }
+
+    pub fn merge_cli_agent_api_profiles_json(
+        &mut self,
+        raw_json: &str,
+        ctx: &mut ModelContext<Self>,
+    ) -> Result<usize, String> {
+        let imported_store = CLIAgentApiProfilesStore::from_import_json(raw_json)?;
+        let mut store = self.cli_agent_api_profiles();
+        let profile_count = store.merge_store(imported_store);
+        report_if_error!(self.cli_agent_api_profiles.set_value(store, ctx));
+        Ok(profile_count)
+    }
+
+    pub fn replace_cli_agent_api_profiles_json(
+        &mut self,
+        raw_json: &str,
+        ctx: &mut ModelContext<Self>,
+    ) -> Result<usize, String> {
+        let store = CLIAgentApiProfilesStore::from_import_json(raw_json)?;
+        let profile_count = store.profiles.len();
+        report_if_error!(self.cli_agent_api_profiles.set_value(store, ctx));
+        Ok(profile_count)
+    }
+
+    pub fn remove_cli_agent_api_profile(&mut self, profile_id: &str, ctx: &mut ModelContext<Self>) {
+        let mut store = self.cli_agent_api_profiles();
+        store.remove_profile(profile_id);
+        report_if_error!(self.cli_agent_api_profiles.set_value(store, ctx));
+    }
+
+    pub fn set_cli_agent_api_profile_enabled(
+        &mut self,
+        profile_id: &str,
+        enabled: bool,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let mut store = self.cli_agent_api_profiles();
+        store.set_profile_enabled(profile_id, enabled);
+        report_if_error!(self.cli_agent_api_profiles.set_value(store, ctx));
+    }
+
+    pub fn record_cli_agent_api_profile_health(
+        &mut self,
+        profile_id: &str,
+        health: CLIAgentApiProfileHealth,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let mut store = self.cli_agent_api_profiles();
+        store.record_profile_health(profile_id, health);
+        report_if_error!(self.cli_agent_api_profiles.set_value(store, ctx));
+    }
+
+    pub fn set_active_cli_agent_api_profile(
+        &mut self,
+        agent: CLIAgent,
+        environment_id: &str,
+        profile_id: &str,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let mut store = self.cli_agent_api_profiles();
+        store.set_active_profile(agent, environment_id, profile_id);
+        report_if_error!(self.cli_agent_api_profiles.set_value(store, ctx));
+    }
+
+    pub fn cli_agent_api_profile_native_environment_vars(
+        profile: &CLIAgentApiProfile,
+    ) -> HashMap<String, String> {
+        let mut env_vars = HashMap::new();
+        if !profile.api_key.is_empty() && !profile.auth_env_var.trim().is_empty() {
+            env_vars.insert(
+                profile.auth_env_var.trim().to_owned(),
+                profile.api_key.clone(),
+            );
+        }
+        for (key, value) in cli_agent_api_env_var_mapping(profile.agent(), profile) {
+            env_vars.insert(key, value);
+        }
+        env_vars.extend(profile.extra_env.clone());
+        env_vars
+    }
+
+    pub fn cli_agent_api_environment_vars(
+        &self,
+        agent: CLIAgent,
+        environment_id: &str,
+    ) -> HashMap<String, String> {
+        let Some(profile) = self.active_cli_agent_api_profile(agent, environment_id) else {
+            return HashMap::default();
+        };
+
+        let mut env_vars = HashMap::new();
+        env_vars.insert(
+            "AGENTWARP_AGENT_API_PROFILE_ID".to_owned(),
+            profile.id.clone(),
+        );
+        env_vars.insert(
+            "AGENTWARP_AGENT_API_PROFILE_NAME".to_owned(),
+            profile.name.clone(),
+        );
+        env_vars.insert(
+            "AGENTWARP_AGENT_API_AGENT".to_owned(),
+            profile.agent.clone(),
+        );
+        env_vars.insert(
+            "AGENTWARP_AGENT_API_FORMAT".to_owned(),
+            profile.api_format.clone(),
+        );
+        env_vars.insert(
+            "AGENTWARP_AGENT_API_FULL_URL_MODE".to_owned(),
+            if profile.full_url_mode { "1" } else { "0" }.to_owned(),
+        );
+        env_vars.insert(
+            "AGENTWARP_AGENT_API_ENVIRONMENT_ID".to_owned(),
+            profile.environment_id.clone(),
+        );
+
+        if !profile.api_key.is_empty() {
+            env_vars.insert(
+                "AGENTWARP_AGENT_API_KEY".to_owned(),
+                profile.api_key.clone(),
+            );
+        }
+        if !profile.auth_env_var.trim().is_empty() && !profile.api_key.is_empty() {
+            env_vars.insert(
+                profile.auth_env_var.trim().to_owned(),
+                profile.api_key.clone(),
+            );
+        }
+        if !profile.base_url.is_empty() {
+            env_vars.insert(
+                "AGENTWARP_AGENT_API_BASE_URL".to_owned(),
+                profile.base_url.clone(),
+            );
+        }
+        let preferred_model = profile.preferred_model();
+        if !preferred_model.is_empty() {
+            env_vars.insert("AGENTWARP_AGENT_API_MODEL".to_owned(), preferred_model);
+        }
+        if let Ok(model_mappings_json) = serde_json::to_string(&profile.model_mappings) {
+            env_vars.insert(
+                "AGENTWARP_AGENT_API_MODEL_MAPPINGS".to_owned(),
+                model_mappings_json,
+            );
+        }
+        if let Ok(model_catalog_json) = serde_json::to_string(&profile.model_catalog) {
+            env_vars.insert(
+                "AGENTWARP_AGENT_API_MODEL_CATALOG".to_owned(),
+                model_catalog_json,
+            );
+        }
+
+        let fallback_profiles = self.cli_agent_api_fallback_profiles(agent, environment_id);
+        env_vars.insert(
+            "AGENTWARP_AGENT_API_FAILOVER_ENABLED".to_owned(),
+            if fallback_profiles.len() > 1 {
+                "1"
+            } else {
+                "0"
+            }
+            .to_owned(),
+        );
+        env_vars.insert(
+            "AGENTWARP_AGENT_API_PROFILE_COUNT".to_owned(),
+            fallback_profiles.len().to_string(),
+        );
+        if let Ok(fallback_profiles_json) = serde_json::to_string(&fallback_profiles) {
+            env_vars.insert(
+                "AGENTWARP_AGENT_API_FALLBACKS".to_owned(),
+                fallback_profiles_json,
+            );
+        }
+
+        env_vars.extend(Self::cli_agent_api_profile_native_environment_vars(
+            &profile,
+        ));
+        env_vars
+    }
+
     pub fn register_and_subscribe_to_events(app: &mut AppContext) {
         Self::register(app);
         app.add_singleton_model(FocusedTerminalInfo::new);

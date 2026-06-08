@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use super::*;
+use crate::terminal::cli_agent::AgentReasoningEffort;
 use crate::terminal::cli_agent::CLIAgent;
 
 fn generated_worktree_path_string(repo: &str, worktree_name: &str) -> String {
@@ -71,6 +72,46 @@ fn cli_agent_no_worktree() {
     assert_eq!(config.panes[0].commands.as_deref().unwrap(), &["claude"]);
     assert!(config.params.is_empty());
     assert!(config.title.is_none());
+}
+
+#[test]
+fn cli_agent_with_reasoning_effort_uses_agent_specific_command() {
+    let codex = build_tab_config_with_reasoning_effort(
+        &SessionType::CliAgent(CLIAgent::Codex),
+        Path::new("/home/user/project"),
+        false,
+        true,
+        AgentReasoningEffort::ExtraHigh,
+    );
+    assert_eq!(
+        codex.panes[0].commands.as_deref().unwrap(),
+        &["codex -c model_reasoning_effort=xhigh"]
+    );
+
+    let claude = build_tab_config_with_reasoning_effort(
+        &SessionType::CliAgent(CLIAgent::Claude),
+        Path::new("/home/user/project"),
+        false,
+        true,
+        AgentReasoningEffort::Medium,
+    );
+    assert_eq!(
+        claude.panes[0].commands.as_deref().unwrap(),
+        &["claude --effort medium"]
+    );
+}
+
+#[test]
+fn cli_agent_auto_reasoning_effort_keeps_existing_command() {
+    let config = build_tab_config_with_reasoning_effort(
+        &SessionType::CliAgent(CLIAgent::Codex),
+        Path::new("/home/user/project"),
+        false,
+        true,
+        AgentReasoningEffort::Auto,
+    );
+
+    assert_eq!(config.panes[0].commands.as_deref().unwrap(), &["codex"]);
 }
 
 #[test]

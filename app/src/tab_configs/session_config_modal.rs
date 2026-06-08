@@ -18,6 +18,7 @@ use warpui::{
 use super::session_config::{is_git_repo, SessionConfigSelection, SessionType};
 use super::session_config_rendering;
 use crate::appearance::Appearance;
+use crate::terminal::cli_agent::AgentReasoningEffort;
 use crate::ui_components::blended_colors;
 use crate::view_components::action_button::{
     ActionButton, ButtonSize, KeystrokeSource, NakedTheme, PrimaryTheme,
@@ -155,6 +156,7 @@ impl SessionConfigModal {
             directory: self.selected_directory.clone(),
             enable_worktree: self.enable_worktree,
             autogenerate_worktree_branch_name: self.autogenerate_worktree_branch_name,
+            reasoning_effort: AgentReasoningEffort::Auto,
         }));
     }
 

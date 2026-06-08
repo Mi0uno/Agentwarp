@@ -2479,6 +2479,7 @@ impl Input {
                 // so its subscriber always fires alongside ours for every chip click.
                 AgentInputFooterEvent::WriteToPty(_)
                 | AgentInputFooterEvent::InsertIntoCLIRichInput(_)
+                | AgentInputFooterEvent::UploadLocalFilesToSshRemote(_)
                 | AgentInputFooterEvent::ToggleCodeReviewPane(_)
                 | AgentInputFooterEvent::ToggleFileExplorer(_)
                 | AgentInputFooterEvent::OpenRichInput

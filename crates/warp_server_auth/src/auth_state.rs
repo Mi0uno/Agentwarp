@@ -112,7 +112,7 @@ impl AuthState {
     }
 
     /// Creates and initializes auth state. Checks, in order:
-    /// 1. Test user (test/integration/skip_login builds)
+    /// 1. Test user (test/integration builds)
     /// 2. Provided API key
     /// 3. WARP_USER_SECRET environment variable
     /// 4. Persisted user from secure storage
@@ -129,6 +129,11 @@ impl AuthState {
                 feature = "test-util"
             ))]
             state.set_credentials(Some(Self::test_credentials()));
+            return state;
+        }
+
+        if cfg!(feature = "skip_login") {
+            log::info!("skip_login enabled; starting without persisted Warp credentials");
             return state;
         }
 
@@ -177,8 +182,7 @@ impl AuthState {
     }
 
     fn should_use_test_user() -> bool {
-        cfg!(any(test, feature = "skip_login", feature = "test-util"))
-            || ChannelState::channel() == Channel::Integration
+        cfg!(any(test, feature = "test-util")) || ChannelState::channel() == Channel::Integration
     }
 
     /// Determines the appropriate persistence action based on the current auth state.
@@ -345,6 +349,10 @@ impl AuthState {
     /// during the transient state where credentials exist but user data hasn't loaded
     /// yet, the user is conservatively treated as lacking a full account.
     pub fn is_anonymous_or_logged_out(&self) -> bool {
+        if cfg!(feature = "skip_login") {
+            return false;
+        }
+
         !self.is_logged_in() || self.is_user_anonymous().unwrap_or(true)
     }
 

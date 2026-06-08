@@ -935,6 +935,7 @@ fn prepare_claude_settings_creates_settings_file() {
 
     let claude_settings: Value =
         serde_json::from_slice(&fs::read(claude_settings_path).unwrap()).unwrap();
+    assert_eq!(claude_settings["skipIntroduction"], Value::Bool(true));
     assert_eq!(
         claude_settings["skipDangerousModePermissionPrompt"],
         Value::Bool(true)
@@ -957,6 +958,7 @@ fn prepare_claude_settings_merges_existing_settings() {
         serde_json::from_slice(&fs::read(claude_settings_path).unwrap()).unwrap();
     assert_eq!(claude_settings["editor"], "vim");
     assert_eq!(claude_settings["nested"]["value"], 1);
+    assert_eq!(claude_settings["skipIntroduction"], Value::Bool(true));
     assert_eq!(
         claude_settings["skipDangerousModePermissionPrompt"],
         Value::Bool(true)

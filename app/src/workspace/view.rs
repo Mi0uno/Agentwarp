@@ -13,6 +13,7 @@ pub(crate) mod onboarding;
 pub(crate) mod openwarp_launch_modal;
 pub(crate) mod orchestration_launch_modal;
 pub(crate) mod right_panel;
+pub(crate) mod ssh_remote;
 mod startup_directory;
 #[cfg(test)]
 #[path = "view_tests.rs"]
@@ -27,6 +28,7 @@ use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
 #[cfg(target_os = "macos")]
 use std::env;
+use std::ffi::OsString;
 use std::fmt::Write;
 #[cfg(all(target_os = "macos", feature = "crash_reporting"))]
 use std::fs;
@@ -58,8 +60,6 @@ use repo_metadata::RemoteRepositoryIdentifier;
 use sentry::protocol::{Attachment, AttachmentType};
 use serde_json;
 use session_sharing_protocol::common::SessionId as SharedSessionId;
-#[cfg(target_family = "wasm")]
-use url::Url;
 use warp_cli::agent::Harness;
 use warp_core::context_flag::ContextFlag;
 use warp_core::execution_mode::AppExecutionMode;
@@ -98,8 +98,8 @@ use warpui::notification::{NotificationSendError, RequestPermissionsOutcome, Use
 use warpui::platform::{
     Cursor, FilePickerConfiguration, FullscreenState, SystemTheme, TerminationMode,
 };
+use warpui::r#async::Timer;
 use warpui::text_layout::ClipConfig;
-use warpui::ui_components::button::{Button, ButtonVariant};
 use warpui::ui_components::components::{Coords, UiComponent, UiComponentStyles};
 use warpui::windowing::state::ApplicationStage;
 use warpui::windowing::{StateEvent, WindowManager};
@@ -108,6 +108,11 @@ use warpui::{
     UpdateModel, UpdateView, View, ViewAsRef, ViewContext, ViewHandle, WeakViewHandle, WindowId,
 };
 
+use self::ssh_remote::{
+    ssh_remote_environment_id, ssh_remote_host_id_from_environment_id, ssh_remote_terminal_launch,
+    verify_embedded_ssh_connection, SshRemoteConnectionStatus, SshRemoteDirectoryPickerEvent,
+    SshRemoteDirectoryPickerView, SshRemoteModel, SSH_REMOTE_LOCAL_ENVIRONMENT_ID,
+};
 use self::vertical_tabs::telemetry::{VerticalTabsDisplayOption, VerticalTabsTelemetryEvent};
 use self::vertical_tabs::{
     render_detail_sidecar, render_settings_popup, vtab_group_position_id, VerticalTabsPanelState,
@@ -233,7 +238,6 @@ use crate::cloud_object::{
     CloudObject, GenericStringObjectFormat, JsonObjectType, ObjectType, Owner, Space,
 };
 use crate::code::buffer_location::LocalOrRemotePath;
-use crate::code::editor::{add_color, remove_color};
 #[cfg(feature = "local_fs")]
 use crate::code::editor_management::CodeManager;
 use crate::code::editor_management::CodeSource;
@@ -320,12 +324,12 @@ use crate::server::telemetry::{
 use crate::session_management::{SessionNavigationData, SessionSource, TabNavigationData};
 use crate::settings::cloud_preferences::CloudPreferencesSettings;
 use crate::settings::{
-    active_theme_kind, respect_system_theme, AISettings, AISettingsChangedEvent,
-    AccessibilitySettings, AliasExpansionSettings, AppEditorSettings, BlockVisibilitySettings,
-    ChangelogSettings, CodeSettings, CodeSettingsChangedEvent, CtrlTabBehavior, CursorBlink,
-    DebugSettings, DefaultSessionMode, FontSettings, GPUSettings, InputModeSettings, InputSettings,
-    MonospaceFontSize, PaneSettings, PrivacySettings, SelectionSettings, Settings, SshSettings,
-    ThemeSettings,
+    active_theme_kind, cli_agent_api_usage_log_path, respect_system_theme, AISettings,
+    AISettingsChangedEvent, AccessibilitySettings, AliasExpansionSettings, AppEditorSettings,
+    BlockVisibilitySettings, ChangelogSettings, CodeSettings, CodeSettingsChangedEvent,
+    CtrlTabBehavior, CursorBlink, DebugSettings, DefaultSessionMode, FontSettings, GPUSettings,
+    InputModeSettings, InputSettings, MonospaceFontSize, PaneSettings, PrivacySettings,
+    SelectionSettings, Settings, SshSettings, ThemeSettings,
 };
 use crate::settings_view::environments_page::EnvironmentsPage;
 use crate::settings_view::handoff_environment_creation_modal::{
@@ -362,7 +366,10 @@ use crate::terminal::available_shells::AvailableShells;
 use crate::terminal::block_list_viewport::InputMode;
 #[cfg(not(target_family = "wasm"))]
 use crate::terminal::cli_agent_sessions::plugin_manager::{plugin_manager_for, PluginModalKind};
-use crate::terminal::cli_agent_sessions::{CLIAgentSessionsModel, CLIAgentSessionsModelEvent};
+use crate::terminal::cli_agent_sessions::{
+    CLIAgentInputState, CLIAgentSession, CLIAgentSessionContext, CLIAgentSessionStatus,
+    CLIAgentSessionsModel, CLIAgentSessionsModelEvent,
+};
 use crate::terminal::enable_auto_reload_modal::{
     EnableAutoReloadModal, EnableAutoReloadModalEvent,
 };
@@ -418,8 +425,6 @@ use crate::ui_components::red_notification_dot::RedNotificationDot;
 use crate::ui_components::window_focus_dimming::WindowFocusDimming;
 use crate::ui_components::{blended_colors, icons};
 use crate::undo_close::UndoCloseStack;
-#[cfg(target_family = "wasm")]
-use crate::uri::browser_url_handler::{parse_current_url, update_browser_url};
 #[cfg(feature = "local_fs")]
 use crate::user_config::{
     ensure_default_worktree_config, find_unused_tab_config_path, find_unused_toml_path,
@@ -500,6 +505,8 @@ use crate::workspace::view::openwarp_launch_modal::{
 use crate::workspace::view::orchestration_launch_modal::{
     OrchestrationLaunchModal, OrchestrationLaunchModalEvent,
 };
+#[cfg(feature = "local_fs")]
+use crate::workspace::view::right_panel::RightPanelFileTreeEvent;
 use crate::workspace::view::right_panel::{RightPanelEvent, RightPanelView};
 use crate::workspace::{ForkFromExchange, ForkedConversationDestination};
 use crate::workspaces::user_workspaces::UserWorkspaces;
@@ -511,6 +518,7 @@ use crate::{
 
 /// The padding that should be applied to the workspace as a whole.
 pub const WORKSPACE_PADDING: f32 = 1.0;
+const AGENT_SESSION_TRANSCRIPT_CAPTURE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// The minimum font size at which terminal text will be rendered.
 const MIN_FONT_SIZE: f32 = 5.0;
@@ -559,6 +567,9 @@ pub(crate) const TAB_BAR_POSITION_ID: &str = "workspace_view:tab_bar";
 /// path renders the vertical tabs panel must wrap it in a `SavePosition` with
 /// this id.
 pub(crate) const VERTICAL_TABS_PANEL_POSITION_ID: &str = "workspace_view:vertical_tabs_panel";
+pub(crate) const SSH_REMOTE_PANEL_POSITION_ID: &str = "workspace_view:ssh_remote_panel";
+const SSH_REMOTE_ENVIRONMENT_BAR_POSITION_ID: &str = "workspace_view:ssh_remote_environment_bar";
+const SSH_REMOTE_ENVIRONMENT_MENU_WIDTH: f32 = 336.;
 
 /// The main content area in a workspace. This is directly below the tab bar.
 const TAB_CONTENT_POSITION_ID: &str = "workspace_view:tab_content";
@@ -610,9 +621,11 @@ pub(crate) const TOGGLE_VERTICAL_TABS_PANEL_BINDING_NAME: &str =
 pub(crate) const OPEN_GLOBAL_SEARCH_BINDING_NAME: &str = "workspace:open_global_search";
 pub(crate) const TOGGLE_CONVERSATION_LIST_VIEW_BINDING_NAME: &str =
     "workspace:toggle_conversation_list_view";
+pub(crate) const TOGGLE_SSH_REMOTE_BINDING_NAME: &str = "workspace:toggle_ssh_remote";
 pub(crate) const NEW_TAB_BINDING_NAME: &str = "workspace:new_tab";
 pub(crate) const NEW_TERMINAL_TAB_BINDING_NAME: &str = "workspace:new_terminal_tab";
 pub(crate) const NEW_AGENT_TAB_BINDING_NAME: &str = "workspace:new_agent_tab";
+pub(crate) const NEW_AGENT_CHILD_SESSION_BINDING_NAME: &str = "workspace:new_agent_child_session";
 pub(crate) const NEW_AMBIENT_AGENT_TAB_BINDING_NAME: &str = "workspace:new_ambient_agent_tab";
 pub(crate) const TOGGLE_TAB_CONFIGS_MENU_BINDING_NAME: &str = "workspace:toggle_tab_configs_menu";
 
@@ -623,6 +636,7 @@ pub(crate) const LEFT_PANEL_GLOBAL_SEARCH_BINDING_NAME: &str = "workspace:left_p
 pub(crate) const LEFT_PANEL_WARP_DRIVE_BINDING_NAME: &str = "workspace:left_panel_warp_drive";
 pub(crate) const LEFT_PANEL_AGENT_CONVERSATIONS_BINDING_NAME: &str =
     "workspace:left_panel_agent_conversations";
+pub(crate) const LEFT_PANEL_SSH_REMOTE_BINDING_NAME: &str = "workspace:left_panel_ssh_remote";
 
 const KEYBINDINGS_TO_CACHE: [&str; 4] = [
     ASK_AI_ASSISTANT_KEYBINDING_NAME,
@@ -939,6 +953,12 @@ pub struct TransferredTab {
     pub draggable_state: DraggableState,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SshRemoteDirectoryPickerPurpose {
+    Project,
+    Browse,
+}
+
 pub struct Workspace {
     window_id: WindowId,
     pub(crate) tabs: Vec<TabData>,
@@ -1026,6 +1046,8 @@ pub struct Workspace {
     header_toolbar_editor_modal: ViewHandle<HeaderToolbarEditorModal>,
     header_toolbar_context_menu: ViewHandle<Menu<WorkspaceAction>>,
     show_header_toolbar_context_menu: Option<Vector2F>,
+    ssh_remote_environment_menu: ViewHandle<Menu<WorkspaceAction>>,
+    show_ssh_remote_environment_menu: bool,
     theme_creator_modal: ViewHandle<ThemeCreatorModal>,
     theme_deletion_modal: ViewHandle<ThemeDeletionModal>,
     suggested_agent_mode_workflow_modal: ViewHandle<SuggestedAgentModeWorkflowModal>,
@@ -1074,6 +1096,10 @@ pub struct Workspace {
     vertical_tabs_panel_open: bool,
     vertical_tabs_panel: VerticalTabsPanelState,
     agent_sessions_view: ViewHandle<AgentSessionsView>,
+    ssh_remote_directory_picker: ViewHandle<SshRemoteDirectoryPickerView>,
+    is_ssh_remote_directory_picker_open: bool,
+    ssh_remote_directory_picker_purpose: SshRemoteDirectoryPickerPurpose,
+    pending_ssh_remote_directory_project_edit: Option<PathBuf>,
     left_panel_view: ViewHandle<LeftPanelView>,
     left_panel_views: Vec<ToolPanelView>,
     right_panel_view: ViewHandle<RightPanelView>,
@@ -1121,31 +1147,37 @@ pub struct Workspace {
     create_auth_secret_modal: Option<ViewHandle<Modal<AuthSecretFtuxView>>>,
 }
 
-fn agent_session_launch_command(record: &AgentSessionRecord, base_command: &str) -> String {
-    let Some(transcript) = record.hosted_transcript_for_restore() else {
-        return base_command.to_owned();
-    };
-
-    format!(
-        "printf %s {}; {}",
-        shell_words::quote(&transcript),
-        base_command
-    )
-}
-
 fn agent_session_base_command(record: &AgentSessionRecord) -> String {
     record
         .agent_session_id
         .as_deref()
         .and_then(|session_id| record.agent.resume_command(session_id))
-        .unwrap_or_else(|| match record.agent {
-            CLIAgent::Codex => format!("{} resume --last", record.agent.command_prefix()),
-            _ => record.agent.command_prefix().to_owned(),
-        })
+        .unwrap_or_else(|| record.agent.command_prefix().to_owned())
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn embedded_agent_api_proxy_executable() -> Option<PathBuf> {
+    let current_exe = std::env::current_exe().ok()?;
+    let exe_name = if cfg!(windows) {
+        "agentwarp-agent-api-proxy.exe"
+    } else {
+        "agentwarp-agent-api-proxy"
+    };
+    let helper = current_exe.parent()?.join(exe_name);
+    helper.exists().then_some(helper)
 }
 
 fn agent_session_restore_command(record: &AgentSessionRecord) -> String {
-    agent_session_launch_command(record, &agent_session_base_command(record))
+    agent_session_base_command(record)
+}
+
+fn agent_session_group_title(parent: &AgentSessionRecord) -> String {
+    let title = parent.title.trim();
+    if title.is_empty() {
+        "Agent group".to_owned()
+    } else {
+        format!("{title} agents")
+    }
 }
 
 fn hosted_transcript_from_terminal_view(terminal_view: &TerminalView) -> Option<String> {
@@ -1192,48 +1224,66 @@ mod agent_session_hosted_transcript_tests {
     fn record_with_hosted_transcript(transcript: Option<&str>) -> AgentSessionRecord {
         AgentSessionRecord {
             id: "record-1".to_owned(),
+            environment_id: SSH_REMOTE_LOCAL_ENVIRONMENT_ID.to_owned(),
             project_path: PathBuf::from("/tmp/project"),
             agent: CLIAgent::Codex,
             title: "Fix parser".to_owned(),
             status: crate::workspace::view::agent_sessions::AgentSessionStatus::Success,
             agent_session_id: Some("agent-session".to_owned()),
+            parent_session_id: None,
+            parent_agent_session_id: None,
             updated_at_ms: 10,
+            sort_order: 10,
             is_pinned: false,
             archived_at_ms: None,
             title_overridden: false,
+            auto_title_fingerprint: None,
+            auto_title_summarized_at_ms: None,
+            auto_title_source_chars: 0,
             hosted_transcript: transcript.map(str::to_owned),
             hosted_transcript_updated_at_ms: transcript.map(|_| 11),
             terminal_view_id: None,
+            group_terminal_view_id: None,
         }
     }
 
     #[test]
-    fn agent_session_launch_command_prints_hosted_transcript_before_agent() {
+    fn agent_session_restore_command_does_not_shell_inject_hosted_transcript() {
         let record = record_with_hosted_transcript(Some("User:\nhello"));
 
-        let command = agent_session_launch_command(&record, "codex resume agent-session");
+        let command = agent_session_restore_command(&record);
 
-        assert!(command.starts_with("printf %s "));
-        assert!(command.contains("codex resume agent-session"));
-        assert!(command.contains("Agentwarp saved chat history"));
+        assert_eq!(command, "codex resume agent-session");
+        assert!(!command.contains("printf"));
+        assert!(!command.contains("Agentwarp saved chat history"));
+        assert!(!command.contains("User:\nhello"));
     }
 
     #[test]
-    fn agent_session_launch_command_uses_base_command_without_hosted_transcript() {
+    fn agent_session_restore_command_uses_base_command_without_hosted_transcript() {
         let record = record_with_hosted_transcript(None);
 
         assert_eq!(
-            agent_session_launch_command(&record, "codex resume agent-session"),
+            agent_session_restore_command(&record),
             "codex resume agent-session"
         );
     }
 
     #[test]
-    fn agent_session_base_command_uses_codex_resume_last_without_session_id() {
+    fn agent_session_base_command_starts_fresh_codex_without_session_id() {
         let mut record = record_with_hosted_transcript(None);
         record.agent_session_id = None;
 
-        assert_eq!(agent_session_base_command(&record), "codex resume --last");
+        assert_eq!(agent_session_base_command(&record), "codex");
+    }
+
+    #[test]
+    fn agent_session_base_command_starts_fresh_codex_for_child_without_session_id() {
+        let mut record = record_with_hosted_transcript(None);
+        record.agent_session_id = None;
+        record.parent_session_id = Some("parent-record".to_owned());
+
+        assert_eq!(agent_session_base_command(&record), "codex");
     }
 
     #[test]
@@ -1301,6 +1351,11 @@ impl Workspace {
             menu.set_safe_zone_target(None);
             menu.set_submenu_being_shown_for_item_index(None);
         });
+        ctx.notify();
+    }
+
+    fn close_ssh_remote_environment_menu(&mut self, ctx: &mut ViewContext<Self>) {
+        self.show_ssh_remote_environment_menu = false;
         ctx.notify();
     }
 
@@ -2297,12 +2352,13 @@ impl Workspace {
                 self.close_session_config_modal(ctx);
                 let has_worktree = selection.enable_worktree;
                 let has_params = {
-                    use crate::tab_configs::session_config::build_tab_config;
-                    let config = build_tab_config(
+                    use crate::tab_configs::session_config::build_tab_config_with_reasoning_effort;
+                    let config = build_tab_config_with_reasoning_effort(
                         &selection.session_type,
                         &selection.directory,
                         selection.enable_worktree,
                         selection.autogenerate_worktree_branch_name,
+                        selection.reasoning_effort,
                     );
                     !config.params.is_empty()
                 };
@@ -2365,14 +2421,17 @@ impl Workspace {
         selection: &crate::tab_configs::session_config::SessionConfigSelection,
         ctx: &mut ViewContext<Self>,
     ) {
-        use crate::tab_configs::session_config::{build_tab_config, write_tab_config};
+        use crate::tab_configs::session_config::{
+            build_tab_config_with_reasoning_effort, write_tab_config,
+        };
 
         // Build a TabConfig.
-        let config = build_tab_config(
+        let config = build_tab_config_with_reasoning_effort(
             &selection.session_type,
             &selection.directory,
             selection.enable_worktree,
             selection.autogenerate_worktree_branch_name,
+            selection.reasoning_effort,
         );
 
         let old_pane_group_id = self.active_tab_pane_group().id();
@@ -3019,6 +3078,11 @@ impl Workspace {
             ctx.add_model(|_| pane_group::WorkingDirectoriesModel::new());
 
         let agent_sessions_view = ctx.add_typed_action_view(AgentSessionsView::new);
+        let ssh_remote_directory_picker =
+            ctx.add_typed_action_view(SshRemoteDirectoryPickerView::new);
+        ctx.subscribe_to_view(&ssh_remote_directory_picker, |me, _, event, ctx| {
+            me.handle_ssh_remote_directory_picker_event(event, ctx);
+        });
 
         let left_panel_views = Self::compute_left_panel_views(ctx);
 
@@ -3412,6 +3476,8 @@ impl Workspace {
             header_toolbar_editor_modal: Self::build_header_toolbar_editor_modal(ctx),
             header_toolbar_context_menu: Self::build_header_toolbar_context_menu(ctx),
             show_header_toolbar_context_menu: None,
+            ssh_remote_environment_menu: Self::build_ssh_remote_environment_menu(ctx),
+            show_ssh_remote_environment_menu: false,
             is_user_menu_open: false,
             tab_bar_pinned_by_popup: false,
             user_menu,
@@ -3423,6 +3489,10 @@ impl Workspace {
             vertical_tabs_panel_open: false,
             vertical_tabs_panel: Default::default(),
             agent_sessions_view,
+            ssh_remote_directory_picker,
+            is_ssh_remote_directory_picker_open: false,
+            ssh_remote_directory_picker_purpose: SshRemoteDirectoryPickerPurpose::Project,
+            pending_ssh_remote_directory_project_edit: None,
             left_panel_view,
             left_panel_views,
             right_panel_view,
@@ -3486,6 +3556,7 @@ impl Workspace {
         // any) read from `GlobalResourceHandles`. Subsequent updates are
         // pushed by `subscribe_to_settings_errors` and `dismiss_workspace_banner`.
         ws.sync_settings_error_state_into_settings_pane(ctx);
+        ws.schedule_agent_session_transcript_capture_tick(ctx);
 
         let weak_handle = ctx.handle();
         WorkspaceRegistry::handle(ctx).update(ctx, |registry, _| {
@@ -3707,6 +3778,34 @@ impl Workspace {
         });
     }
 
+    fn schedule_agent_session_transcript_capture_tick(&mut self, ctx: &mut ViewContext<Self>) {
+        ctx.spawn(
+            Timer::after(AGENT_SESSION_TRANSCRIPT_CAPTURE_INTERVAL),
+            |workspace, _, ctx| {
+                workspace.capture_attached_agent_session_transcripts(ctx);
+                workspace.schedule_agent_session_transcript_capture_tick(ctx);
+            },
+        );
+    }
+
+    fn capture_attached_agent_session_transcripts(&self, ctx: &mut ViewContext<Self>) {
+        let mut terminal_view_ids = Vec::new();
+        for record in AgentSessionsModel::as_ref(ctx).records() {
+            for terminal_view_id in [record.terminal_view_id, record.group_terminal_view_id]
+                .into_iter()
+                .flatten()
+            {
+                if !terminal_view_ids.contains(&terminal_view_id) {
+                    terminal_view_ids.push(terminal_view_id);
+                }
+            }
+        }
+
+        for terminal_view_id in terminal_view_ids {
+            self.capture_agent_session_transcript(terminal_view_id, ctx);
+        }
+    }
+
     /// Handle session settings changes.
     fn handle_session_settings_event(
         &mut self,
@@ -3808,6 +3907,7 @@ impl Workspace {
             | TabSettingsChangedEvent::VerticalTabsTabItemMode { .. }
             | TabSettingsChangedEvent::VerticalTabsPrimaryInfo { .. }
             | TabSettingsChangedEvent::VerticalTabsCompactSubtitle { .. }
+            | TabSettingsChangedEvent::SingletonAgentGroupBehavior { .. }
             | TabSettingsChangedEvent::UseLatestUserPromptAsConversationTitleInTabNames {
                 ..
             }
@@ -5725,7 +5825,11 @@ impl Workspace {
 
     /// Focuses the given pane, revealing it first if it is hidden behind a
     /// temporary swap.
-    pub fn focus_pane(&mut self, pane_view_locator: PaneViewLocator, ctx: &mut ViewContext<Self>) {
+    pub fn focus_pane(
+        &mut self,
+        pane_view_locator: PaneViewLocator,
+        ctx: &mut ViewContext<Self>,
+    ) -> bool {
         if let Some((index, tab)) = self
             .tabs
             .iter()
@@ -5738,12 +5842,16 @@ impl Workspace {
             // was focused in the mean time, that pane will be the one that will
             // remain focused (as opposed to the pane with pane_id) since its
             // input would remain focused.
-            tab.pane_group.update(ctx, |view, ctx| {
-                view.reveal_and_focus_pane(pane_view_locator.pane_id, ctx);
+            let focused = tab.pane_group.update(ctx, |view, ctx| {
+                view.reveal_and_focus_pane(pane_view_locator.pane_id, ctx)
             });
             self.activate_tab_internal(index, ctx);
-            ctx.notify();
+            if focused {
+                ctx.notify();
+            }
+            return focused;
         }
+        false
     }
 
     /// Searches this workspace's tabs for the given terminal view and focuses it.
@@ -5753,22 +5861,36 @@ impl Workspace {
         terminal_view_id: EntityId,
         ctx: &mut ViewContext<Self>,
     ) -> bool {
-        for tab in self.tabs.iter() {
+        let locator = self.tabs.iter().find_map(|tab| {
             let pane_group_handle = &tab.pane_group;
             let pane_group = pane_group_handle.as_ref(ctx);
-            if let Some(pane_id) = pane_group.find_pane_id_for_terminal_view(terminal_view_id, ctx)
-            {
-                self.focus_pane(
-                    PaneViewLocator {
-                        pane_group_id: pane_group_handle.id(),
-                        pane_id,
-                    },
-                    ctx,
-                );
-                return true;
-            }
-        }
-        false
+            pane_group
+                .find_pane_id_for_terminal_view(terminal_view_id, ctx)
+                .map(|pane_id| PaneViewLocator {
+                    pane_group_id: pane_group_handle.id(),
+                    pane_id,
+                })
+        });
+
+        locator.is_some_and(|locator| self.focus_pane(locator, ctx))
+    }
+
+    fn terminal_view_is_long_running_locally(
+        &self,
+        terminal_view_id: EntityId,
+        ctx: &AppContext,
+    ) -> bool {
+        self.tabs.iter().any(|tab| {
+            let pane_group = tab.pane_group.as_ref(ctx);
+            let Some(pane_id) = pane_group.find_pane_id_for_terminal_view(terminal_view_id, ctx)
+            else {
+                return false;
+            };
+            let Some(terminal_view) = pane_group.terminal_view_from_pane_id(pane_id, ctx) else {
+                return false;
+            };
+            terminal_view.as_ref(ctx).is_long_running()
+        })
     }
 
     /// Searches other windows for the given terminal view and focuses it there.
@@ -5994,6 +6116,24 @@ impl Workspace {
         ctx.subscribe_to_view(&menu, |me, _, event, ctx| {
             if let MenuEvent::Close { .. } = event {
                 me.show_header_toolbar_context_menu = None;
+                ctx.notify();
+            }
+        });
+        menu
+    }
+
+    fn build_ssh_remote_environment_menu(
+        ctx: &mut ViewContext<Self>,
+    ) -> ViewHandle<Menu<WorkspaceAction>> {
+        let menu = ctx.add_typed_action_view(|_| {
+            Menu::new()
+                .with_width(SSH_REMOTE_ENVIRONMENT_MENU_WIDTH)
+                .with_drop_shadow()
+                .prevent_interaction_with_other_elements()
+        });
+        ctx.subscribe_to_view(&menu, |me, _, event, ctx| {
+            if let MenuEvent::Close { .. } = event {
+                me.show_ssh_remote_environment_menu = false;
                 ctx.notify();
             }
         });
@@ -6287,6 +6427,12 @@ impl Workspace {
             LeftPanelEvent::NewConversationInNewTab => {
                 self.add_terminal_tab_with_new_agent_view(ctx);
             }
+            LeftPanelEvent::ConnectSshRemoteHost(host_id) => {
+                self.connect_ssh_remote_host(host_id, ctx);
+            }
+            LeftPanelEvent::DisconnectSshRemoteHost(host_id) => {
+                self.disconnect_ssh_remote_host(host_id, ctx);
+            }
             LeftPanelEvent::ShowDeleteConfirmationDialog {
                 conversation_id,
                 conversation_title,
@@ -6309,6 +6455,57 @@ impl Workspace {
         match event {
             RightPanelEvent::ToggleMaximize => {
                 self.toggle_right_panel_maximized(ctx);
+            }
+            RightPanelEvent::FileTree(file_tree_event) => {
+                let pane_group_event = match file_tree_event {
+                    RightPanelFileTreeEvent::FileRenamed { old_path, new_path } => {
+                        pane_group::Event::FileRenamed { old_path, new_path }
+                    }
+                    RightPanelFileTreeEvent::FileDeleted { path } => {
+                        pane_group::Event::FileDeleted { path }
+                    }
+                    RightPanelFileTreeEvent::AttachPathAsContext { path } => {
+                        pane_group::Event::AttachPathAsContext { path }
+                    }
+                    RightPanelFileTreeEvent::CDToDirectory { path } => {
+                        pane_group::Event::CDToDirectory { path }
+                    }
+                    RightPanelFileTreeEvent::OpenDirectoryInNewTab { path } => {
+                        pane_group::Event::OpenDirectoryInNewTab { path }
+                    }
+                };
+                let pane_group = self.active_tab_pane_group().clone();
+                self.handle_file_tree_event(pane_group, &pane_group_event, ctx);
+            }
+            RightPanelEvent::OpenFileFromFileManager {
+                location,
+                target,
+                line_col,
+            } => {
+                let code_source = CodeSource::FileTree {
+                    location: location.clone(),
+                };
+                match location {
+                    LocalOrRemotePath::Local(path) => {
+                        self.open_file_with_target(
+                            path.clone(),
+                            target,
+                            line_col,
+                            code_source,
+                            ctx,
+                        );
+                    }
+                    LocalOrRemotePath::Remote(_) => {
+                        self.open_code(
+                            code_source,
+                            EditorLayout::SplitPane,
+                            line_col,
+                            false,
+                            &[],
+                            ctx,
+                        );
+                    }
+                }
             }
             RightPanelEvent::OpenFileWithTarget {
                 path,
@@ -6354,6 +6551,13 @@ impl Workspace {
                     );
                 }
             },
+            RightPanelEvent::AttachBrowserSelectionAsContext { text } => {
+                if let Some(terminal_view) = self.active_session_view(ctx) {
+                    terminal_view.update(ctx, |terminal_view, ctx| {
+                        terminal_view.insert_browser_selection_into_agent(text.clone(), ctx);
+                    });
+                }
+            }
             #[cfg(not(target_family = "wasm"))]
             RightPanelEvent::OpenLspLogs { log_path } => {
                 self.open_lsp_logs(&log_path, ctx);
@@ -9063,6 +9267,9 @@ impl Workspace {
             view.set_maximized(new_is_maximized, ctx);
             if should_close {
                 view.close_code_review(ctx);
+                #[cfg(feature = "local_fs")]
+                view.set_active_file_tree_visible(false, ctx);
+                view.hide_browser_host(ctx);
             }
         });
 
@@ -9247,10 +9454,6 @@ impl Workspace {
 
     fn user_menu_items(&self, app: &AppContext) -> Vec<MenuItem<WorkspaceAction>> {
         let mut items = Vec::new();
-        if !self.auth_state.is_anonymous_or_logged_out() {
-            let name = self.auth_state.username_for_display().unwrap_or_default();
-            items.push(MenuItemFields::new(name).with_disabled(true).into_item())
-        }
 
         let appearance = Appearance::as_ref(app);
 
@@ -9326,56 +9529,9 @@ impl Workspace {
                 .into_item(),
         );
 
-        items.extend([
-            MenuItemFields::new("Slack")
-                .with_on_select_action(WorkspaceAction::JoinSlack)
-                .into_item(),
-            MenuItem::Separator,
-        ]);
-
-        if self.auth_state.is_anonymous_or_logged_out() {
-            items.push(
-                MenuItemFields::new("Sign up")
-                    .with_on_select_action(WorkspaceAction::SignupAnonymousUser)
-                    .into_item(),
-            );
-        }
-
-        // Check if the user is on any paid plan to determine whether to show "Billing and Usage" or "Upgrade"
-        let is_on_paid_plan = UserWorkspaces::as_ref(app)
-            .current_workspace()
-            .map(|workspace| workspace.billing_metadata.is_user_on_paid_plan())
-            .unwrap_or(false);
-
-        if is_on_paid_plan {
-            items.push(
-                MenuItemFields::new("Billing and usage")
-                    .with_on_select_action(WorkspaceAction::ShowSettingsPage(
-                        SettingsSection::BillingAndUsage,
-                    ))
-                    .into_item(),
-            );
-        } else {
-            items.push(
-                MenuItemFields::new("Upgrade")
-                    .with_on_select_action(WorkspaceAction::ShowUpgrade)
-                    .into_item(),
-            );
-        }
-
-        items.push(
-            MenuItemFields::new("Invite a friend")
-                .with_on_select_action(WorkspaceAction::ShowReferralSettingsPage)
-                .into_item(),
-        );
-
-        if !self.auth_state.is_anonymous_or_logged_out() {
-            items.push(
-                MenuItemFields::new("Log out")
-                    .with_on_select_action(WorkspaceAction::LogOut)
-                    .into_item(),
-            );
-        }
+        items.extend([MenuItemFields::new("Slack")
+            .with_on_select_action(WorkspaceAction::JoinSlack)
+            .into_item()]);
         items
     }
 
@@ -11966,15 +12122,50 @@ impl Workspace {
             DefaultSessionModeBehavior::Apply
         ) && conversation_restoration.is_none()
             && AISettings::as_ref(ctx).default_session_mode(ctx) == DefaultSessionMode::Agent;
+
+        let active_ssh_remote_host = if chosen_shell.is_none() {
+            SshRemoteModel::as_ref(ctx).active_host().cloned()
+        } else {
+            None
+        };
+        let mut effective_shell = chosen_shell;
+        let mut env_vars = HashMap::new();
+        let mut is_ssh_remote_session = false;
+        let mut custom_tab_title = None;
+        if let Some(host) = active_ssh_remote_host {
+            match ssh_remote_terminal_launch(&host, None) {
+                Ok((shell, mut remote_env_vars)) => {
+                    Self::add_cli_agent_api_env_vars_for_ssh_remote_shell(
+                        &host,
+                        &mut remote_env_vars,
+                        ctx,
+                    );
+                    effective_shell = Some(shell);
+                    env_vars = remote_env_vars;
+                    is_ssh_remote_session = true;
+                    custom_tab_title = Some(format!("SSH {}", host.display_name()));
+                }
+                Err(error) => {
+                    log::error!("Failed to prepare SSH remote session: {error}");
+                }
+            }
+        }
+
         #[cfg(feature = "local_tty")]
-        let is_docker_sandbox = chosen_shell
+        let is_docker_sandbox = effective_shell
             .as_ref()
             .is_some_and(AvailableShell::is_docker_sandbox);
         #[cfg(not(feature = "local_tty"))]
         let is_docker_sandbox = {
-            let _ = chosen_shell.as_ref();
+            let _ = effective_shell.as_ref();
             false
         };
+        if !is_ssh_remote_session && !is_docker_sandbox {
+            env_vars.extend(Self::cli_agent_api_shell_env_vars_for_environment(
+                SSH_REMOTE_LOCAL_ENVIRONMENT_ID,
+                ctx,
+            ));
+        }
 
         // If restoring a conversation, use its initial working directory if it exists
         let startup_directory_from_conversation = conversation_restoration
@@ -11983,25 +12174,30 @@ impl Workspace {
             .map(PathBuf::from)
             .filter(|path| path.is_dir());
 
-        let startup_directory = startup_directory_from_conversation.or_else(|| {
-            self.get_new_tab_startup_directory(
-                new_session_source,
-                previous_session_window_id,
-                chosen_shell.as_ref(),
-                ctx,
-            )
-        });
+        let startup_directory = if is_ssh_remote_session {
+            None
+        } else {
+            startup_directory_from_conversation.or_else(|| {
+                self.get_new_tab_startup_directory(
+                    new_session_source,
+                    previous_session_window_id,
+                    effective_shell.as_ref(),
+                    ctx,
+                )
+            })
+        };
 
         self.add_tab_with_pane_layout(
             PanesLayout::SingleTerminal(Box::new(NewTerminalOptions {
-                shell: chosen_shell,
+                shell: effective_shell,
                 initial_directory: startup_directory,
+                env_vars,
                 conversation_restoration,
-                hide_homepage,
+                hide_homepage: hide_homepage || is_ssh_remote_session,
                 ..Default::default()
             })),
             Arc::new(HashMap::new()),
-            None, /*custom_tab_title*/
+            custom_tab_title,
             ctx,
         );
 
@@ -12453,6 +12649,17 @@ impl Workspace {
     }
 
     fn open_agent_session_project_picker(&mut self, ctx: &mut ViewContext<Self>) {
+        if let Some(host) = SshRemoteModel::as_ref(ctx).active_host().cloned() {
+            self.pending_ssh_remote_directory_project_edit = None;
+            self.open_ssh_remote_directory_picker(
+                host,
+                None,
+                SshRemoteDirectoryPickerPurpose::Project,
+                ctx,
+            );
+            return;
+        }
+
         ctx.open_file_picker(
             |result, ctx| match result {
                 Ok(paths) => {
@@ -12483,11 +12690,425 @@ impl Workspace {
 
     fn add_agent_session_project(&mut self, path: &str, ctx: &mut ViewContext<Self>) {
         let path_buf = PathBuf::from(path);
+        if SshRemoteModel::as_ref(ctx).active_host().is_some() {
+            AgentSessionsModel::handle(ctx).update(ctx, |model, ctx| {
+                model.add_project_path(path_buf, ctx);
+            });
+        } else {
+            ProjectManagementModel::handle(ctx).update(ctx, |projects, ctx| {
+                projects.upsert_project(path_buf, ctx);
+            });
+        }
+        self.open_vertical_tabs_panel_if_enabled(ctx);
+        ctx.notify();
+    }
+
+    fn open_agent_session_project_edit_picker(
+        &mut self,
+        project_path: PathBuf,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if let Some(host) = SshRemoteModel::as_ref(ctx).active_host().cloned() {
+            self.pending_ssh_remote_directory_project_edit = Some(project_path.clone());
+            self.open_ssh_remote_directory_picker(
+                host,
+                Some(project_path.to_string_lossy().to_string()),
+                SshRemoteDirectoryPickerPurpose::Project,
+                ctx,
+            );
+            return;
+        }
+
+        ctx.open_file_picker(
+            move |result, ctx| match result {
+                Ok(paths) => {
+                    let Some(path) = paths.into_iter().next() else {
+                        return;
+                    };
+
+                    if let Some(handle) = ctx.handle().upgrade(ctx) {
+                        let old_project_path = project_path.clone();
+                        handle.update(ctx, |workspace, ctx| {
+                            workspace.update_agent_session_project_path(
+                                &old_project_path,
+                                PathBuf::from(path),
+                                ctx,
+                            );
+                        });
+                    }
+                }
+                Err(err) => {
+                    let window_id = ctx.window_id();
+                    ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
+                        toast_stack.add_ephemeral_toast(
+                            DismissibleToast::error(format!("{err}")),
+                            window_id,
+                            ctx,
+                        );
+                    });
+                }
+            },
+            FilePickerConfiguration::new().folders_only(),
+        );
+    }
+
+    fn update_agent_session_project_path(
+        &mut self,
+        old_project_path: &Path,
+        new_project_path: PathBuf,
+        ctx: &mut ViewContext<Self>,
+    ) {
         ProjectManagementModel::handle(ctx).update(ctx, |projects, ctx| {
-            projects.upsert_project(path_buf, ctx);
+            projects.rename_project(old_project_path, new_project_path.clone(), ctx);
+        });
+        AgentSessionsModel::handle(ctx).update(ctx, |model, ctx| {
+            model.move_project_path(old_project_path, new_project_path, ctx);
         });
         self.open_vertical_tabs_panel_if_enabled(ctx);
         ctx.notify();
+    }
+
+    fn open_ssh_remote_directory_picker(
+        &mut self,
+        host: self::ssh_remote::SshRemoteHost,
+        initial_path: Option<String>,
+        purpose: SshRemoteDirectoryPickerPurpose,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        self.ssh_remote_directory_picker_purpose = purpose;
+        self.ssh_remote_directory_picker.update(ctx, |picker, ctx| {
+            picker.open(host, initial_path, ctx);
+        });
+        self.is_ssh_remote_directory_picker_open = true;
+        ctx.focus(&self.ssh_remote_directory_picker);
+        ctx.notify();
+    }
+
+    fn open_ssh_remote_file_explorer(
+        &mut self,
+        initial_path: Option<String>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let Some(host) = SshRemoteModel::as_ref(ctx).active_host().cloned() else {
+            return;
+        };
+        self.pending_ssh_remote_directory_project_edit = None;
+        self.open_ssh_remote_directory_picker(
+            host,
+            initial_path,
+            SshRemoteDirectoryPickerPurpose::Browse,
+            ctx,
+        );
+    }
+
+    fn insert_remote_path_into_active_terminal(
+        &mut self,
+        path: String,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let paths = vec![path];
+        self.active_tab_pane_group().update(ctx, |pane_group, ctx| {
+            if let Some(active_terminal) = pane_group.active_session_view(ctx) {
+                active_terminal.update(ctx, |terminal, ctx| {
+                    terminal.insert_paths_as_user_input(&paths, ctx);
+                });
+            }
+        });
+    }
+
+    fn handle_ssh_remote_directory_picker_event(
+        &mut self,
+        event: &SshRemoteDirectoryPickerEvent,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        match event {
+            SshRemoteDirectoryPickerEvent::Selected(path) => {
+                self.is_ssh_remote_directory_picker_open = false;
+                let purpose = self.ssh_remote_directory_picker_purpose;
+                self.ssh_remote_directory_picker_purpose = SshRemoteDirectoryPickerPurpose::Project;
+                match purpose {
+                    SshRemoteDirectoryPickerPurpose::Project => {
+                        if let Some(old_project_path) =
+                            self.pending_ssh_remote_directory_project_edit.take()
+                        {
+                            self.update_agent_session_project_path(
+                                &old_project_path,
+                                PathBuf::from(path),
+                                ctx,
+                            );
+                        } else {
+                            self.add_agent_session_project(path, ctx);
+                        }
+                    }
+                    SshRemoteDirectoryPickerPurpose::Browse => {
+                        self.pending_ssh_remote_directory_project_edit = None;
+                        self.insert_remote_path_into_active_terminal(path.clone(), ctx);
+                        ctx.notify();
+                    }
+                }
+            }
+            SshRemoteDirectoryPickerEvent::Cancelled => {
+                self.pending_ssh_remote_directory_project_edit = None;
+                self.ssh_remote_directory_picker_purpose = SshRemoteDirectoryPickerPurpose::Project;
+                self.is_ssh_remote_directory_picker_open = false;
+                ctx.notify();
+            }
+        }
+    }
+
+    fn delete_agent_session_project(&mut self, project_path: PathBuf, ctx: &mut ViewContext<Self>) {
+        ProjectManagementModel::handle(ctx).update(ctx, |projects, ctx| {
+            projects.remove_project(&project_path, ctx);
+        });
+        AgentSessionsModel::handle(ctx).update(ctx, |model, ctx| {
+            model.delete_project_sessions(&project_path, ctx);
+        });
+        ctx.notify();
+    }
+
+    fn close_agent_session_terminal_views(
+        &mut self,
+        terminal_view_ids: &[EntityId],
+        ctx: &mut ViewContext<Self>,
+    ) {
+        for terminal_view_id in terminal_view_ids {
+            self.capture_agent_session_transcript(*terminal_view_id, ctx);
+        }
+
+        let mut panes_to_close = Vec::new();
+        for tab in self.tabs.iter() {
+            let pane_group_handle = &tab.pane_group;
+            let pane_group = pane_group_handle.as_ref(ctx);
+            for terminal_view_id in terminal_view_ids {
+                if let Some(pane_id) =
+                    pane_group.find_pane_id_for_terminal_view(*terminal_view_id, ctx)
+                {
+                    if !panes_to_close.iter().any(|(group_id, existing_pane_id)| {
+                        *group_id == pane_group_handle.id() && *existing_pane_id == pane_id
+                    }) {
+                        panes_to_close.push((pane_group_handle.id(), pane_id));
+                    }
+                }
+            }
+        }
+
+        for (pane_group_id, pane_id) in panes_to_close {
+            self.close_pane(pane_group_id, pane_id, ctx);
+        }
+    }
+
+    fn delete_agent_session(&mut self, session_id: &str, ctx: &mut ViewContext<Self>) {
+        let terminal_view_ids =
+            AgentSessionsModel::as_ref(ctx).terminal_view_ids_for_deleted_session(session_id);
+        self.close_agent_session_terminal_views(&terminal_view_ids, ctx);
+        AgentSessionsModel::handle(ctx).update(ctx, |model, ctx| {
+            model.delete_session(session_id, ctx);
+        });
+        ctx.notify();
+    }
+
+    fn disband_agent_session_group(
+        &mut self,
+        parent_session_id: &str,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let terminal_view_ids = AgentSessionsModel::as_ref(ctx)
+            .terminal_view_ids_for_disbanded_group(parent_session_id);
+        self.close_agent_session_terminal_views(&terminal_view_ids, ctx);
+        AgentSessionsModel::handle(ctx).update(ctx, |model, ctx| {
+            model.disband_group(parent_session_id, ctx);
+        });
+        ctx.notify();
+    }
+
+    fn detach_agent_session_terminal_views(
+        &mut self,
+        terminal_view_ids: &[EntityId],
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if terminal_view_ids.is_empty() {
+            return;
+        }
+
+        self.close_agent_session_terminal_views(terminal_view_ids, ctx);
+        AgentSessionsModel::handle(ctx).update(ctx, |model, ctx| {
+            model.detach_terminal_views(terminal_view_ids, ctx);
+        });
+        ctx.notify();
+    }
+
+    fn ssh_remote_host_for_environment_id<V: View>(
+        environment_id: &str,
+        ctx: &mut ViewContext<V>,
+    ) -> Option<self::ssh_remote::SshRemoteHost> {
+        let host_id = ssh_remote_host_id_from_environment_id(environment_id)?;
+        SshRemoteModel::as_ref(ctx).host(host_id).cloned()
+    }
+
+    fn cli_agent_api_env_vars_for_record<V: View>(
+        record: &AgentSessionRecord,
+        ctx: &mut ViewContext<V>,
+    ) -> HashMap<OsString, OsString> {
+        AISettings::as_ref(ctx)
+            .cli_agent_api_environment_vars(record.agent, &record.environment_id)
+            .into_iter()
+            .map(|(key, value)| (OsString::from(key), OsString::from(value)))
+            .collect()
+    }
+
+    fn cli_agent_api_shell_env_vars_for_environment<V: View>(
+        environment_id: &str,
+        ctx: &mut ViewContext<V>,
+    ) -> HashMap<OsString, OsString> {
+        let settings = AISettings::as_ref(ctx);
+        AISettings::cli_agent_api_profile_agents()
+            .into_iter()
+            .flat_map(|agent| settings.cli_agent_api_environment_vars(agent, environment_id))
+            .filter(|(key, value)| {
+                !key.starts_with("AGENTWARP_AGENT_API_") && !value.trim().is_empty()
+            })
+            .map(|(key, value)| (OsString::from(key), OsString::from(value)))
+            .collect()
+    }
+
+    fn add_local_cli_agent_api_usage_log_env_var(env_vars: &mut HashMap<OsString, OsString>) {
+        env_vars.insert(
+            OsString::from("AGENTWARP_AGENT_API_USAGE_LOG"),
+            OsString::from(cli_agent_api_usage_log_path()),
+        );
+    }
+
+    fn should_forward_ssh_remote_agent_api_env_var(key: &str) -> bool {
+        if key.starts_with("AGENTWARP_SSH_") || key.is_empty() {
+            return false;
+        }
+
+        key.starts_with("AGENTWARP_AGENT_API_")
+            || matches!(
+                key,
+                "ANTHROPIC_API_KEY"
+                    | "ANTHROPIC_AUTH_TOKEN"
+                    | "ANTHROPIC_BASE_URL"
+                    | "ANTHROPIC_MODEL"
+                    | "OPENAI_API_KEY"
+                    | "OPENAI_BASE_URL"
+                    | "OPENAI_MODEL"
+                    | "GEMINI_API_KEY"
+                    | "GOOGLE_API_KEY"
+                    | "GOOGLE_GEMINI_BASE_URL"
+                    | "GEMINI_MODEL"
+            )
+            || key
+                .chars()
+                .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+    }
+
+    fn add_ssh_remote_forwarded_env_vars(env_vars: &mut HashMap<OsString, OsString>) {
+        let forwarded_env_vars = env_vars
+            .iter()
+            .filter_map(|(key, value)| {
+                let key = key.to_str()?;
+                if Self::should_forward_ssh_remote_agent_api_env_var(key) {
+                    value
+                        .to_str()
+                        .map(|value| (key.to_owned(), value.to_owned()))
+                } else {
+                    None
+                }
+            })
+            .collect::<HashMap<_, _>>();
+
+        if let Ok(serialized) = serde_json::to_string(&forwarded_env_vars) {
+            env_vars.insert(
+                OsString::from("AGENTWARP_SSH_REMOTE_ENV_JSON"),
+                OsString::from(serialized),
+            );
+        }
+    }
+
+    fn add_cli_agent_api_env_vars_for_ssh_remote_shell<V: View>(
+        host: &self::ssh_remote::SshRemoteHost,
+        env_vars: &mut HashMap<OsString, OsString>,
+        ctx: &mut ViewContext<V>,
+    ) {
+        let environment_id = ssh_remote_environment_id(&host.id);
+        let shell_env_vars =
+            Self::cli_agent_api_shell_env_vars_for_environment(&environment_id, ctx);
+        if shell_env_vars.is_empty() {
+            return;
+        }
+
+        env_vars.extend(shell_env_vars);
+        Self::add_ssh_remote_forwarded_env_vars(env_vars);
+    }
+
+    fn maybe_wrap_agent_api_proxy_command<V: View>(
+        record: &AgentSessionRecord,
+        launch_command: &str,
+        ctx: &mut ViewContext<V>,
+    ) -> String {
+        if record.environment_id != SSH_REMOTE_LOCAL_ENVIRONMENT_ID {
+            let fallback_profile_count = AISettings::as_ref(ctx)
+                .cli_agent_api_fallback_profiles(record.agent, &record.environment_id)
+                .len();
+            if fallback_profile_count < 2 {
+                return launch_command.to_owned();
+            }
+            return format!("agentwarp-agent-api-proxy -- {launch_command}");
+        }
+
+        let fallback_profile_count = AISettings::as_ref(ctx)
+            .cli_agent_api_fallback_profiles(record.agent, &record.environment_id)
+            .len();
+        if fallback_profile_count < 2 {
+            return launch_command.to_owned();
+        }
+
+        #[cfg(not(target_family = "wasm"))]
+        if let Some(helper) = embedded_agent_api_proxy_executable() {
+            return format!(
+                "{} -- {}",
+                shell_words::quote(&helper.to_string_lossy()),
+                launch_command
+            );
+        }
+
+        launch_command.to_owned()
+    }
+
+    fn terminal_options_for_agent_session<V: View>(
+        record: &AgentSessionRecord,
+        ctx: &mut ViewContext<V>,
+    ) -> Result<(NewTerminalOptions, Option<String>), String> {
+        if let Some(host) = Self::ssh_remote_host_for_environment_id(&record.environment_id, ctx) {
+            let (shell, mut env_vars) =
+                ssh_remote_terminal_launch(&host, Some(record.project_path.as_path()))?;
+            env_vars.extend(Self::cli_agent_api_env_vars_for_record(record, ctx));
+            Self::add_ssh_remote_forwarded_env_vars(&mut env_vars);
+            Ok((
+                NewTerminalOptions {
+                    shell: Some(shell),
+                    initial_directory: None,
+                    env_vars,
+                    hide_homepage: true,
+                    ssh_remote_host_id: Some(host.id.clone()),
+                    ..Default::default()
+                },
+                Some(format!("SSH {}", host.display_name())),
+            ))
+        } else {
+            let mut env_vars = Self::cli_agent_api_env_vars_for_record(record, ctx);
+            Self::add_local_cli_agent_api_usage_log_env_var(&mut env_vars);
+            Ok((
+                NewTerminalOptions {
+                    initial_directory: Some(record.project_path.clone()),
+                    env_vars,
+                    hide_homepage: true,
+                    ..Default::default()
+                },
+                None,
+            ))
+        }
     }
 
     fn start_agent_session(
@@ -12498,24 +13119,42 @@ impl Workspace {
         launch_command: Option<String>,
         ctx: &mut ViewContext<Self>,
     ) {
-        ProjectManagementModel::handle(ctx).update(ctx, |projects, ctx| {
-            projects.upsert_project(project_path.clone(), ctx);
-        });
-
         let session_id = existing_session_id.unwrap_or_else(|| {
             AgentSessionsModel::handle(ctx).update(ctx, |model, ctx| {
                 model.start_session(project_path.clone(), agent, ctx)
             })
         });
+        let session_record = AgentSessionsModel::as_ref(ctx)
+            .session(&session_id)
+            .cloned();
+
+        let Some(session_record) = session_record else {
+            return;
+        };
+
+        if session_record.environment_id == SSH_REMOTE_LOCAL_ENVIRONMENT_ID {
+            ProjectManagementModel::handle(ctx).update(ctx, |projects, ctx| {
+                projects.upsert_project(session_record.project_path.clone(), ctx);
+            });
+        } else {
+            AgentSessionsModel::handle(ctx).update(ctx, |model, ctx| {
+                model.add_project_path(session_record.project_path.clone(), ctx);
+            });
+        }
+
+        let (terminal_options, custom_tab_title) =
+            match Self::terminal_options_for_agent_session(&session_record, ctx) {
+                Ok(options) => options,
+                Err(error) => {
+                    log::error!("Failed to prepare agent session terminal: {error}");
+                    return;
+                }
+            };
 
         self.add_tab_with_pane_layout(
-            PanesLayout::SingleTerminal(Box::new(NewTerminalOptions {
-                initial_directory: Some(project_path),
-                hide_homepage: true,
-                ..Default::default()
-            })),
+            PanesLayout::SingleTerminal(Box::new(terminal_options)),
             Arc::new(HashMap::new()),
-            None,
+            custom_tab_title,
             ctx,
         );
 
@@ -12525,14 +13164,377 @@ impl Workspace {
                 AgentSessionsModel::handle(ctx).update(ctx, |model, ctx| {
                     model.attach_terminal(&session_id, terminal_view_id, ctx);
                 });
+                Self::seed_cli_agent_session_for_record(terminal_view_id, &session_record, ctx);
                 active_terminal.update(ctx, |terminal, ctx| {
                     let launch_command = launch_command
                         .as_deref()
                         .unwrap_or_else(|| agent.command_prefix());
-                    terminal.execute_command_or_set_pending(launch_command, ctx);
+                    let launch_command = Self::maybe_wrap_agent_api_proxy_command(
+                        &session_record,
+                        launch_command,
+                        ctx,
+                    );
+                    terminal.execute_command_or_set_pending(&launch_command, ctx);
+                    terminal.apply_cli_agent_footer_visibility(true, ctx);
+                    ctx.spawn(
+                        Timer::after(Duration::from_millis(1_200)),
+                        |terminal, _, ctx| {
+                            terminal.apply_cli_agent_footer_visibility(true, ctx);
+                        },
+                    );
                 });
             }
         });
+        ctx.notify();
+    }
+
+    fn start_agent_child_session(
+        &mut self,
+        parent_session_id: String,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let Some(parent_session_id) = AgentSessionsModel::handle(ctx).update(ctx, |model, ctx| {
+            model
+                .start_child_session(&parent_session_id, ctx)
+                .and_then(|child_session_id| model.parent_or_self_session_id(&child_session_id))
+        }) else {
+            return;
+        };
+
+        self.restore_agent_session_group(parent_session_id, ctx);
+    }
+
+    fn start_agent_child_session_from_active(&mut self, ctx: &mut ViewContext<Self>) {
+        let Some(terminal_view_id) = ActiveSession::as_ref(ctx).terminal_view_id(ctx.window_id())
+        else {
+            return;
+        };
+
+        let Some(parent_session_id) = AgentSessionsModel::as_ref(ctx)
+            .records()
+            .iter()
+            .find(|record| {
+                record.terminal_view_id == Some(terminal_view_id)
+                    || record.group_terminal_view_id == Some(terminal_view_id)
+            })
+            .and_then(|record| {
+                AgentSessionsModel::as_ref(ctx).parent_or_self_session_id(&record.id)
+            })
+        else {
+            return;
+        };
+
+        self.start_agent_child_session(parent_session_id, ctx);
+    }
+
+    fn attach_and_launch_agent_session_pane(
+        terminal_view: ViewHandle<TerminalView>,
+        record: &AgentSessionRecord,
+        ctx: &mut ViewContext<PaneGroup>,
+    ) {
+        let terminal_view_id = terminal_view.id();
+        let launch_command = agent_session_restore_command(record);
+        let launch_command = Self::maybe_wrap_agent_api_proxy_command(record, &launch_command, ctx);
+        Self::seed_cli_agent_session_for_record(terminal_view_id, record, ctx);
+        AgentSessionsModel::handle(ctx).update(ctx, |model, ctx| {
+            model.attach_terminal(&record.id, terminal_view_id, ctx);
+        });
+        terminal_view.update(ctx, |terminal, ctx| {
+            terminal.execute_command_or_set_pending(&launch_command, ctx);
+            terminal.apply_cli_agent_footer_visibility(true, ctx);
+            ctx.spawn(
+                Timer::after(Duration::from_millis(1_200)),
+                |terminal, _, ctx| {
+                    terminal.apply_cli_agent_footer_visibility(true, ctx);
+                },
+            );
+        });
+    }
+
+    fn seed_cli_agent_session_for_record<V: View>(
+        terminal_view_id: EntityId,
+        record: &AgentSessionRecord,
+        ctx: &mut ViewContext<V>,
+    ) {
+        let already_tracked = CLIAgentSessionsModel::as_ref(ctx)
+            .session(terminal_view_id)
+            .is_some_and(|session| session.agent == record.agent);
+        if already_tracked {
+            return;
+        }
+
+        let project = record
+            .project_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_owned)
+            .or_else(|| Some(record.title.clone()));
+        let cwd = Some(record.project_path.to_string_lossy().into_owned());
+        let should_auto_toggle_input =
+            *AISettings::as_ref(ctx).auto_open_rich_input_on_cli_agent_start;
+        let remote_host = Self::ssh_remote_host_for_environment_id(&record.environment_id, ctx)
+            .map(|host| host.user_host());
+
+        CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions_model, ctx| {
+            sessions_model.set_session(
+                terminal_view_id,
+                CLIAgentSession {
+                    agent: record.agent,
+                    status: CLIAgentSessionStatus::InProgress,
+                    session_context: CLIAgentSessionContext {
+                        cwd,
+                        project,
+                        session_id: record.agent_session_id.clone(),
+                        ..Default::default()
+                    },
+                    input_state: CLIAgentInputState::Closed,
+                    should_auto_toggle_input,
+                    listener: None,
+                    plugin_version: None,
+                    remote_host,
+                    draft_text: None,
+                    custom_command_prefix: None,
+                    received_rich_notification: false,
+                },
+                ctx,
+            );
+        });
+    }
+
+    fn ensure_agent_session_group_panes(
+        &mut self,
+        parent_session: &AgentSessionRecord,
+        pane_sessions: &[AgentSessionRecord],
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let Some(group_terminal_view_id) = parent_session.group_terminal_view_id else {
+            return;
+        };
+
+        self.active_tab_pane_group()
+            .update(ctx, |pane_group, pane_ctx| {
+                let Some(base_pane_id) =
+                    pane_group.find_pane_id_for_terminal_view(group_terminal_view_id, pane_ctx)
+                else {
+                    return;
+                };
+                let mut base_pane_available = !pane_sessions
+                    .iter()
+                    .any(|record| record.terminal_view_id == Some(group_terminal_view_id));
+                let existing_agent_pane_ids = pane_sessions
+                    .iter()
+                    .filter_map(|record| {
+                        record.terminal_view_id.and_then(|view_id| {
+                            pane_group.find_pane_id_for_terminal_view(view_id, pane_ctx)
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let mut next_pane_index = existing_agent_pane_ids.len();
+                let focused_pane_id = pane_group.focused_pane_id(pane_ctx);
+                let mut split_anchor_pane_id = if existing_agent_pane_ids.contains(&focused_pane_id)
+                {
+                    focused_pane_id
+                } else {
+                    existing_agent_pane_ids
+                        .last()
+                        .copied()
+                        .unwrap_or(base_pane_id)
+                };
+
+                for record in pane_sessions {
+                    if let Some((view_id, pane_id)) = record.terminal_view_id.and_then(|view_id| {
+                        pane_group
+                            .find_pane_id_for_terminal_view(view_id, pane_ctx)
+                            .map(|pane_id| (view_id, pane_id))
+                    }) {
+                        let is_agent_active = CLIAgentSessionsModel::as_ref(pane_ctx)
+                            .session(view_id)
+                            .is_some_and(|session| session.agent == record.agent)
+                            || pane_group
+                                .terminal_view_from_pane_id(pane_id, pane_ctx)
+                                .is_some_and(|terminal_view| {
+                                    terminal_view.as_ref(pane_ctx).is_long_running()
+                                });
+                        if is_agent_active {
+                            continue;
+                        }
+
+                        if let Some(terminal_view) =
+                            pane_group.terminal_view_from_pane_id(pane_id, pane_ctx)
+                        {
+                            Self::attach_and_launch_agent_session_pane(
+                                terminal_view,
+                                record,
+                                pane_ctx,
+                            );
+                        }
+                        continue;
+                    }
+
+                    if base_pane_available {
+                        if let Some(terminal_view) =
+                            pane_group.terminal_view_from_pane_id(base_pane_id, pane_ctx)
+                        {
+                            Self::attach_and_launch_agent_session_pane(
+                                terminal_view,
+                                record,
+                                pane_ctx,
+                            );
+                        }
+                        base_pane_available = false;
+                        split_anchor_pane_id = base_pane_id;
+                        next_pane_index += 1;
+                        continue;
+                    }
+
+                    let direction = if next_pane_index % 2 == 1 {
+                        PaneGroupDirection::Right
+                    } else {
+                        PaneGroupDirection::Down
+                    };
+                    let (terminal_options, _) =
+                        match Self::terminal_options_for_agent_session(record, pane_ctx) {
+                            Ok(options) => options,
+                            Err(error) => {
+                                log::error!(
+                                    "Failed to prepare agent session group pane for {}: {error}",
+                                    record.id
+                                );
+                                continue;
+                            }
+                        };
+                    let pane_id = pane_group.add_session_with_terminal_options(
+                        direction,
+                        Some(split_anchor_pane_id),
+                        terminal_options,
+                        pane_ctx,
+                    );
+                    if let Some(terminal_view) =
+                        pane_group.terminal_view_from_pane_id(pane_id, pane_ctx)
+                    {
+                        Self::attach_and_launch_agent_session_pane(terminal_view, record, pane_ctx);
+                    }
+                    split_anchor_pane_id = pane_id.into();
+                    next_pane_index += 1;
+                }
+            });
+    }
+
+    fn restore_agent_session_group(
+        &mut self,
+        parent_session_id: String,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let Some(project_path) = AgentSessionsModel::as_ref(ctx)
+            .session(&parent_session_id)
+            .map(|record| record.project_path.clone())
+        else {
+            return;
+        };
+
+        AgentSessionsModel::handle(ctx).update(ctx, |model, ctx| {
+            model.resolve_missing_agent_session_ids_for_project(&project_path, ctx);
+        });
+
+        let parent_session_id = AgentSessionsModel::as_ref(ctx)
+            .parent_or_self_session_id(&parent_session_id)
+            .unwrap_or(parent_session_id);
+        let sessions =
+            AgentSessionsModel::as_ref(ctx).group_sessions_for_session(&parent_session_id);
+        if sessions.is_empty() {
+            return;
+        }
+
+        if sessions.len() == 1 {
+            self.restore_agent_session(&sessions[0].id, ctx);
+            return;
+        }
+
+        let parent_session = sessions[0].clone();
+        let pane_sessions = sessions.clone();
+        if pane_sessions.is_empty() {
+            self.restore_agent_session(&parent_session.id, ctx);
+            return;
+        }
+
+        for terminal_view_id in pane_sessions
+            .iter()
+            .filter_map(|record| record.terminal_view_id)
+        {
+            self.capture_agent_session_transcript(terminal_view_id, ctx);
+        }
+
+        if let Some(group_terminal_view_id) = parent_session.group_terminal_view_id {
+            if self.focus_terminal_view_locally(group_terminal_view_id, ctx) {
+                self.ensure_agent_session_group_panes(&parent_session, &pane_sessions, ctx);
+                return;
+            }
+            if self.focus_terminal_view_in_other_window(group_terminal_view_id, ctx) {
+                return;
+            }
+        }
+
+        if let Some(parent_terminal_view_id) = parent_session.terminal_view_id {
+            if self.focus_terminal_view_locally(parent_terminal_view_id, ctx) {
+                AgentSessionsModel::handle(ctx).update(ctx, |model, ctx| {
+                    model.attach_group_terminal(&parent_session.id, parent_terminal_view_id, ctx);
+                });
+                let mut parent_with_group_terminal = parent_session.clone();
+                parent_with_group_terminal.group_terminal_view_id = Some(parent_terminal_view_id);
+                self.ensure_agent_session_group_panes(
+                    &parent_with_group_terminal,
+                    &pane_sessions,
+                    ctx,
+                );
+                return;
+            }
+            if self.focus_terminal_view_in_other_window(parent_terminal_view_id, ctx) {
+                AgentSessionsModel::handle(ctx).update(ctx, |model, ctx| {
+                    model.attach_group_terminal(&parent_session.id, parent_terminal_view_id, ctx);
+                });
+                return;
+            }
+        }
+
+        let (terminal_options, _) =
+            match Self::terminal_options_for_agent_session(&parent_session, ctx) {
+                Ok(options) => options,
+                Err(error) => {
+                    log::error!("Failed to prepare agent session group terminal: {error}");
+                    return;
+                }
+            };
+        self.add_tab_with_pane_layout(
+            PanesLayout::SingleTerminal(Box::new(terminal_options)),
+            Arc::new(HashMap::new()),
+            Some(agent_session_group_title(&parent_session)),
+            ctx,
+        );
+
+        let mut new_group_terminal_view_id = None;
+        self.active_tab_pane_group().update(ctx, |pane_group, ctx| {
+            if let Some(active_terminal) = pane_group.active_session_view(ctx) {
+                let terminal_view_id = active_terminal.id();
+                new_group_terminal_view_id = Some(terminal_view_id);
+                AgentSessionsModel::handle(ctx).update(ctx, |model, ctx| {
+                    model.attach_group_terminal(&parent_session.id, terminal_view_id, ctx);
+                });
+                Self::attach_and_launch_agent_session_pane(active_terminal, &parent_session, ctx);
+            }
+        });
+        if let Some(group_terminal_view_id) = new_group_terminal_view_id {
+            let mut parent_with_group_terminal = parent_session.clone();
+            parent_with_group_terminal.group_terminal_view_id = Some(group_terminal_view_id);
+            let mut pane_sessions_with_first_terminal = pane_sessions.clone();
+            if let Some(first_pane_session) = pane_sessions_with_first_terminal.first_mut() {
+                first_pane_session.terminal_view_id = Some(group_terminal_view_id);
+            }
+            self.ensure_agent_session_group_panes(
+                &parent_with_group_terminal,
+                &pane_sessions_with_first_terminal,
+                ctx,
+            );
+        }
         ctx.notify();
     }
 
@@ -12548,7 +13550,8 @@ impl Workspace {
         if let Some(terminal_view_id) = record.terminal_view_id {
             let is_agent_active = CLIAgentSessionsModel::as_ref(ctx)
                 .session(terminal_view_id)
-                .is_some_and(|session| session.agent == record.agent);
+                .is_some_and(|session| session.agent == record.agent)
+                || self.terminal_view_is_long_running_locally(terminal_view_id, ctx);
 
             if is_agent_active {
                 if self.focus_terminal_view_locally(terminal_view_id, ctx)
@@ -12556,11 +13559,24 @@ impl Workspace {
                 {
                     return;
                 }
-            } else if self.restore_agent_session_in_existing_terminal(
-                &record,
-                terminal_view_id,
-                ctx,
-            ) {
+            } else if self.focus_terminal_view_in_other_window(terminal_view_id, ctx) {
+                return;
+            }
+        }
+
+        if let Some(parent_session_id) =
+            AgentSessionsModel::as_ref(ctx).parent_or_self_session_id(session_id)
+        {
+            if parent_session_id != session_id
+                || AgentSessionsModel::as_ref(ctx).has_active_children(&parent_session_id)
+            {
+                self.restore_agent_session_group(parent_session_id, ctx);
+                return;
+            }
+        }
+
+        if let Some(terminal_view_id) = record.terminal_view_id {
+            if self.restore_agent_session_in_existing_terminal(&record, terminal_view_id, ctx) {
                 return;
             }
         }
@@ -12597,8 +13613,16 @@ impl Workspace {
         AgentSessionsModel::handle(ctx).update(ctx, |model, ctx| {
             model.attach_terminal(&record.id, terminal_view_id, ctx);
         });
+        Self::seed_cli_agent_session_for_record(terminal_view_id, record, ctx);
         terminal_view.update(ctx, |terminal, ctx| {
             terminal.execute_command_or_set_pending(&launch_command, ctx);
+            terminal.apply_cli_agent_footer_visibility(true, ctx);
+            ctx.spawn(
+                Timer::after(Duration::from_millis(1_200)),
+                |terminal, _, ctx| {
+                    terminal.apply_cli_agent_footer_visibility(true, ctx);
+                },
+            );
         });
         true
     }
@@ -13897,6 +14921,7 @@ impl Workspace {
     fn close_all_overlays(&mut self, ctx: &mut ViewContext<Self>) {
         self.current_workspace_state.close_all_modals();
         self.close_tab_bar_overflow_menu(ctx);
+        self.close_ssh_remote_environment_menu(ctx);
         self.close_all_chip_menus(ctx);
 
         self.active_tab_pane_group()
@@ -13919,6 +14944,11 @@ impl Workspace {
     }
 
     fn open_require_login_modal(&mut self, variant: AuthViewVariant, ctx: &mut ViewContext<Self>) {
+        if Self::warp_login_disabled() {
+            log::info!("Ignoring require-login modal because Warp login is disabled");
+            return;
+        }
+
         self.require_login_modal.update(ctx, |modal, ctx| {
             modal.set_variant(ctx, variant);
         });
@@ -14396,6 +15426,9 @@ impl Workspace {
                 ctx.notify();
             }
             SettingsViewEvent::SignupAnonymousUser => {
+                if Self::warp_login_disabled() {
+                    return;
+                }
                 self.initiate_user_signup(AnonymousUserSignupEntrypoint::SignUpButton, ctx);
             }
             SettingsViewEvent::Pane(_) | SettingsViewEvent::StartResize => {}
@@ -15487,6 +16520,16 @@ impl Workspace {
                 self.update_active_session(ctx);
                 ctx.notify();
             }
+            pane_group::Event::TerminalPaneClosed { terminal_view_id } => {
+                self.capture_agent_session_transcript(*terminal_view_id, ctx);
+                AgentSessionsModel::handle(ctx).update(ctx, |model, ctx| {
+                    model.detach_terminal_views(&[*terminal_view_id], ctx);
+                });
+                SshRemoteModel::handle(ctx).update(ctx, |model, ctx| {
+                    model.unregister_terminal_host(*terminal_view_id, ctx);
+                });
+                ctx.notify();
+            }
             pane_group::Event::OnboardingTutorialCompleted => {
                 self.pending_session_config_tab_config_chip = false;
                 self.show_session_config_tab_config_chip = false;
@@ -15757,6 +16800,7 @@ impl Workspace {
 
                 // Re-evaluate which region is focused and update pane dimming accordingly.
                 self.update_pane_dimming_for_current_focus_region(ctx);
+                self.update_active_session(ctx);
 
                 let mut active_object_open_in_pane = false;
                 // Case 1: if workflow, get workflow ID via TerminalView input
@@ -16359,6 +17403,9 @@ impl Workspace {
                 });
             }
             pane_group::Event::SignupAnonymousUser { entrypoint } => {
+                if Self::warp_login_disabled() {
+                    return;
+                }
                 self.initiate_user_signup(*entrypoint, ctx);
             }
             pane_group::Event::OpenThemeChooser => {
@@ -16425,6 +17472,9 @@ impl Workspace {
                         left_panel.handle_action_with_force_open(&action, *force_open, ctx);
                     });
                 }
+            }
+            pane_group::Event::OpenSshRemoteFileExplorer { initial_path } => {
+                self.open_ssh_remote_file_explorer(initial_path.clone(), ctx);
             }
             #[cfg(feature = "local_fs")]
             pane_group::Event::OpenFileWithTarget {
@@ -16879,6 +17929,11 @@ impl Workspace {
                 // with that path and re-create models that were just dropped.
             }
         } else {
+            let window_id = ctx.window_id();
+            ActiveSession::handle(ctx).update(ctx, |active_session, ctx| {
+                active_session.set_session_state(window_id, None, None, None, ctx);
+            });
+
             let enablement = CodingPanelEnablementState::from_session_env(
                 file_tree_and_global_search_are_enabled,
                 false,
@@ -17196,7 +18251,8 @@ impl Workspace {
         if self.is_readonly_shared_session_active(ctx) {
             return;
         }
-        if self.auth_state.is_anonymous_or_logged_out()
+        if !Self::warp_login_disabled()
+            && self.auth_state.is_anonymous_or_logged_out()
             && workflow.as_workflow().is_agent_mode_workflow()
         {
             AuthManager::handle(ctx).update(ctx, |auth_manager, ctx| {
@@ -19210,6 +20266,7 @@ impl Workspace {
                         ToolPanelView::GlobalSearch { .. } => "Global search",
                         ToolPanelView::WarpDrive => "Warp Drive",
                         ToolPanelView::ConversationListView => "Agent conversations",
+                        ToolPanelView::SshRemote => "SSH remote",
                     }
                 } else {
                     "Tools panel"
@@ -19264,6 +20321,7 @@ impl Workspace {
                 ToolPanelView::GlobalSearch { .. } => "Global search",
                 ToolPanelView::WarpDrive => "Warp Drive",
                 ToolPanelView::ConversationListView => "Agent conversations",
+                ToolPanelView::SshRemote => "SSH remote",
             }
         } else {
             "Tools panel"
@@ -19292,6 +20350,389 @@ impl Workspace {
         .finish()
     }
 
+    fn render_ssh_remote_button(
+        &self,
+        appearance: &Appearance,
+        ctx: &AppContext,
+    ) -> Box<dyn Element> {
+        let is_active = self.active_tab_pane_group().as_ref(ctx).left_panel_open
+            && self.left_panel_view.as_ref(ctx).active_view() == ToolPanelView::SshRemote;
+        let is_local_environment = SshRemoteModel::as_ref(ctx).active_host().is_none();
+
+        let ssh_remote_button = Container::new(
+            Align::new(
+                self.render_tab_bar_icon_button(
+                    appearance,
+                    if is_active {
+                        icons::Icon::CloudFilled
+                    } else {
+                        icons::Icon::Cloud
+                    },
+                    &self.mouse_states.ssh_remote_icon,
+                    WorkspaceAction::ToggleSshRemote,
+                    "SSH remote".to_string(),
+                    keybinding_name_to_display_string(LEFT_PANEL_SSH_REMOTE_BINDING_NAME, ctx)
+                        .or_else(|| {
+                            keybinding_name_to_display_string(TOGGLE_SSH_REMOTE_BINDING_NAME, ctx)
+                        }),
+                    is_active,
+                    false,
+                )
+                .finish(),
+            )
+            .finish(),
+        )
+        .finish();
+
+        let local_environment_button = Container::new(
+            Align::new(
+                self.render_tab_bar_icon_button(
+                    appearance,
+                    icons::Icon::Laptop,
+                    &self.mouse_states.ssh_remote_local_icon,
+                    WorkspaceAction::SelectSshRemoteEnvironment(
+                        SSH_REMOTE_LOCAL_ENVIRONMENT_ID.to_owned(),
+                    ),
+                    "Local machine".to_string(),
+                    Some(if is_local_environment {
+                        "Current environment".to_string()
+                    } else {
+                        "Switch to local mode".to_string()
+                    }),
+                    is_local_environment,
+                    false,
+                )
+                .finish(),
+            )
+            .finish(),
+        )
+        .finish();
+
+        SavePosition::new(
+            Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_child(ssh_remote_button)
+                .with_child(local_environment_button)
+                .finish(),
+            "workspace:ssh_remote_button",
+        )
+        .finish()
+    }
+
+    fn ssh_remote_environment_menu_items(
+        &self,
+        ctx: &mut ViewContext<Self>,
+    ) -> Vec<MenuItem<WorkspaceAction>> {
+        let (hosts, active_host_id) = {
+            let model = SshRemoteModel::as_ref(ctx);
+            (
+                model.hosts().to_vec(),
+                model.active_host().map(|host| host.id.clone()),
+            )
+        };
+        let local_active = active_host_id.is_none();
+
+        let mut local_item = MenuItemFields::new_with_stacked_label("local", "Local machine")
+            .with_icon(icons::Icon::Laptop)
+            .with_on_select_action(WorkspaceAction::SelectSshRemoteEnvironment(
+                SSH_REMOTE_LOCAL_ENVIRONMENT_ID.to_owned(),
+            ))
+            .with_disabled(local_active);
+        if local_active {
+            local_item = local_item.with_key_shortcut_label(Some("Active"));
+        }
+
+        let mut items = vec![local_item.into_item()];
+
+        if !hosts.is_empty() {
+            items.push(MenuItem::Separator);
+        }
+
+        for host in hosts {
+            let status = SshRemoteModel::as_ref(ctx).connection_status(&host.id);
+            let is_active = active_host_id.as_deref() == Some(host.id.as_str());
+            let title = format!("{} @ {}", host.display_name(), host.user_host());
+            let subtitle = match &status {
+                SshRemoteConnectionStatus::Active => "SSH remote - active".to_owned(),
+                SshRemoteConnectionStatus::Connecting => "SSH remote - connecting...".to_owned(),
+                SshRemoteConnectionStatus::Failed(error) => format!("Failed - {error}"),
+                SshRemoteConnectionStatus::Idle => {
+                    if host.remote_shell.trim().is_empty() {
+                        "SSH remote".to_owned()
+                    } else {
+                        format!("SSH remote - {}", host.remote_shell.trim())
+                    }
+                }
+            };
+
+            let mut item = MenuItemFields::new_with_stacked_label(title, subtitle)
+                .with_icon(icons::Icon::Cloud)
+                .with_on_select_action(WorkspaceAction::SelectSshRemoteEnvironment(host.id.clone()))
+                .with_disabled(
+                    is_active || matches!(status, SshRemoteConnectionStatus::Connecting),
+                );
+            if is_active {
+                item = item.with_key_shortcut_label(Some("Active"));
+            } else if matches!(status, SshRemoteConnectionStatus::Connecting) {
+                item = item.with_key_shortcut_label(Some("Connecting"));
+            }
+            items.push(item.into_item());
+        }
+
+        items.push(MenuItem::Separator);
+        items.push(
+            MenuItemFields::new("Manage SSH remotes")
+                .with_icon(icons::Icon::Settings)
+                .with_on_select_action(WorkspaceAction::ToggleSshRemote)
+                .into_item(),
+        );
+
+        items
+    }
+
+    fn open_ssh_remote_environment_menu(&mut self, ctx: &mut ViewContext<Self>) {
+        if self.show_ssh_remote_environment_menu {
+            self.close_ssh_remote_environment_menu(ctx);
+            return;
+        }
+
+        self.close_new_session_dropdown_menu(ctx);
+        self.close_tab_bar_overflow_menu(ctx);
+        self.show_tab_right_click_menu = None;
+        self.show_tab_group_right_click_menu = None;
+        self.show_header_toolbar_context_menu = None;
+
+        let items = self.ssh_remote_environment_menu_items(ctx);
+        self.ssh_remote_environment_menu.update(ctx, |menu, ctx| {
+            menu.set_items(items, ctx);
+            menu.reset_selection(ctx);
+        });
+        self.show_ssh_remote_environment_menu = true;
+        ctx.focus(&self.ssh_remote_environment_menu);
+        ctx.notify();
+    }
+
+    fn select_ssh_remote_environment(&mut self, environment_id: &str, ctx: &mut ViewContext<Self>) {
+        self.close_ssh_remote_environment_menu(ctx);
+        if environment_id == SSH_REMOTE_LOCAL_ENVIRONMENT_ID {
+            self.switch_to_local_environment(ctx);
+        } else {
+            self.connect_ssh_remote_host(environment_id, ctx);
+        }
+    }
+
+    fn terminal_view_environment_id(
+        terminal_view_id: EntityId,
+        ctx: &mut ViewContext<Self>,
+    ) -> String {
+        if let Some(environment_id) =
+            SshRemoteModel::as_ref(ctx).terminal_environment_id(terminal_view_id)
+        {
+            return environment_id;
+        }
+
+        AgentSessionsModel::as_ref(ctx)
+            .records()
+            .iter()
+            .find(|record| {
+                record.terminal_view_id == Some(terminal_view_id)
+                    || record.group_terminal_view_id == Some(terminal_view_id)
+            })
+            .map(|record| record.environment_id.clone())
+            .unwrap_or_else(|| SSH_REMOTE_LOCAL_ENVIRONMENT_ID.to_owned())
+    }
+
+    fn tab_matches_environment(
+        &self,
+        tab_index: usize,
+        environment_id: &str,
+        ctx: &mut ViewContext<Self>,
+    ) -> bool {
+        let Some(tab) = self.tabs.get(tab_index) else {
+            return false;
+        };
+        let terminal_view_ids = {
+            let pane_group = tab.pane_group.as_ref(ctx);
+            pane_group
+                .visible_pane_ids()
+                .into_iter()
+                .filter_map(|pane_id| {
+                    pane_group
+                        .terminal_view_from_pane_id(pane_id, ctx)
+                        .map(|terminal_view| terminal_view.id())
+                })
+                .collect::<Vec<_>>()
+        };
+        let saw_terminal = !terminal_view_ids.is_empty();
+        for terminal_view_id in terminal_view_ids {
+            if Self::terminal_view_environment_id(terminal_view_id, ctx) == environment_id {
+                return true;
+            }
+        }
+
+        !saw_terminal && environment_id == SSH_REMOTE_LOCAL_ENVIRONMENT_ID
+    }
+
+    fn focus_first_tab_for_environment(
+        &mut self,
+        environment_id: &str,
+        ctx: &mut ViewContext<Self>,
+    ) -> bool {
+        let Some(tab_index) = (0..self.tabs.len())
+            .find(|index| self.tab_matches_environment(*index, environment_id, ctx))
+        else {
+            return false;
+        };
+        self.activate_tab_internal(tab_index, ctx);
+        true
+    }
+
+    fn switch_to_local_environment(&mut self, ctx: &mut ViewContext<Self>) {
+        if SshRemoteModel::as_ref(ctx).active_host().is_none() {
+            let _ = self.focus_first_tab_for_environment(SSH_REMOTE_LOCAL_ENVIRONMENT_ID, ctx);
+            return;
+        }
+
+        SshRemoteModel::handle(ctx).update(ctx, |model, ctx| {
+            model.set_active_host(None, ctx);
+        });
+        if self.focus_first_tab_for_environment(SSH_REMOTE_LOCAL_ENVIRONMENT_ID, ctx) {
+            ctx.notify();
+            return;
+        }
+        self.add_new_session_tab_internal_with_default_session_mode_behavior(
+            NewSessionSource::Tab,
+            Some(ctx.window_id()),
+            None,
+            None,
+            true,
+            DefaultSessionModeBehavior::Ignore,
+            ctx,
+        );
+        ctx.notify();
+    }
+
+    fn render_ssh_remote_environment_bar(
+        &self,
+        appearance: &Appearance,
+        ctx: &AppContext,
+    ) -> Option<Box<dyn Element>> {
+        let theme = appearance.theme();
+        let (label, subtitle, icon) = if let Some(host) = SshRemoteModel::as_ref(ctx).active_host()
+        {
+            let label = format!("{} @ {}", host.display_name(), host.user_host());
+            let subtitle = if host.remote_shell.trim().is_empty() {
+                "SSH remote".to_owned()
+            } else {
+                format!("SSH remote - {}", host.remote_shell.trim())
+            };
+            (label, subtitle, icons::Icon::Cloud)
+        } else {
+            (
+                "local".to_owned(),
+                "Local machine".to_owned(),
+                icons::Icon::Laptop,
+            )
+        };
+
+        Some(
+            SavePosition::new(
+                Hoverable::new(
+                    self.mouse_states.ssh_remote_environment_bar.clone(),
+                    move |state| {
+                        let background = if state.is_hovered() {
+                            theme.surface_overlay_2()
+                        } else {
+                            theme.surface_overlay_1()
+                        };
+
+                        Container::new(
+                            Flex::row()
+                                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                                .with_main_axis_size(MainAxisSize::Max)
+                                .with_spacing(8.)
+                                .with_child(
+                                    ConstrainedBox::new(
+                                        icon.to_warpui_icon(
+                                            theme.sub_text_color(theme.background()),
+                                        )
+                                        .finish(),
+                                    )
+                                    .with_width(15.)
+                                    .with_height(15.)
+                                    .finish(),
+                                )
+                                .with_child(
+                                    Shrinkable::new(
+                                        1.,
+                                        Flex::row()
+                                            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                                            .with_spacing(8.)
+                                            .with_child(
+                                                Text::new_inline(
+                                                    label.clone(),
+                                                    appearance.ui_font_family(),
+                                                    12.,
+                                                )
+                                                .with_color(
+                                                    theme
+                                                        .main_text_color(theme.background())
+                                                        .into(),
+                                                )
+                                                .with_style(
+                                                    Properties::default().weight(Weight::Semibold),
+                                                )
+                                                .with_clip(ClipConfig::ellipsis())
+                                                .finish(),
+                                            )
+                                            .with_child(
+                                                Text::new_inline(
+                                                    subtitle.clone(),
+                                                    appearance.ui_font_family(),
+                                                    11.,
+                                                )
+                                                .with_color(
+                                                    theme.sub_text_color(theme.background()).into(),
+                                                )
+                                                .with_clip(ClipConfig::ellipsis())
+                                                .finish(),
+                                            )
+                                            .finish(),
+                                    )
+                                    .finish(),
+                                )
+                                .with_child(
+                                    ConstrainedBox::new(
+                                        icons::Icon::ChevronDown
+                                            .to_warpui_icon(
+                                                theme.sub_text_color(theme.background()),
+                                            )
+                                            .finish(),
+                                    )
+                                    .with_width(14.)
+                                    .with_height(14.)
+                                    .finish(),
+                                )
+                                .finish(),
+                        )
+                        .with_background(background)
+                        .with_border(Border::bottom(1.).with_border_fill(theme.active_ui_detail()))
+                        .with_horizontal_padding(14.)
+                        .with_vertical_padding(5.)
+                        .finish()
+                    },
+                )
+                .with_cursor(Cursor::PointingHand)
+                .on_click(|ctx, _, _| {
+                    ctx.dispatch_typed_action(WorkspaceAction::ToggleSshRemoteEnvironmentMenu);
+                })
+                .finish(),
+                SSH_REMOTE_ENVIRONMENT_BAR_POSITION_ID,
+            )
+            .finish(),
+        )
+    }
+
     fn should_enable_file_tree_and_global_search_for_pane_group(pane_group: &PaneGroup) -> bool {
         pane_group
             .pane_ids()
@@ -19310,130 +20751,25 @@ impl Workspace {
         ctx: &AppContext,
     ) -> Box<dyn Element> {
         let is_active = self.active_tab_pane_group().as_ref(ctx).right_panel_open;
-        let is_enabled = Self::should_enable_file_tree_and_global_search_for_pane_group(
-            self.active_tab_pane_group().as_ref(ctx),
-        );
-        let disable = !is_enabled;
-
-        let theme = appearance.theme();
-        let font_color = if disable {
-            theme.disabled_text_color(theme.background())
-        } else if is_active {
-            theme.main_text_color(theme.background())
-        } else {
-            theme.sub_text_color(theme.background())
-        };
-
-        // Build the button content: Diff icon + optional diff stats
-        let icon = ConstrainedBox::new(icons::Icon::Diff.to_warpui_icon(font_color).finish())
-            .with_width(16.)
-            .with_height(16.)
-            .finish();
-
-        let show_diff_stats = *TabSettings::as_ref(ctx).show_code_review_diff_stats;
-
-        let line_changes = if show_diff_stats {
-            self.active_tab_pane_group()
-                .as_ref(ctx)
-                .active_session_view(ctx)
-                .and_then(|tv| tv.as_ref(ctx).current_diff_line_changes(ctx))
-                .filter(|lc| {
-                    // Only show the stat badge when there are actual line-level changes
-                    // (files_changed alone, e.g. mode-only changes, is not surfaced here).
-                    lc.lines_added > 0 || lc.lines_removed > 0
-                })
-        } else {
-            None
-        };
-
-        let has_stats = line_changes.is_some();
-
-        let mut row = Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Center);
-        row.add_child(icon);
-
-        if let Some(lc) = line_changes {
-            let stat = |value: u32, prefix: &str, color: ColorU| -> Box<dyn Element> {
-                Container::new(
-                    Text::new_inline(format!("{prefix}{value}"), appearance.ui_font_family(), 12.)
-                        .with_color(color)
-                        .with_style(Properties::default().weight(Weight::Semibold))
-                        .finish(),
-                )
-                .with_margin_left(4.)
-                .finish()
-            };
-            row.add_child(stat(lc.lines_added, "+", add_color(appearance)));
-            row.add_child(stat(lc.lines_removed, "-", remove_color(appearance)));
-        }
-
-        let label = row.finish();
-
-        // The diff icon SVG has intrinsic horizontal whitespace in its 14px viewBox: its visible
-        // paths start around x=3 and end around x=11. When stats are shown, equal container padding
-        // makes the gap between the button edge and the visible icon look wider than the gap after
-        // the text. Locally compensate for that artwork padding without changing the shared icon.
-        let (header_padding_left, header_padding_right) =
-            if has_stats { (5., 8.) } else { (4., 4.) };
-        let default_styles = UiComponentStyles {
-            font_color: Some(font_color.into()),
-            font_size: Some(12.),
-            font_weight: Some(Weight::Medium),
-            font_family_id: Some(appearance.ui_font_family()),
-            height: Some(24.),
-            border_radius: Some(CornerRadius::with_all(Radius::Pixels(4.))),
-            border_width: Some(0.),
-            padding: Some(Coords {
-                top: 0.,
-                bottom: 0.,
-                left: header_padding_left,
-                right: header_padding_right,
-            }),
-            ..Default::default()
-        };
-
-        let hover_styles = UiComponentStyles {
-            background: Some(theme.surface_2().into()),
-            ..default_styles
-        };
-
-        let clicked_styles = UiComponentStyles {
-            background: Some(theme.background().into()),
-            ..default_styles
-        };
-
-        let mut button = Button::new(
-            self.mouse_states.right_panel_icon.clone(),
-            default_styles,
-            Some(hover_styles),
-            Some(clicked_styles),
-            None,
-        )
-        .with_custom_label(label);
-
-        if is_active {
-            button = button.active().with_active_styles(UiComponentStyles {
-                background: Some(internal_colors::fg_overlay_3(theme).into()),
-                ..UiComponentStyles::default()
-            });
-        }
-
-        let hoverable = if disable {
-            button.build().disable()
-        } else {
-            button
-                .with_tooltip(self.render_tab_bar_icon_button_tooltip(
-                    appearance,
-                    "Code review panel".to_string(),
-                    keybinding_name_to_display_string("workspace:toggle_right_panel", ctx),
-                ))
-                .build()
-                .on_click(move |ctx, _, _| {
-                    ctx.dispatch_typed_action(WorkspaceAction::ToggleRightPanel);
-                })
-        };
 
         SavePosition::new(
-            Container::new(Align::new(hoverable.finish()).finish()).finish(),
+            Container::new(
+                Align::new(
+                    self.render_tab_bar_icon_button(
+                        appearance,
+                        icons::Icon::Menu,
+                        &self.mouse_states.right_panel_icon,
+                        WorkspaceAction::ToggleRightPanel,
+                        "Right panel".to_string(),
+                        keybinding_name_to_display_string("workspace:toggle_right_panel", ctx),
+                        is_active,
+                        false,
+                    )
+                    .finish(),
+                )
+                .finish(),
+            )
+            .finish(),
             "workspace:right_panel_button",
         )
         .finish()
@@ -19876,6 +21212,7 @@ impl Workspace {
                     self.render_left_toggle_button(appearance, ctx)
                 }
             }
+            HeaderToolbarItemKind::SshRemote => self.render_ssh_remote_button(appearance, ctx),
             HeaderToolbarItemKind::AgentManagement => {
                 self.render_agent_management_view_button(appearance, ctx)
             }
@@ -20039,24 +21376,6 @@ impl Workspace {
                     .with_margin_left(TAB_BAR_PADDING_LEFT)
                     .finish(),
             );
-        }
-
-        if self.auth_state.is_anonymous_or_logged_out()
-            && !FeatureFlag::OpenWarpNewSettingsModes.is_enabled()
-        {
-            if is_web_anonymous_user {
-                target.add_child(
-                    Container::new(self.render_web_anonymous_user_sign_in_button(appearance))
-                        .with_margin_left(8.)
-                        .finish(),
-                );
-            } else {
-                target.add_child(
-                    Container::new(self.render_anonymous_sign_up_user_button(appearance))
-                        .with_margin_left(8.)
-                        .finish(),
-                );
-            }
         }
 
         let zoom_factor = WindowSettings::as_ref(ctx).zoom_level.as_zoom_factor();
@@ -20482,92 +21801,6 @@ impl Workspace {
         .finish()
     }
 
-    fn render_web_anonymous_user_sign_in_button(
-        &self,
-        appearance: &Appearance,
-    ) -> Box<dyn Element> {
-        let default_styles = UiComponentStyles {
-            font_color: Some(appearance.theme().active_ui_text_color().into()),
-            font_size: Some(12.),
-            font_weight: Some(Weight::Light),
-            font_family_id: Some(appearance.ui_font_family()),
-            border_color: None,
-            border_radius: Some(CornerRadius::with_all(Radius::Pixels(5.))),
-            border_width: Some(1.),
-            width: Some(80.),
-            height: Some(24.),
-            ..Default::default()
-        };
-        let hovered_styles = UiComponentStyles {
-            font_color: Some(appearance.theme().accent().into()),
-            border_color: Some(appearance.theme().accent().into()),
-            ..default_styles
-        };
-        let button = appearance
-            .ui_builder()
-            .button_with_custom_styles(
-                ButtonVariant::Text,
-                self.mouse_states.sign_in_button.clone(),
-                default_styles,
-                Some(hovered_styles),
-                Some(hovered_styles),
-                None,
-            )
-            .with_centered_text_label(String::from("Sign up"));
-
-        Align::new(
-            button
-                .build()
-                .on_click(|ctx, _, _| {
-                    ctx.dispatch_typed_action(WorkspaceAction::SignInAnonymousWebUser)
-                })
-                .finish(),
-        )
-        .finish()
-    }
-
-    fn render_anonymous_sign_up_user_button(&self, appearance: &Appearance) -> Box<dyn Element> {
-        let default_styles = UiComponentStyles {
-            font_color: Some(appearance.theme().active_ui_text_color().into()),
-            font_size: Some(12.),
-            font_weight: Some(Weight::Semibold),
-            font_family_id: Some(appearance.ui_font_family()),
-            border_color: Some(appearance.theme().active_ui_text_color().into()),
-            border_radius: Some(CornerRadius::with_all(Radius::Pixels(5.))),
-            border_width: Some(1.),
-            width: Some(80.),
-            height: Some(24.),
-            ..Default::default()
-        };
-        let hovered_styles = UiComponentStyles {
-            font_color: Some(appearance.theme().accent().into()),
-            border_color: Some(appearance.theme().accent().into()),
-            ..default_styles
-        };
-
-        let button = appearance
-            .ui_builder()
-            .button_with_custom_styles(
-                ButtonVariant::Text,
-                self.mouse_states.sign_up_button.clone(),
-                default_styles,
-                Some(hovered_styles),
-                Some(hovered_styles),
-                None,
-            )
-            .with_centered_text_label(String::from("Sign up"));
-
-        Align::new(
-            button
-                .build()
-                .on_click(|ctx, _, _| {
-                    ctx.dispatch_typed_action(WorkspaceAction::SignupAnonymousUser)
-                })
-                .finish(),
-        )
-        .finish()
-    }
-
     fn render_offline_button(&self, appearance: &Appearance) -> Box<dyn Element> {
         let ui_builder = appearance.ui_builder().clone();
 
@@ -20817,6 +22050,9 @@ impl Workspace {
                 .clone();
             let mut prev_panel_added = false;
             for item in config.left_items() {
+                if item == HeaderToolbarItemKind::CodeReview {
+                    continue;
+                }
                 Self::add_panel_with_separator(
                     &mut main_content,
                     &mut prev_panel_added,
@@ -20850,7 +22086,10 @@ impl Workspace {
                     self.render_config_panel_maximized(pane_group, &config, app),
                     app,
                 );
-            } else if !config.contains_item(&HeaderToolbarItemKind::CodeReview) {
+            } else if !config
+                .right_items()
+                .contains(&HeaderToolbarItemKind::CodeReview)
+            {
                 Self::add_panel_with_separator(
                     &mut main_content,
                     &mut prev_panel_added,
@@ -20962,6 +22201,10 @@ impl Workspace {
     }
 
     fn render_reauth_banner_element(&self) -> Option<WorkspaceBannerFields> {
+        if Self::warp_login_disabled() {
+            return None;
+        }
+
         if self.reauth_banner_dismissed || !self.auth_state.needs_reauth() {
             return None;
         }
@@ -21437,6 +22680,9 @@ impl Workspace {
             let pane_group = self.active_tab_pane_group().as_ref(app);
 
             for item in config.left_items() {
+                if item == HeaderToolbarItemKind::CodeReview {
+                    continue;
+                }
                 Self::add_panel_with_separator(
                     &mut panels_view,
                     &mut prev_panel_added,
@@ -21492,7 +22738,10 @@ impl Workspace {
                     self.render_config_panel_maximized(pane_group, &config, app),
                     app,
                 );
-            } else if !config.contains_item(&HeaderToolbarItemKind::CodeReview) {
+            } else if !config
+                .right_items()
+                .contains(&HeaderToolbarItemKind::CodeReview)
+            {
                 Self::add_panel_with_separator(
                     &mut panels_view,
                     &mut prev_panel_added,
@@ -21590,6 +22839,26 @@ impl Workspace {
             }
             HeaderToolbarItemKind::ToolsPanel => {
                 if !pane_group.left_panel_open || warpui::platform::is_mobile_device() {
+                    return None;
+                }
+                let ssh_remote_item_is_configured = config
+                    .left_items()
+                    .contains(&HeaderToolbarItemKind::SshRemote)
+                    || config
+                        .right_items()
+                        .contains(&HeaderToolbarItemKind::SshRemote);
+                if ssh_remote_item_is_configured
+                    && self.left_panel_view.as_ref(app).active_view() == ToolPanelView::SshRemote
+                {
+                    return None;
+                }
+                Some(ChildView::new(&self.left_panel_view).finish())
+            }
+            HeaderToolbarItemKind::SshRemote => {
+                if !pane_group.left_panel_open
+                    || warpui::platform::is_mobile_device()
+                    || self.left_panel_view.as_ref(app).active_view() != ToolPanelView::SshRemote
+                {
                     return None;
                 }
                 Some(ChildView::new(&self.left_panel_view).finish())
@@ -22301,11 +23570,20 @@ impl Workspace {
         UserWorkspaces::as_ref(app).current_team_uid()
     }
 
+    fn warp_login_disabled() -> bool {
+        cfg!(feature = "skip_login") || FeatureFlag::SkipFirebaseAnonymousUser.is_enabled()
+    }
+
     fn initiate_user_signup(
         &mut self,
         entrypoint: AnonymousUserSignupEntrypoint,
         ctx: &mut ViewContext<Self>,
     ) {
+        if Self::warp_login_disabled() {
+            log::info!("Ignoring user signup because Warp login is disabled");
+            return;
+        }
+
         if self.auth_state.is_user_anonymous().unwrap_or_default() {
             // User has a Firebase anonymous account — use the linking flow.
             AuthManager::handle(ctx).update(ctx, |auth_manager, ctx| {
@@ -22322,26 +23600,6 @@ impl Workspace {
             auth_modal.skip_to_browser_open_step(ctx);
         });
         self.open_require_login_modal(AuthViewVariant::RequireLoginCloseable, ctx);
-    }
-
-    fn redirect_to_sign_in(&mut self) {
-        #[cfg(target_family = "wasm")]
-        if let Some(current_url) = parse_current_url() {
-            update_browser_url(
-                Url::parse(&format!(
-                    "{}/login?redirect_to={}",
-                    ChannelState::server_root_url(),
-                    current_url.path()
-                ))
-                .ok(),
-                true,
-            );
-        } else {
-            update_browser_url(
-                Url::parse(&format!("{}/login", ChannelState::server_root_url())).ok(),
-                true,
-            );
-        }
     }
 
     /// Triggers the necessary cleanup for when a user logs out.
@@ -22413,6 +23671,86 @@ impl Workspace {
         }
     }
 
+    fn connect_ssh_remote_host(&mut self, host_id: &str, ctx: &mut ViewContext<Self>) {
+        let Some(host) = SshRemoteModel::as_ref(ctx).host(host_id).cloned() else {
+            return;
+        };
+        if SshRemoteModel::as_ref(ctx)
+            .active_host()
+            .is_some_and(|host| host.id == host_id)
+        {
+            let environment_id = ssh_remote_environment_id(host_id);
+            let _ = self.focus_first_tab_for_environment(&environment_id, ctx);
+            return;
+        }
+        SshRemoteModel::handle(ctx).update(ctx, |model, ctx| {
+            model.set_host_connecting(host_id, ctx);
+        });
+
+        let host_id = host.id.clone();
+        ctx.spawn(
+            verify_embedded_ssh_connection(host.clone()),
+            move |workspace, result, ctx| match result {
+                Ok(()) => workspace.finish_ssh_remote_connection(host.clone(), ctx),
+                Err(error) => {
+                    log::warn!("SSH remote connection failed for {}: {error}", host_id);
+                    SshRemoteModel::handle(ctx).update(ctx, |model, ctx| {
+                        model.set_host_failed(&host_id, error, ctx);
+                    });
+                }
+            },
+        );
+    }
+
+    fn disconnect_ssh_remote_host(&mut self, host_id: &str, ctx: &mut ViewContext<Self>) {
+        let is_active_host = SshRemoteModel::as_ref(ctx)
+            .active_host()
+            .is_some_and(|host| host.id == host_id);
+        if !is_active_host {
+            return;
+        }
+
+        self.switch_to_local_environment(ctx);
+    }
+
+    fn finish_ssh_remote_connection(
+        &mut self,
+        host: self::ssh_remote::SshRemoteHost,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let (shell, mut env_vars) = match ssh_remote_terminal_launch(&host, None) {
+            Ok(launch) => launch,
+            Err(error) => {
+                SshRemoteModel::handle(ctx).update(ctx, |model, ctx| {
+                    model.set_host_failed(&host.id, error, ctx);
+                });
+                return;
+            }
+        };
+        Self::add_cli_agent_api_env_vars_for_ssh_remote_shell(&host, &mut env_vars, ctx);
+
+        SshRemoteModel::handle(ctx).update(ctx, |model, ctx| {
+            model.set_active_host(Some(host.id.clone()), ctx);
+        });
+        let environment_id = ssh_remote_environment_id(&host.id);
+        if self.focus_first_tab_for_environment(&environment_id, ctx) {
+            ctx.notify();
+            return;
+        }
+        self.add_tab_with_pane_layout(
+            PanesLayout::SingleTerminal(Box::new(NewTerminalOptions {
+                shell: Some(shell),
+                env_vars,
+                hide_homepage: true,
+                ssh_remote_host_id: Some(host.id.clone()),
+                ..Default::default()
+            })),
+            Arc::new(HashMap::new()),
+            Some(format!("SSH {}", host.display_name())),
+            ctx,
+        );
+    }
+
     /// Computes the list of available left panel views based on current AI settings and feature flags.
     fn compute_left_panel_views(ctx: &AppContext) -> Vec<ToolPanelView> {
         let mut views = vec![];
@@ -22424,6 +23762,9 @@ impl Workspace {
             && *AISettings::as_ref(ctx).show_conversation_history
         {
             views.push(ToolPanelView::ConversationListView);
+        }
+        if !cfg!(target_family = "wasm") {
+            views.push(ToolPanelView::SshRemote);
         }
         if cfg!(feature = "local_fs")
             && FeatureFlag::GlobalSearch.is_enabled()
@@ -22513,7 +23854,10 @@ impl TypedActionView for Workspace {
         use WorkspaceAction::*;
         let window_id = ctx.window_id();
 
-        if self.auth_state.is_anonymous_or_logged_out() && action.blocked_for_anonymous_user() {
+        if !Self::warp_login_disabled()
+            && self.auth_state.is_anonymous_or_logged_out()
+            && action.blocked_for_anonymous_user()
+        {
             AuthManager::handle(ctx).update(ctx, |auth_manager, ctx| {
                 auth_manager.attempt_login_gated_feature(
                     action.into(),
@@ -22907,11 +24251,7 @@ impl TypedActionView for Workspace {
             }
             AutoupdateFailureLink => self.open_autoupdate_failure_link(ctx),
             ApplyUpdate => self.apply_update(ctx),
-            LogOut => {
-                // Need to dispatch global action, or else we will not be able to retrieve
-                // the currently active session in the log out modal.
-                ctx.dispatch_global_action("app:maybe_log_out", ());
-            }
+            LogOut => {}
             ExportAllWarpDriveObjects => {
                 self.export_all_warp_drive_objects(ctx);
             }
@@ -22944,6 +24284,10 @@ impl TypedActionView for Workspace {
                 source,
             } => self.toggle_palette(*palette_mode, *source, ctx),
             ShowUpgrade => {
+                if Self::warp_login_disabled() {
+                    return;
+                }
+
                 send_telemetry_from_ctx!(TelemetryEvent::UserMenuUpgradeClicked, ctx);
 
                 let auth_state = AuthStateProvider::as_ref(ctx).get();
@@ -22958,9 +24302,7 @@ impl TypedActionView for Workspace {
 
                 ctx.open_url(&upgrade_url);
             }
-            ShowReferralSettingsPage => {
-                self.show_settings_with_section(Some(SettingsSection::Referrals), ctx);
-            }
+            ShowReferralSettingsPage => {}
             JoinSlack => self.join_slack(ctx),
             ViewUserDocs => self.view_user_docs(ctx),
             ViewLatestChangelog => self.view_latest_changelog(ctx),
@@ -23265,6 +24607,11 @@ impl TypedActionView for Workspace {
             SetVerticalTabsPanelMode(mode) => {
                 self.vertical_tabs_panel.panel_mode = *mode;
                 self.vertical_tabs_panel.show_settings_popup = false;
+                ctx.notify();
+            }
+            ToggleAgentTerminalTabsCollapsed => {
+                self.vertical_tabs_panel.agent_terminal_group_collapsed =
+                    !self.vertical_tabs_panel.agent_terminal_group_collapsed;
                 ctx.notify();
             }
             ToggleNotificationMailbox { select_first } => {
@@ -23687,18 +25034,17 @@ impl TypedActionView for Workspace {
                 send_telemetry_from_ctx!(TelemetryEvent::DisableInputSync, ctx);
             }
             Reauth => {
+                if Self::warp_login_disabled() {
+                    log::info!("Ignoring reauth action because Warp login is disabled");
+                    return;
+                }
                 AuthManager::handle(ctx).update(ctx, |auth_manager, ctx| {
                     let sign_in_url = auth_manager.sign_in_url();
                     ctx.open_url(&sign_in_url);
                 });
                 send_telemetry_from_ctx!(TelemetryEvent::InitiateReauth, ctx);
             }
-            SignupAnonymousUser => {
-                self.initiate_user_signup(AnonymousUserSignupEntrypoint::SignUpButton, ctx);
-            }
-            SignInAnonymousWebUser => {
-                self.redirect_to_sign_in();
-            }
+            SignupAnonymousUser | SignInAnonymousWebUser => {}
             HandleConflictingWorkflow(workflow_id) => {
                 self.toast_stack.update(ctx, |view, ctx| {
                     view.dismiss_older_toasts(&workflow_id.uid(), ctx);
@@ -23828,6 +25174,10 @@ impl TypedActionView for Workspace {
                 ctx.notify();
             }
             AttemptLoginGatedAIUpgrade => {
+                if Self::warp_login_disabled() {
+                    return;
+                }
+
                 AuthManager::handle(ctx).update(ctx, |auth_manager, ctx| {
                     auth_manager.attempt_login_gated_feature(
                         "Upgrade AI Usage",
@@ -24029,14 +25379,50 @@ impl TypedActionView for Workspace {
             OpenAgentSessionProjectPicker => {
                 self.open_agent_session_project_picker(ctx);
             }
+            EditAgentSessionProject { project_path } => {
+                self.open_agent_session_project_edit_picker(project_path.clone(), ctx);
+            }
+            DeleteAgentSessionProject { project_path } => {
+                self.delete_agent_session_project(project_path.clone(), ctx);
+            }
+            DeleteAgentSession { session_id } => {
+                self.delete_agent_session(session_id, ctx);
+            }
+            DisbandAgentSessionGroup { parent_session_id } => {
+                self.disband_agent_session_group(parent_session_id, ctx);
+            }
+            DetachAgentSessionTerminalViews { terminal_view_ids } => {
+                self.detach_agent_session_terminal_views(terminal_view_ids, ctx);
+            }
             StartAgentSession {
                 project_path,
                 agent,
+                reasoning_effort,
             } => {
-                self.start_agent_session(project_path.clone(), *agent, None, None, ctx);
+                let launch_command = AISettings::as_ref(ctx)
+                    .apply_cli_agent_builtin_prompt_to_launch_command(
+                        *agent,
+                        agent.command_with_reasoning_effort(*reasoning_effort),
+                    );
+                self.start_agent_session(
+                    project_path.clone(),
+                    *agent,
+                    None,
+                    Some(launch_command),
+                    ctx,
+                );
+            }
+            StartAgentChildSession { parent_session_id } => {
+                self.start_agent_child_session(parent_session_id.clone(), ctx);
+            }
+            StartAgentChildSessionFromActive => {
+                self.start_agent_child_session_from_active(ctx);
             }
             RestoreAgentSession { session_id } => {
                 self.restore_agent_session(session_id, ctx);
+            }
+            RestoreAgentSessionGroup { parent_session_id } => {
+                self.restore_agent_session_group(parent_session_id.clone(), ctx);
             }
             OpenTabConfigRepoPicker { param_index } => {
                 self.open_repo_picker_for_tab_config_modal(*param_index, ctx);
@@ -24527,6 +25913,18 @@ impl TypedActionView for Workspace {
                     );
                 }
             }
+            ToggleSshRemote => {
+                self.show_ssh_remote_environment_menu = false;
+                let is_showing =
+                    self.left_panel_view.as_ref(ctx).active_view() == ToolPanelView::SshRemote;
+                self.toggle_left_panel_view(&LeftPanelAction::SshRemote, is_showing, ctx);
+            }
+            ToggleSshRemoteEnvironmentMenu => {
+                self.open_ssh_remote_environment_menu(ctx);
+            }
+            SelectSshRemoteEnvironment(environment_id) => {
+                self.select_ssh_remote_environment(environment_id, ctx);
+            }
             ShowRewindConfirmationDialog {
                 ai_block_view_id,
                 exchange_id,
@@ -24790,7 +26188,7 @@ impl View for Workspace {
             context.set.insert("WarpDrive_BelongsToTeam");
         }
 
-        if self.auth_state.is_anonymous_or_logged_out() {
+        if !Self::warp_login_disabled() && self.auth_state.is_anonymous_or_logged_out() {
             context.set.insert("IsAnonymousUser");
         }
 
@@ -24906,6 +26304,9 @@ impl View for Workspace {
             if tab_bar_mode == ShowTabBar::Stacked {
                 outer_column.add_child(self.render_tab_bar(self.tab_fixed_width, appearance, app));
             }
+            if let Some(environment_bar) = self.render_ssh_remote_environment_bar(appearance, app) {
+                outer_column.add_child(environment_bar);
+            }
             let content = self.render_banner_and_active_tab(app, appearance);
             // Hide the vertical tab rail for simplified WASM views (notebooks, shared sessions, etc.)
             let panels_row = self.render_panels(app, Shrinkable::new(1.0, content).finish(), true);
@@ -24917,6 +26318,9 @@ impl View for Workspace {
             let mut outer_column = Flex::column();
             if tab_bar_mode == ShowTabBar::Stacked {
                 outer_column.add_child(self.render_tab_bar(self.tab_fixed_width, appearance, app));
+            }
+            if let Some(environment_bar) = self.render_ssh_remote_environment_bar(appearance, app) {
+                outer_column.add_child(environment_bar);
             }
             let content = self.render_banner_and_active_tab(app, appearance);
             let panels_row = self.render_panels(app, Shrinkable::new(1.0, content).finish(), false);
@@ -25088,6 +26492,19 @@ impl View for Workspace {
                     position,
                     ParentOffsetBounds::WindowByPosition,
                     ParentAnchor::TopLeft,
+                    ChildAnchor::TopLeft,
+                ),
+            );
+        }
+
+        if self.show_ssh_remote_environment_menu {
+            stack.add_positioned_overlay_child(
+                ChildView::new(&self.ssh_remote_environment_menu).finish(),
+                OffsetPositioning::offset_from_save_position_element(
+                    SSH_REMOTE_ENVIRONMENT_BAR_POSITION_ID,
+                    vec2f(14., 4.),
+                    PositionedElementOffsetBounds::WindowByPosition,
+                    PositionedElementAnchor::BottomLeft,
                     ChildAnchor::TopLeft,
                 ),
             );
@@ -25779,6 +27196,37 @@ impl View for Workspace {
 
         if let Some(create_auth_secret_modal) = &self.create_auth_secret_modal {
             stack.add_child(ChildView::new(create_auth_secret_modal).finish());
+        }
+
+        if self.is_ssh_remote_directory_picker_open {
+            let scrim = ConstrainedBox::new(
+                Container::new(Empty::new().finish())
+                    .with_background_color(ColorU::new(0, 0, 0, 150))
+                    .finish(),
+            )
+            .with_width(10000.)
+            .with_height(10000.)
+            .finish();
+            stack.add_positioned_overlay_child(
+                Dismiss::new(scrim)
+                    .prevent_interaction_with_other_elements()
+                    .finish(),
+                OffsetPositioning::offset_from_parent(
+                    Vector2F::zero(),
+                    ParentOffsetBounds::WindowByPosition,
+                    ParentAnchor::Center,
+                    ChildAnchor::Center,
+                ),
+            );
+            stack.add_positioned_overlay_child(
+                ChildView::new(&self.ssh_remote_directory_picker).finish(),
+                OffsetPositioning::offset_from_parent(
+                    Vector2F::zero(),
+                    ParentOffsetBounds::WindowByPosition,
+                    ParentAnchor::Center,
+                    ChildAnchor::Center,
+                ),
+            );
         }
 
         if FeatureFlag::CreatingSharedSessions.is_enabled()

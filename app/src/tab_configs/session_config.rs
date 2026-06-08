@@ -10,7 +10,7 @@ use super::tab_config::{
 };
 use crate::app_state::{BranchSnapshot, LeafContents, LeafSnapshot, PaneNodeSnapshot};
 use crate::launch_configs::launch_config::SplitDirection;
-use crate::terminal::cli_agent::CLIAgent;
+use crate::terminal::cli_agent::{AgentReasoningEffort, CLIAgent};
 use crate::themes::theme::AnsiColorIdentifier;
 use crate::ui_components::icons::Icon;
 
@@ -65,6 +65,7 @@ pub struct SessionConfigSelection {
     pub directory: PathBuf,
     pub enable_worktree: bool,
     pub autogenerate_worktree_branch_name: bool,
+    pub reasoning_effort: AgentReasoningEffort,
 }
 
 const WORKTREE_BRANCH_PARAM: &str = "worktree_branch_name";
@@ -105,6 +106,22 @@ pub fn build_tab_config(
     enable_worktree: bool,
     autogenerate_worktree_branch_name: bool,
 ) -> TabConfig {
+    build_tab_config_with_reasoning_effort(
+        session_type,
+        directory,
+        enable_worktree,
+        autogenerate_worktree_branch_name,
+        AgentReasoningEffort::Auto,
+    )
+}
+
+pub fn build_tab_config_with_reasoning_effort(
+    session_type: &SessionType,
+    directory: &Path,
+    enable_worktree: bool,
+    autogenerate_worktree_branch_name: bool,
+    reasoning_effort: AgentReasoningEffort,
+) -> TabConfig {
     let mut commands: Vec<String> = Vec::new();
     let mut params = HashMap::new();
     let mut title = None;
@@ -139,7 +156,11 @@ pub fn build_tab_config(
     }
 
     if let Some(prefix) = session_type.command_prefix() {
-        commands.push(prefix.to_string());
+        let command = match session_type {
+            SessionType::CliAgent(agent) => agent.command_with_reasoning_effort(reasoning_effort),
+            _ => prefix.to_string(),
+        };
+        commands.push(command);
     }
 
     let pane_type = match session_type {

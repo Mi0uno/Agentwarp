@@ -91,9 +91,9 @@ use crate::window_settings::{
 use crate::workspace::header_toolbar_editor::HeaderToolbarInlineEditor;
 use crate::workspace::tab_settings::{
     DirectoryTabColor, PreserveActiveTabColor, ShowCodeReviewButton, ShowIndicatorsButton,
-    ShowVerticalTabPanelInRestoredWindows, TabCloseButtonPosition, TabSettings,
-    TabSettingsChangedEvent, UseLatestUserPromptAsConversationTitleInTabNames, UseVerticalTabs,
-    WorkspaceDecorationVisibility,
+    ShowVerticalTabPanelInRestoredWindows, SingletonAgentGroupBehavior, TabCloseButtonPosition,
+    TabSettings, TabSettingsChangedEvent, UseLatestUserPromptAsConversationTitleInTabNames,
+    UseVerticalTabs, WorkspaceDecorationVisibility,
 };
 use crate::workspace::WorkspaceAction;
 use crate::{report_error, report_if_error, send_telemetry_from_ctx, themes};
@@ -502,6 +502,7 @@ pub enum AppearancePageAction {
     SetAppIcon(AppIcon),
     SetCursorType(CursorDisplayType),
     SetWorkspaceDecorationVisibility(WorkspaceDecorationVisibility),
+    SetSingletonAgentGroupBehavior(SingletonAgentGroupBehavior),
     ToggleWorkspaceDecorationVisibility,
     ToggleJumpToBottomOfBlockButton,
     ToggleShowBlockDividers,
@@ -563,6 +564,7 @@ pub struct AppearanceSettingsPageView {
     input_type_radio_state: RadioButtonStateHandle,
     app_icon_dropdown: ViewHandle<Dropdown<AppearancePageAction>>,
     workspace_decorations_dropdown: ViewHandle<Dropdown<AppearancePageAction>>,
+    singleton_agent_group_behavior_dropdown: ViewHandle<Dropdown<AppearancePageAction>>,
     tab_close_button_position_dropdown: ViewHandle<Dropdown<AppearancePageAction>>,
     zoom_level_dropdown: ViewHandle<Dropdown<AppearancePageAction>>,
     zoom_reset_button_mouse_state: MouseStateHandle,
@@ -629,6 +631,9 @@ impl TypedActionView for AppearanceSettingsPageView {
             }
             SetWorkspaceDecorationVisibility(value) => {
                 self.set_workspace_decoration_visibility(*value, ctx)
+            }
+            SetSingletonAgentGroupBehavior(value) => {
+                self.set_singleton_agent_group_behavior(*value, ctx)
             }
             ToggleWorkspaceDecorationVisibility => self.toggle_workspace_decoration_visiblity(ctx),
             ToggleJumpToBottomOfBlockButton => self.toggle_jump_to_bottom_of_block_button(ctx),
@@ -1295,6 +1300,8 @@ impl AppearanceSettingsPageView {
             workspace_decorations_dropdown: Self::build_workspace_decoration_visibility_dropdown(
                 ctx,
             ),
+            singleton_agent_group_behavior_dropdown:
+                Self::build_singleton_agent_group_behavior_dropdown(ctx),
             tab_close_button_position_dropdown: Self::build_tab_close_button_position_dropdown(ctx),
             zoom_level_dropdown: Self::build_zoom_level_dropdown(ctx),
             zoom_reset_button_mouse_state: MouseStateHandle::default(),
@@ -1468,6 +1475,7 @@ impl AppearanceSettingsPageView {
                 tab_settings_widgets.push(Box::new(EditToolbarWidget));
             }
         }
+        tab_settings_widgets.push(Box::new(SingletonAgentGroupBehaviorWidget::default()));
 
         if FeatureFlag::DirectoryTabColors.is_enabled() {
             let add_picker = ctx.add_typed_action_view(DirectoryColorAddPicker::new);
@@ -1650,6 +1658,16 @@ impl AppearanceSettingsPageView {
         match value {
             TabCloseButtonPosition::Right => "Right",
             TabCloseButtonPosition::Left => "Left",
+        }
+    }
+
+    fn singleton_agent_group_behavior_dropdown_item_label(
+        value: SingletonAgentGroupBehavior,
+    ) -> &'static str {
+        match value {
+            SingletonAgentGroupBehavior::Ask => "Ask each time",
+            SingletonAgentGroupBehavior::Disband => "Disband automatically",
+            SingletonAgentGroupBehavior::Keep => "Keep automatically",
         }
     }
 
@@ -2452,6 +2470,19 @@ impl AppearanceSettingsPageView {
         );
     }
 
+    fn set_singleton_agent_group_behavior(
+        &mut self,
+        new_value: SingletonAgentGroupBehavior,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        TabSettings::handle(ctx).update(ctx, |tab_settings, ctx| {
+            report_if_error!(tab_settings
+                .singleton_agent_group_behavior
+                .set_value(new_value, ctx));
+        });
+        ctx.notify();
+    }
+
     fn build_workspace_decoration_visibility_dropdown(
         ctx: &mut ViewContext<Self>,
     ) -> ViewHandle<Dropdown<AppearancePageAction>> {
@@ -2499,6 +2530,49 @@ impl AppearanceSettingsPageView {
             dropdown.set_items(values.into_iter().map(|value| {
                 DropdownItem::new(Self::tab_close_button_position_dropdown_item_label(value), AppearancePageAction::SetTabCloseButtonPosition(value))
             }).collect(), ctx);
+            dropdown.set_selected_by_index(selected_index, ctx);
+
+            dropdown
+        })
+    }
+
+    fn build_singleton_agent_group_behavior_dropdown(
+        ctx: &mut ViewContext<Self>,
+    ) -> ViewHandle<Dropdown<AppearancePageAction>> {
+        ctx.add_typed_action_view(|ctx| {
+            let mut dropdown = Dropdown::new(ctx);
+
+            let values = [
+                SingletonAgentGroupBehavior::Ask,
+                SingletonAgentGroupBehavior::Disband,
+                SingletonAgentGroupBehavior::Keep,
+            ];
+
+            let current_value = *TabSettings::as_ref(ctx)
+                .singleton_agent_group_behavior
+                .value();
+            let selected_index = values
+                .iter()
+                .position(|val| *val == current_value)
+                .unwrap_or_else(|| {
+                    log::error!(
+                        "Could not find current SingletonAgentGroupBehavior value in dropdown option list"
+                    );
+                    0
+                });
+
+            dropdown.set_items(
+                values
+                    .into_iter()
+                    .map(|value| {
+                        DropdownItem::new(
+                            Self::singleton_agent_group_behavior_dropdown_item_label(value),
+                            AppearancePageAction::SetSingletonAgentGroupBehavior(value),
+                        )
+                    })
+                    .collect(),
+                ctx,
+            );
             dropdown.set_selected_by_index(selected_index, ctx);
 
             dropdown
@@ -2568,6 +2642,16 @@ impl AppearanceSettingsPageView {
             });
             self.directory_tab_color_delete_buttons = build_directory_delete_buttons(ctx);
         }
+        let singleton_behavior = *TabSettings::as_ref(ctx)
+            .singleton_agent_group_behavior
+            .value();
+        self.singleton_agent_group_behavior_dropdown
+            .update(ctx, |dropdown, ctx| {
+                dropdown.set_selected_by_action(
+                    AppearancePageAction::SetSingletonAgentGroupBehavior(singleton_behavior),
+                    ctx,
+                );
+            });
         ctx.notify();
     }
 
@@ -4773,6 +4857,39 @@ impl SettingsWidget for UseLatestUserPromptAsConversationTitleInTabNamesWidget {
                 "Show the latest user prompt instead of the generated conversation title for Oz and third-party agent sessions in vertical tabs."
                     .to_string(),
             ),
+        )
+    }
+}
+
+#[derive(Default)]
+struct SingletonAgentGroupBehaviorWidget;
+
+impl SettingsWidget for SingletonAgentGroupBehaviorWidget {
+    type View = AppearanceSettingsPageView;
+
+    fn search_terms(&self) -> &str {
+        "agent session group singleton one session disband remember prompt"
+    }
+
+    fn render(
+        &self,
+        view: &Self::View,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        render_dropdown_item(
+            appearance,
+            "Single-session agent groups",
+            Some("Choose what happens when moving, deleting, or archiving leaves an agent group with one session."),
+            None,
+            LocalOnlyIconState::for_setting(
+                SingletonAgentGroupBehavior::storage_key(),
+                SingletonAgentGroupBehavior::sync_to_cloud(),
+                &mut view.local_only_icon_tooltip_states.borrow_mut(),
+                app,
+            ),
+            None,
+            &view.singleton_agent_group_behavior_dropdown,
         )
     }
 }

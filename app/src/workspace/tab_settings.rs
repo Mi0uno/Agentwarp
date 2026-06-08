@@ -198,6 +198,38 @@ settings::macros::implement_setting_for_enum!(
     feature_flag: warp_core::features::FeatureFlag::DirectoryTabColors,
 );
 
+#[derive(
+    Default,
+    Debug,
+    serde::Serialize,
+    serde::Deserialize,
+    PartialEq,
+    Copy,
+    Clone,
+    schemars::JsonSchema,
+    settings_value::SettingsValue,
+)]
+#[schemars(
+    description = "How Agent Sessions handles a group after it only contains one session.",
+    rename_all = "snake_case"
+)]
+pub enum SingletonAgentGroupBehavior {
+    #[default]
+    Ask,
+    Disband,
+    Keep,
+}
+
+settings::macros::implement_setting_for_enum!(
+    SingletonAgentGroupBehavior,
+    TabSettings,
+    SupportedPlatforms::ALL,
+    SyncToCloud::Never,
+    private: false,
+    toml_path: "agent_sessions.singleton_group_behavior",
+    description: "How Agent Sessions handles a group after it only contains one session.",
+);
+
 impl DirectoryTabColors {
     /// Returns the configured tab color for a directory using longest-prefix matching.
     /// Returns `None` if no configured directory is a prefix of `dir`.
@@ -542,6 +574,7 @@ define_settings_group!(TabSettings, settings: [
     workspace_decoration_visibility: WorkspaceDecorationVisibility,
     close_button_position: TabCloseButtonPosition,
     directory_tab_colors: DirectoryTabColors,
+    singleton_agent_group_behavior: SingletonAgentGroupBehavior,
 ]);
 
 #[cfg(test)]

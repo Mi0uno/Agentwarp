@@ -1,30 +1,52 @@
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
+use anyhow::{anyhow, Context as _};
 use dunce::canonicalize;
+use futures_util::{SinkExt, StreamExt};
+use html5ever::tendril::TendrilSink;
+use html5ever::{parse_document, Attribute};
 use itertools::Itertools;
+use markup5ever_rcdom::{Handle, NodeData, RcDom};
 use pathfinder_color::ColorU;
+use pathfinder_geometry::vector::Vector2F;
+use reqwest::header::CONTENT_TYPE;
+use serde::Deserialize;
+use serde_json::Value;
+use url::Url;
 use warp_core::features::FeatureFlag;
+use warp_core::ui::theme::color::internal_colors;
 use warp_core::ui::Icon;
 use warp_util::path::LineAndColumnArg;
+use warpui::clipboard::ClipboardContent;
 use warpui::elements::{
-    resizable_state_handle, ChildAnchor, ChildView, Clipped, ConstrainedBox, Container,
-    CrossAxisAlignment, DragBarSide, Element, Empty, Flex, MainAxisAlignment, MainAxisSize,
-    MouseStateHandle, ParentElement, PositionedElementAnchor, Resizable, ResizableStateHandle,
+    resizable_state_handle, Align, Border, ChildAnchor, ChildView, Clipped,
+    ClippedScrollStateHandle, ClippedScrollable, ConstrainedBox, Container, CornerRadius,
+    CrossAxisAlignment, DragBarSide, Element, EventContext, Flex, Hoverable, LayoutContext,
+    LiveElement, MainAxisAlignment, MainAxisSize, MouseStateHandle, PaintContext, ParentElement,
+    Point, PositionedElementAnchor, Radius, Resizable, ResizableStateHandle, ScrollbarWidth,
     Shrinkable, Text,
 };
+use warpui::event::DispatchedEvent;
 use warpui::fonts::{Properties, Weight};
 use warpui::keymap::EditableBinding;
 use warpui::platform::Cursor;
-use warpui::ui_components::components::UiComponent;
+use warpui::r#async::Timer;
+use warpui::ui_components::components::{Coords, UiComponent, UiComponentStyles};
 use warpui::{
-    AppContext, Entity, EntityId, ModelHandle, SingletonEntity, TypedActionView, View, ViewContext,
-    ViewHandle, WeakViewHandle,
+    AfterLayoutContext, AppContext, Entity, EntityId, ModelHandle, SingletonEntity, SizeConstraint,
+    TypedActionView, View, ViewContext, ViewHandle, WeakViewHandle, WindowId,
 };
+use websocket::{Message, WebSocket, WebsocketMessage as _};
 
 use crate::ai::agent::AgentReviewCommentBatch;
 use crate::appearance::{Appearance, AppearanceEvent};
 use crate::code::buffer_location::LocalOrRemotePath;
+#[cfg(feature = "local_fs")]
+use crate::code::file_tree::{FileTreeEvent, FileTreeView};
 use crate::code_review::code_review_header::HEADER_BUTTON_PADDING;
 #[cfg(feature = "local_fs")]
 use crate::code_review::code_review_view::CodeReviewAction;
@@ -35,6 +57,7 @@ use crate::code_review::code_review_view::{
 use crate::code_review::diff_state::DiffStateModel;
 use crate::code_review::telemetry_event::CodeReviewContextDestination;
 use crate::drive::panel::{MAX_SIDEBAR_WIDTH_RATIO, MIN_SIDEBAR_WIDTH};
+use crate::editor::{EditorOptions, EditorView, Event as EditorEvent, TextOptions};
 use crate::pane_group::pane::view::header::components::HEADER_EDGE_PADDING;
 use crate::pane_group::pane::view::header::PANE_HEADER_HEIGHT;
 use crate::pane_group::{
@@ -58,6 +81,1017 @@ use crate::view_components::action_button::{NakedTheme, TooltipAlignment};
 use crate::view_components::{Dropdown, DropdownItem};
 use crate::workspace::view::TOGGLE_RIGHT_PANEL_BINDING_NAME;
 use crate::workspace::WorkspaceAction;
+
+const BROWSER_MAX_ELEMENT_CANDIDATES: usize = 80;
+const BROWSER_MAX_ELEMENT_TEXT_CHARS: usize = 500;
+const BROWSER_MAX_CONTEXT_CHARS: usize = 4_000;
+const BROWSER_HOST_REPAINT_INTERVAL: Duration = Duration::from_millis(250);
+const BROWSER_ELEMENT_PICKER_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BrowserHostRect {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+}
+
+#[cfg(all(target_os = "linux", not(target_family = "wasm")))]
+struct ExternalBrowserHost {
+    child: Option<Child>,
+    window_id: Option<String>,
+    reparented_to: Option<String>,
+    current_url: Option<String>,
+    class_name: String,
+    profile_dir: PathBuf,
+    cdp_port: u16,
+    last_rect: Option<BrowserHostRect>,
+    last_sync_at: Option<Instant>,
+    decorations_disabled: bool,
+    hidden: bool,
+}
+
+#[cfg(all(target_os = "linux", not(target_family = "wasm")))]
+impl ExternalBrowserHost {
+    fn new() -> Self {
+        let process_id = std::process::id();
+        Self {
+            child: None,
+            window_id: None,
+            reparented_to: None,
+            current_url: None,
+            class_name: format!("WarpRightPanelBrowser{process_id}"),
+            profile_dir: std::env::temp_dir()
+                .join(format!("warp-right-panel-browser-{process_id}")),
+            cdp_port: 40_000 + (process_id % 20_000) as u16,
+            last_rect: None,
+            last_sync_at: None,
+            decorations_disabled: false,
+            hidden: false,
+        }
+    }
+
+    fn show(&mut self, url: &str, parent_window_id: Option<String>, rect: BrowserHostRect) {
+        if rect.width < 8 || rect.height < 8 {
+            self.hide();
+            return;
+        }
+
+        self.ensure_launched(url);
+
+        let should_sync = self.last_rect != Some(rect)
+            || self.hidden
+            || self
+                .last_sync_at
+                .is_none_or(|last_sync| last_sync.elapsed() >= BROWSER_HOST_REPAINT_INTERVAL);
+        if !should_sync {
+            return;
+        }
+
+        if self.window_id.is_none() {
+            self.window_id = self.find_window_id();
+        }
+
+        let Some(window_id) = self.window_id.clone() else {
+            return;
+        };
+
+        if !self.decorations_disabled {
+            let _ = Command::new("xprop")
+                .args([
+                    "-id",
+                    &window_id,
+                    "-f",
+                    "_MOTIF_WM_HINTS",
+                    "32c",
+                    "-set",
+                    "_MOTIF_WM_HINTS",
+                    "0x2, 0x0, 0x0, 0x0, 0x0",
+                ])
+                .status();
+            self.decorations_disabled = true;
+        }
+
+        if let Some(parent_window_id) = parent_window_id {
+            if self.reparented_to.as_deref() != Some(parent_window_id.as_str()) {
+                let _ = Command::new("xdotool")
+                    .args(["windowreparent", &window_id, &parent_window_id])
+                    .status();
+                self.reparented_to = Some(parent_window_id);
+                self.last_rect = None;
+            }
+        }
+
+        let _ = Command::new("xdotool")
+            .args([
+                "windowmap",
+                &window_id,
+                "windowmove",
+                &window_id,
+                &rect.x.to_string(),
+                &rect.y.to_string(),
+                "windowsize",
+                &window_id,
+                &rect.width.to_string(),
+                &rect.height.to_string(),
+                "windowraise",
+                &window_id,
+            ])
+            .status();
+
+        self.hidden = false;
+        self.last_rect = Some(rect);
+        self.last_sync_at = Some(Instant::now());
+    }
+
+    fn hide(&mut self) {
+        if self.hidden {
+            return;
+        }
+
+        if self.window_id.is_none() {
+            self.window_id = self.find_window_id();
+        }
+
+        if let Some(window_id) = &self.window_id {
+            let _ = Command::new("xdotool")
+                .args(["windowunmap", window_id])
+                .status();
+        }
+
+        self.hidden = true;
+        self.last_rect = None;
+    }
+
+    fn terminate(&mut self) {
+        if self.window_id.is_none() {
+            self.window_id = self.find_window_id();
+        }
+
+        if let Some(window_id) = &self.window_id {
+            let _ = Command::new("xdotool")
+                .args(["windowclose", window_id])
+                .status();
+        }
+
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+
+        self.child = None;
+        self.window_id = None;
+        self.reparented_to = None;
+        self.current_url = None;
+        self.last_rect = None;
+        self.last_sync_at = None;
+        self.decorations_disabled = false;
+        self.hidden = true;
+    }
+
+    fn ensure_launched(&mut self, url: &str) {
+        let child_exited = self
+            .child
+            .as_mut()
+            .is_some_and(|child| child.try_wait().ok().flatten().is_some());
+
+        if child_exited {
+            self.child = None;
+            self.window_id = None;
+            self.reparented_to = None;
+            self.current_url = None;
+            self.decorations_disabled = false;
+        }
+
+        if self.child.is_some() && self.current_url.as_deref() == Some(url) {
+            return;
+        }
+
+        if self.child.is_some() {
+            self.terminate();
+        }
+
+        let _ = std::fs::create_dir_all(&self.profile_dir);
+        let user_data_dir = format!("--user-data-dir={}", self.profile_dir.display());
+        let class_arg = format!("--class={}", self.class_name);
+        let app_arg = format!("--app={url}");
+        let remote_debugging_address = "--remote-debugging-address=127.0.0.1";
+        let remote_debugging_port = format!("--remote-debugging-port={}", self.cdp_port);
+        match Command::new("chromium")
+            .args([
+                user_data_dir.as_str(),
+                remote_debugging_address,
+                remote_debugging_port.as_str(),
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-default-apps",
+                "--disable-session-crashed-bubble",
+                "--disable-infobars",
+                class_arg.as_str(),
+                app_arg.as_str(),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => {
+                self.child = Some(child);
+                self.current_url = Some(url.to_string());
+                self.window_id = None;
+                self.reparented_to = None;
+                self.decorations_disabled = false;
+                self.hidden = false;
+                self.last_sync_at = None;
+            }
+            Err(err) => {
+                log::warn!("failed to launch right-panel browser host: {err}");
+                self.child = None;
+                self.current_url = None;
+            }
+        }
+    }
+
+    fn find_window_id(&self) -> Option<String> {
+        let output = Command::new("xdotool")
+            .args(["search", "--onlyvisible", "--class", &self.class_name])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .last()
+            .map(|line| line.trim().to_string())
+    }
+}
+
+#[cfg(all(target_os = "linux", not(target_family = "wasm")))]
+impl Drop for ExternalBrowserHost {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
+#[cfg(all(target_os = "linux", not(target_family = "wasm")))]
+fn external_browser_host() -> &'static Mutex<ExternalBrowserHost> {
+    static HOST: OnceLock<Mutex<ExternalBrowserHost>> = OnceLock::new();
+    HOST.get_or_init(|| Mutex::new(ExternalBrowserHost::new()))
+}
+
+fn show_external_browser_host(url: &str, parent_window_id: Option<String>, rect: BrowserHostRect) {
+    #[cfg(all(target_os = "linux", not(target_family = "wasm")))]
+    if let Ok(mut host) = external_browser_host().lock() {
+        host.show(url, parent_window_id, rect);
+    }
+
+    #[cfg(not(all(target_os = "linux", not(target_family = "wasm"))))]
+    let _ = (url, parent_window_id, rect);
+}
+
+fn hide_external_browser_host() {
+    #[cfg(all(target_os = "linux", not(target_family = "wasm")))]
+    if let Ok(mut host) = external_browser_host().lock() {
+        host.hide();
+    }
+}
+
+fn external_browser_debugging_port() -> Option<u16> {
+    #[cfg(all(target_os = "linux", not(target_family = "wasm")))]
+    if let Ok(host) = external_browser_host().lock() {
+        return host.child.as_ref().map(|_| host.cdp_port);
+    }
+
+    None
+}
+
+#[derive(Debug, Deserialize)]
+struct BrowserCdpTarget {
+    #[serde(rename = "type")]
+    target_type: String,
+    url: String,
+    #[serde(rename = "webSocketDebuggerUrl")]
+    websocket_debugger_url: Option<String>,
+}
+
+async fn browser_cdp_page_ws_url(port: u16) -> anyhow::Result<String> {
+    let targets = reqwest::get(format!("http://127.0.0.1:{port}/json"))
+        .await?
+        .json::<Vec<BrowserCdpTarget>>()
+        .await?;
+
+    targets
+        .into_iter()
+        .find(|target| {
+            target.target_type == "page"
+                && !target.url.starts_with("devtools://")
+                && target.websocket_debugger_url.is_some()
+        })
+        .and_then(|target| target.websocket_debugger_url)
+        .ok_or_else(|| anyhow!("No debuggable browser page found"))
+}
+
+async fn browser_cdp_evaluate(port: u16, expression: String) -> anyhow::Result<Value> {
+    let ws_url = browser_cdp_page_ws_url(port).await?;
+    let socket = WebSocket::connect(&ws_url, None::<&str>).await?;
+    let (mut sink, mut stream) = socket.split().await;
+    let request_id = 1_u64;
+    let request = serde_json::json!({
+        "id": request_id,
+        "method": "Runtime.evaluate",
+        "params": {
+            "expression": expression,
+            "awaitPromise": false,
+            "returnByValue": true,
+            "userGesture": true,
+        }
+    });
+
+    sink.send(Message::new(request.to_string())).await?;
+    while let Some(message) = stream.next().await {
+        let message = message?;
+        let Some(text) = message.text() else {
+            continue;
+        };
+        let response: Value = serde_json::from_str(text)?;
+        if response.get("id").and_then(Value::as_u64) == Some(request_id) {
+            if let Some(error) = response.get("error") {
+                return Err(anyhow!("CDP Runtime.evaluate failed: {error}"));
+            }
+            return Ok(response);
+        }
+    }
+
+    Err(anyhow!(
+        "CDP connection closed before Runtime.evaluate returned"
+    ))
+}
+
+async fn browser_enable_element_picker(port: u16) -> anyhow::Result<()> {
+    browser_cdp_evaluate(port, BROWSER_ELEMENT_PICKER_SCRIPT.to_string())
+        .await
+        .map(|_| ())
+        .context("failed to enable browser element picker")
+}
+
+async fn browser_disable_element_picker(port: u16) -> anyhow::Result<()> {
+    browser_cdp_evaluate(
+        port,
+        r#"(() => {
+            if (window.__warpDisableElementPicker) {
+                window.__warpDisableElementPicker();
+            }
+            window.__warpSelectedElementContext = null;
+            return true;
+        })()"#
+            .to_string(),
+    )
+    .await
+    .map(|_| ())
+    .context("failed to disable browser element picker")
+}
+
+async fn browser_take_selected_element(port: u16) -> anyhow::Result<Option<String>> {
+    let response = browser_cdp_evaluate(
+        port,
+        r#"(() => {
+            const selected = window.__warpSelectedElementContext || null;
+            if (selected) {
+                window.__warpSelectedElementContext = null;
+            }
+            return selected;
+        })()"#
+            .to_string(),
+    )
+    .await
+    .context("failed to read selected browser element")?;
+
+    Ok(response
+        .pointer("/result/result/value")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned))
+}
+
+const BROWSER_ELEMENT_PICKER_SCRIPT: &str = r#"(() => {
+    if (window.__warpDisableElementPicker) {
+        window.__warpDisableElementPicker();
+    }
+
+    window.__warpSelectedElementContext = null;
+
+    const overlay = document.createElement('div');
+    overlay.style.cssText = [
+        'position: fixed',
+        'z-index: 2147483646',
+        'pointer-events: none',
+        'border: 2px solid #315EFB',
+        'background: rgba(49, 94, 251, 0.10)',
+        'box-sizing: border-box',
+        'display: none'
+    ].join(';');
+
+    const label = document.createElement('div');
+    label.style.cssText = [
+        'position: fixed',
+        'z-index: 2147483647',
+        'pointer-events: none',
+        'max-width: 420px',
+        'padding: 8px 10px',
+        'border-radius: 8px',
+        'background: #202839',
+        'color: white',
+        'font: 12px Arial, sans-serif',
+        'box-shadow: 0 12px 40px rgba(0,0,0,0.30)',
+        'display: none',
+        'white-space: pre-wrap'
+    ].join(';');
+
+    document.documentElement.appendChild(overlay);
+    document.documentElement.appendChild(label);
+
+    function normalizeText(text) {
+        return String(text || '').replace(/\s+/g, ' ').trim();
+    }
+
+    function truncate(text, max) {
+        text = String(text || '');
+        return text.length > max ? text.slice(0, max - 3) + '...' : text;
+    }
+
+    function cssEscape(value) {
+        if (window.CSS && CSS.escape) {
+            return CSS.escape(value);
+        }
+        return String(value).replace(/[^a-zA-Z0-9_-]/g, ch => '\\' + ch);
+    }
+
+    function selectorFor(element) {
+        if (!element || element.nodeType !== Node.ELEMENT_NODE) {
+            return '';
+        }
+        if (element.id) {
+            return '#' + cssEscape(element.id);
+        }
+
+        const parts = [];
+        let current = element;
+        while (current && current.nodeType === Node.ELEMENT_NODE && parts.length < 6) {
+            let part = current.localName;
+            if (current.classList && current.classList.length > 0) {
+                part += '.' + Array.from(current.classList)
+                    .slice(0, 3)
+                    .map(cssEscape)
+                    .join('.');
+            }
+            const parent = current.parentElement;
+            if (parent) {
+                const siblings = Array.from(parent.children)
+                    .filter(child => child.localName === current.localName);
+                if (siblings.length > 1) {
+                    part += `:nth-of-type(${siblings.indexOf(current) + 1})`;
+                }
+            }
+            parts.unshift(part);
+            current = parent;
+        }
+        return parts.join(' > ');
+    }
+
+    function attributesFor(element) {
+        const names = ['id', 'class', 'role', 'aria-label', 'href', 'src', 'type', 'name', 'placeholder'];
+        return names
+            .map(name => {
+                const value = element.getAttribute && element.getAttribute(name);
+                return value ? `${name}="${truncate(normalizeText(value), 180)}"` : null;
+            })
+            .filter(Boolean)
+            .join(', ');
+    }
+
+    function describe(element) {
+        const rect = element.getBoundingClientRect();
+        const tag = element.localName || element.tagName.toLowerCase();
+        const selector = selectorFor(element);
+        const attrs = attributesFor(element) || 'none';
+        const text = truncate(normalizeText(element.innerText || element.textContent || element.getAttribute('aria-label') || ''), 3000);
+        const html = truncate(element.outerHTML || '', 1200);
+        return [
+            'Web page element',
+            `Page: ${document.title || 'Untitled page'}`,
+            `URL: ${location.href}`,
+            `Selector: ${selector}`,
+            `Tag: <${tag}>`,
+            `Bounds: ${Math.round(rect.width)}x${Math.round(rect.height)} at (${Math.round(rect.left)}, ${Math.round(rect.top)})`,
+            `Attributes: ${attrs}`,
+            '',
+            'Text:',
+            text || '(no visible text)',
+            '',
+            'HTML:',
+            html
+        ].join('\n');
+    }
+
+    function show(element) {
+        if (!element || element === overlay || element === label) {
+            return;
+        }
+        const rect = element.getBoundingClientRect();
+        overlay.style.display = 'block';
+        overlay.style.left = `${rect.left}px`;
+        overlay.style.top = `${rect.top}px`;
+        overlay.style.width = `${rect.width}px`;
+        overlay.style.height = `${rect.height}px`;
+
+        label.style.display = 'block';
+        label.textContent = `${element.localName || element.tagName.toLowerCase()}  ${Math.round(rect.width)}x${Math.round(rect.height)}\n${selectorFor(element)}`;
+        const labelX = Math.min(Math.max(8, rect.left), window.innerWidth - 430);
+        const labelY = rect.top > 72 ? rect.top - 64 : rect.bottom + 8;
+        label.style.left = `${labelX}px`;
+        label.style.top = `${Math.max(8, labelY)}px`;
+    }
+
+    function cleanup() {
+        document.removeEventListener('mousemove', onMove, true);
+        document.removeEventListener('click', onClick, true);
+        document.removeEventListener('keydown', onKeyDown, true);
+        overlay.remove();
+        label.remove();
+        window.__warpDisableElementPicker = null;
+    }
+
+    function onMove(event) {
+        show(event.target);
+    }
+
+    function onClick(event) {
+        event.preventDefault();
+        event.stopPropagation();
+        event.stopImmediatePropagation();
+        window.__warpSelectedElementContext = describe(event.target);
+        cleanup();
+        return false;
+    }
+
+    function onKeyDown(event) {
+        if (event.key === 'Escape') {
+            event.preventDefault();
+            event.stopPropagation();
+            cleanup();
+        }
+    }
+
+    window.__warpDisableElementPicker = cleanup;
+    document.addEventListener('mousemove', onMove, true);
+    document.addEventListener('click', onClick, true);
+    document.addEventListener('keydown', onKeyDown, true);
+    return true;
+})()"#;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RightPanelMode {
+    CodeReview,
+    Files,
+    Browser,
+}
+
+impl RightPanelMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::CodeReview => "Review",
+            Self::Files => "Files",
+            Self::Browser => "Browser",
+        }
+    }
+
+    fn icon(self) -> Icon {
+        match self {
+            Self::CodeReview => Icon::Diff,
+            Self::Files => Icon::FileCopy,
+            Self::Browser => Icon::Globe,
+        }
+    }
+}
+
+#[derive(Default)]
+struct ModeButtonMouseStates {
+    code_review: MouseStateHandle,
+    files: MouseStateHandle,
+    browser: MouseStateHandle,
+}
+
+impl ModeButtonMouseStates {
+    fn handle(&self, mode: RightPanelMode) -> MouseStateHandle {
+        match mode {
+            RightPanelMode::CodeReview => self.code_review.clone(),
+            RightPanelMode::Files => self.files.clone(),
+            RightPanelMode::Browser => self.browser.clone(),
+        }
+    }
+}
+
+fn normalize_browser_url(raw_url: &str) -> Option<String> {
+    let trimmed = raw_url.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if trimmed.contains("://") || trimmed.starts_with("about:") {
+        return Some(trimmed.to_string());
+    }
+
+    if trimmed.starts_with('/') {
+        return Some(format!("file://{trimmed}"));
+    }
+
+    if trimmed.starts_with("localhost")
+        || trimmed.starts_with("127.")
+        || trimmed.starts_with("0.0.0.0")
+        || trimmed.starts_with("[::1]")
+    {
+        return Some(format!("http://{trimmed}"));
+    }
+
+    Some(format!("https://{trimmed}"))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BrowserElementCandidate {
+    tag: String,
+    selector: String,
+    text: String,
+    attributes: Vec<(String, String)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BrowserDocument {
+    url: String,
+    title: Option<String>,
+    elements: Vec<BrowserElementCandidate>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum BrowserLoadState {
+    Blank,
+    Loading { url: String },
+    Loaded(BrowserDocument),
+    Error { url: String, message: String },
+}
+
+impl Default for BrowserLoadState {
+    fn default() -> Self {
+        Self::Blank
+    }
+}
+
+struct ExternalBrowserSurfaceElement {
+    window_id: WindowId,
+    url: Option<String>,
+    background: ColorU,
+    size: Option<Vector2F>,
+    origin: Option<Point>,
+}
+
+impl ExternalBrowserSurfaceElement {
+    fn new(window_id: WindowId, url: Option<String>, background: ColorU) -> Self {
+        Self {
+            window_id,
+            url,
+            background,
+            size: None,
+            origin: None,
+        }
+    }
+}
+
+impl Element for ExternalBrowserSurfaceElement {
+    fn layout(
+        &mut self,
+        constraint: SizeConstraint,
+        _ctx: &mut LayoutContext,
+        _app: &AppContext,
+    ) -> Vector2F {
+        let size = constraint.max;
+        self.size = Some(size);
+        size
+    }
+
+    fn after_layout(&mut self, _ctx: &mut AfterLayoutContext, _app: &AppContext) {}
+
+    fn paint(&mut self, origin: Vector2F, ctx: &mut PaintContext, app: &AppContext) {
+        self.origin = Some(Point::from_vec2f(origin, ctx.scene.z_index()));
+        let size = self.size.unwrap_or(Vector2F::zero());
+        ctx.scene
+            .draw_rect_with_hit_recording(pathfinder_geometry::rect::RectF::new(origin, size))
+            .with_background(self.background);
+
+        let Some(url) = self.url.as_deref() else {
+            hide_external_browser_host();
+            return;
+        };
+
+        let Some(window) = app.windows().platform_window(self.window_id) else {
+            hide_external_browser_host();
+            return;
+        };
+
+        let scale = window.backing_scale_factor();
+        let parent_window_id = window.x11_window_id().map(|id| format!("{id:#x}"));
+        let (x, y) = if parent_window_id.is_some() {
+            (origin.x(), origin.y())
+        } else {
+            let window_origin = window.origin();
+            (
+                window_origin.x() + origin.x(),
+                window_origin.y() + origin.y(),
+            )
+        };
+        let rect = BrowserHostRect {
+            x: (x * scale).round() as i32,
+            y: (y * scale).round() as i32,
+            width: (size.x() * scale).round().max(1.) as u32,
+            height: (size.y() * scale).round().max(1.) as u32,
+        };
+        show_external_browser_host(url, parent_window_id, rect);
+        ctx.repaint_after(BROWSER_HOST_REPAINT_INTERVAL);
+    }
+
+    fn size(&self) -> Option<Vector2F> {
+        self.size
+    }
+
+    fn origin(&self) -> Option<Point> {
+        self.origin
+    }
+
+    fn dispatch_event(
+        &mut self,
+        _event: &DispatchedEvent,
+        _ctx: &mut EventContext,
+        _app: &AppContext,
+    ) -> bool {
+        false
+    }
+}
+
+fn normalize_browser_text(text: &str) -> String {
+    text.split_whitespace().join(" ")
+}
+
+fn truncate_browser_text(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+
+    let mut truncated = text
+        .chars()
+        .take(max_chars.saturating_sub(3))
+        .collect::<String>();
+    truncated.push_str("...");
+    truncated
+}
+
+fn browser_attr_value(attrs: &[Attribute], name: &str) -> Option<String> {
+    attrs
+        .iter()
+        .find_map(|attr| (attr.name.local.as_ref() == name).then(|| attr.value.to_string()))
+}
+
+fn browser_attr_summary(attrs: &[Attribute]) -> Vec<(String, String)> {
+    [
+        "id",
+        "class",
+        "role",
+        "aria-label",
+        "href",
+        "src",
+        "type",
+        "name",
+        "placeholder",
+    ]
+    .into_iter()
+    .filter_map(|name| {
+        browser_attr_value(attrs, name).map(|value| {
+            (
+                name.to_string(),
+                truncate_browser_text(&normalize_browser_text(&value), 160),
+            )
+        })
+    })
+    .collect()
+}
+
+fn browser_selector_for(tag: &str, attrs: &[Attribute], fallback_index: usize) -> String {
+    if let Some(id) = browser_attr_value(attrs, "id") {
+        let id = id.trim();
+        if !id.is_empty() {
+            return format!("#{id}");
+        }
+    }
+
+    if let Some(class_names) = browser_attr_value(attrs, "class") {
+        let classes = class_names
+            .split_whitespace()
+            .take(3)
+            .map(|class_name| format!(".{class_name}"))
+            .join("");
+        if !classes.is_empty() {
+            return format!("{tag}{classes}");
+        }
+    }
+
+    format!("{tag}:nth-candidate({fallback_index})")
+}
+
+fn browser_element_text(handle: &Handle) -> String {
+    fn collect_text(handle: &Handle, output: &mut String) {
+        match &handle.data {
+            NodeData::Text { contents } => {
+                output.push_str(&contents.borrow());
+                output.push(' ');
+            }
+            NodeData::Element { name, .. } => {
+                let tag = name.local.to_string();
+                if matches!(
+                    tag.as_str(),
+                    "script" | "style" | "noscript" | "svg" | "head"
+                ) {
+                    return;
+                }
+                for child in handle.children.borrow().iter() {
+                    collect_text(child, output);
+                }
+            }
+            _ => {
+                for child in handle.children.borrow().iter() {
+                    collect_text(child, output);
+                }
+            }
+        }
+    }
+
+    let mut text = String::new();
+    collect_text(handle, &mut text);
+    normalize_browser_text(&text)
+}
+
+fn browser_element_is_candidate(tag: &str, attrs: &[Attribute], text: &str) -> bool {
+    if text.is_empty() {
+        return false;
+    }
+
+    if matches!(
+        tag,
+        "a" | "button"
+            | "input"
+            | "textarea"
+            | "select"
+            | "label"
+            | "summary"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "p"
+            | "li"
+            | "pre"
+            | "code"
+            | "blockquote"
+    ) {
+        return true;
+    }
+
+    browser_attr_value(attrs, "role").is_some()
+        || browser_attr_value(attrs, "aria-label").is_some()
+        || browser_attr_value(attrs, "data-testid").is_some()
+}
+
+fn parse_browser_document(url: String, html: &str) -> BrowserDocument {
+    fn walk(
+        handle: &Handle,
+        title: &mut Option<String>,
+        elements: &mut Vec<BrowserElementCandidate>,
+    ) {
+        let NodeData::Element { name, attrs, .. } = &handle.data else {
+            for child in handle.children.borrow().iter() {
+                walk(child, title, elements);
+            }
+            return;
+        };
+
+        let tag = name.local.to_string();
+        if matches!(tag.as_str(), "script" | "style" | "noscript" | "svg") {
+            return;
+        }
+
+        if tag == "title" {
+            let text = browser_element_text(handle);
+            if !text.is_empty() {
+                *title = Some(truncate_browser_text(&text, 160));
+            }
+        }
+
+        if elements.len() < BROWSER_MAX_ELEMENT_CANDIDATES {
+            let attrs = attrs.borrow();
+            let mut text = browser_element_text(handle);
+
+            if text.is_empty() {
+                text = browser_attr_value(&attrs, "aria-label")
+                    .or_else(|| browser_attr_value(&attrs, "placeholder"))
+                    .or_else(|| browser_attr_value(&attrs, "value"))
+                    .map(|value| normalize_browser_text(&value))
+                    .unwrap_or_default();
+            }
+
+            if browser_element_is_candidate(&tag, &attrs, &text) {
+                let candidate_index = elements.len() + 1;
+                elements.push(BrowserElementCandidate {
+                    tag: tag.clone(),
+                    selector: browser_selector_for(&tag, &attrs, candidate_index),
+                    text: truncate_browser_text(&text, BROWSER_MAX_ELEMENT_TEXT_CHARS),
+                    attributes: browser_attr_summary(&attrs),
+                });
+            }
+        }
+
+        for child in handle.children.borrow().iter() {
+            walk(child, title, elements);
+        }
+    }
+
+    let dom = parse_document(RcDom::default(), Default::default()).one(html.to_string());
+    let mut title = None;
+    let mut elements = Vec::new();
+    walk(&dom.document, &mut title, &mut elements);
+
+    BrowserDocument {
+        url,
+        title,
+        elements,
+    }
+}
+
+async fn load_browser_document(url: String) -> Result<BrowserDocument, String> {
+    let parsed_url = Url::parse(&url).map_err(|err| format!("Invalid URL: {err}"))?;
+    let html = match parsed_url.scheme() {
+        "http" | "https" => {
+            let client = http_client::Client::new();
+            let response = client
+                .get(url.clone())
+                .timeout(Duration::from_secs(15))
+                .send()
+                .await
+                .map_err(|err| format!("Request failed: {err}"))?;
+
+            let status = response.status();
+            let content_type = response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            if !status.is_success() {
+                return Err(format!("HTTP {status}"));
+            }
+            if !content_type.is_empty()
+                && !content_type.contains("text/html")
+                && !content_type.contains("application/xhtml")
+                && !content_type.contains("text/plain")
+            {
+                return Err(format!("Unsupported content type: {content_type}"));
+            }
+
+            response
+                .text()
+                .await
+                .map_err(|err| format!("Could not read response: {err}"))?
+        }
+        "file" => {
+            let path = parsed_url
+                .to_file_path()
+                .map_err(|_| "Invalid file URL".to_string())?;
+            async_fs::read_to_string(path)
+                .await
+                .map_err(|err| format!("Could not read file: {err}"))?
+        }
+        "about" => String::new(),
+        scheme => return Err(format!("Unsupported URL scheme: {scheme}")),
+    };
+
+    Ok(parse_browser_document(url, &html))
+}
+
+fn deduplicate_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut seen_paths = HashSet::new();
+    paths
+        .into_iter()
+        .filter(|path| seen_paths.insert(path.clone()))
+        .collect()
+}
 
 /// Describes which agent destination is available for sending review comments.
 #[derive(Clone, Debug, PartialEq)]
@@ -334,11 +1368,22 @@ impl CodeReviewState {
 #[cfg_attr(not(feature = "local_fs"), allow(dead_code))]
 pub enum RightPanelAction {
     ToggleFileSidebar,
+    SetMode(RightPanelMode),
     SelectRepo {
         repo_path: LocalOrRemotePath,
         from_dropdown: bool,
     },
     OpenRepository,
+    OpenBrowserCurrentUrl,
+    OpenBrowserExternal,
+    CopyBrowserUrl,
+    RefreshBrowserUrl,
+    BrowserBack,
+    BrowserForward,
+    ToggleBrowserElementPicker,
+    AttachBrowserElement {
+        index: usize,
+    },
     ToggleMaximize,
 }
 
@@ -346,6 +1391,14 @@ pub enum RightPanelAction {
 #[cfg_attr(not(feature = "local_fs"), allow(dead_code))]
 pub enum RightPanelEvent {
     ToggleMaximize,
+    #[cfg(feature = "local_fs")]
+    FileTree(RightPanelFileTreeEvent),
+    #[cfg(feature = "local_fs")]
+    OpenFileFromFileManager {
+        location: LocalOrRemotePath,
+        target: FileTarget,
+        line_col: Option<LineAndColumnArg>,
+    },
     #[cfg(feature = "local_fs")]
     OpenFileWithTarget {
         path: PathBuf,
@@ -356,18 +1409,51 @@ pub enum RightPanelEvent {
         path: LocalOrRemotePath,
         line_and_column: Option<LineAndColumnArg>,
     },
+    AttachBrowserSelectionAsContext {
+        text: String,
+    },
     #[cfg(not(target_family = "wasm"))]
     OpenLspLogs {
         log_path: PathBuf,
     },
 }
 
+#[cfg(feature = "local_fs")]
+#[derive(Clone, Debug)]
+pub enum RightPanelFileTreeEvent {
+    FileRenamed {
+        old_path: PathBuf,
+        new_path: PathBuf,
+    },
+    FileDeleted {
+        path: PathBuf,
+    },
+    AttachPathAsContext {
+        path: PathBuf,
+    },
+    CDToDirectory {
+        path: PathBuf,
+    },
+    OpenDirectoryInNewTab {
+        path: PathBuf,
+    },
+}
+
 pub struct RightPanelView {
+    window_id: WindowId,
     resizable_state_handle: ResizableStateHandle,
     close_button_mouse_state: MouseStateHandle,
     file_navigation_button_mouse_state: MouseStateHandle,
+    mode_button_mouse_states: ModeButtonMouseStates,
     #[cfg(feature = "local_fs")]
     open_repository_button: ViewHandle<ActionButton>,
+    browser_url_editor: ViewHandle<EditorView>,
+    browser_back_button: ViewHandle<ActionButton>,
+    browser_forward_button: ViewHandle<ActionButton>,
+    browser_open_button: ViewHandle<ActionButton>,
+    browser_copy_button: ViewHandle<ActionButton>,
+    browser_refresh_button: ViewHandle<ActionButton>,
+    browser_element_picker_button: ViewHandle<ActionButton>,
     pub active_pane_group: Option<ViewHandle<PaneGroup>>,
     #[cfg_attr(not(feature = "local_fs"), allow(dead_code))]
     working_directories_model: ModelHandle<WorkingDirectoriesModel>,
@@ -375,6 +1461,16 @@ pub struct RightPanelView {
     code_review_state: Option<CodeReviewState>,
     #[cfg(feature = "local_fs")]
     code_review_session_env: Option<CodeReviewSessionEnv>,
+    #[cfg(feature = "local_fs")]
+    file_tree_views: HashMap<EntityId, ViewHandle<FileTreeView>>,
+    active_mode: RightPanelMode,
+    browser_current_url: Option<String>,
+    browser_history: Vec<String>,
+    browser_history_index: Option<usize>,
+    browser_load_state: BrowserLoadState,
+    browser_element_picker_enabled: bool,
+    browser_element_mouse_states: Vec<MouseStateHandle>,
+    browser_scroll_state: ClippedScrollStateHandle,
     is_agent_management_view_open: bool,
     panel_position: super::PanelPosition,
 }
@@ -449,6 +1545,73 @@ impl RightPanelView {
             button
         });
 
+        let browser_url_editor = ctx.add_typed_action_view(|ctx| {
+            let appearance = Appearance::as_ref(ctx);
+            let options = EditorOptions {
+                text: TextOptions::ui_text(Some(13.), appearance),
+                single_line: true,
+                select_all_on_focus: true,
+                clear_selections_on_blur: true,
+                ..Default::default()
+            };
+            let mut editor = EditorView::new(options, ctx);
+            editor.set_placeholder_text("localhost:3000 or https://example.com", ctx);
+            editor
+        });
+        ctx.subscribe_to_view(&browser_url_editor, |me, _handle, event, ctx| {
+            me.handle_browser_url_editor_event(event, ctx);
+        });
+
+        let browser_back_button = ctx.add_typed_action_view(|_| {
+            ActionButton::new("", PaneHeaderTheme)
+                .with_icon(Icon::ChevronLeft)
+                .with_tooltip("Back")
+                .with_tooltip_positioning_provider(Arc::new(MenuPositioning::BelowInputBox))
+                .on_click(|ctx| ctx.dispatch_typed_action(RightPanelAction::BrowserBack))
+        });
+
+        let browser_forward_button = ctx.add_typed_action_view(|_| {
+            ActionButton::new("", PaneHeaderTheme)
+                .with_icon(Icon::ChevronRight)
+                .with_tooltip("Forward")
+                .with_tooltip_positioning_provider(Arc::new(MenuPositioning::BelowInputBox))
+                .on_click(|ctx| ctx.dispatch_typed_action(RightPanelAction::BrowserForward))
+        });
+
+        let browser_open_button = ctx.add_typed_action_view(|_| {
+            ActionButton::new("", PaneHeaderTheme)
+                .with_icon(Icon::LinkExternal)
+                .with_tooltip("Open externally")
+                .with_tooltip_positioning_provider(Arc::new(MenuPositioning::BelowInputBox))
+                .on_click(|ctx| ctx.dispatch_typed_action(RightPanelAction::OpenBrowserExternal))
+        });
+
+        let browser_copy_button = ctx.add_typed_action_view(|_| {
+            ActionButton::new("", PaneHeaderTheme)
+                .with_icon(Icon::Copy)
+                .with_tooltip("Copy URL")
+                .with_tooltip_positioning_provider(Arc::new(MenuPositioning::BelowInputBox))
+                .on_click(|ctx| ctx.dispatch_typed_action(RightPanelAction::CopyBrowserUrl))
+        });
+
+        let browser_refresh_button = ctx.add_typed_action_view(|_| {
+            ActionButton::new("", PaneHeaderTheme)
+                .with_icon(Icon::RefreshCcw)
+                .with_tooltip("Reopen URL")
+                .with_tooltip_positioning_provider(Arc::new(MenuPositioning::BelowInputBox))
+                .on_click(|ctx| ctx.dispatch_typed_action(RightPanelAction::RefreshBrowserUrl))
+        });
+
+        let browser_element_picker_button = ctx.add_typed_action_view(|_| {
+            ActionButton::new("", PaneHeaderTheme)
+                .with_icon(Icon::CornersOfBox)
+                .with_tooltip("Select page element")
+                .with_tooltip_positioning_provider(Arc::new(MenuPositioning::BelowInputBox))
+                .on_click(|ctx| {
+                    ctx.dispatch_typed_action(RightPanelAction::ToggleBrowserElementPicker)
+                })
+        });
+
         #[cfg(feature = "local_fs")]
         let open_repository_button = ctx.add_typed_action_view(|_| {
             ActionButton::new("Open repository", NakedTheme)
@@ -459,17 +1622,36 @@ impl RightPanelView {
         });
 
         Self {
+            window_id: ctx.window_id(),
             resizable_state_handle,
             close_button_mouse_state: Default::default(),
             file_navigation_button_mouse_state: Default::default(),
+            mode_button_mouse_states: Default::default(),
             #[cfg(feature = "local_fs")]
             open_repository_button,
+            browser_url_editor,
+            browser_back_button,
+            browser_forward_button,
+            browser_open_button,
+            browser_copy_button,
+            browser_refresh_button,
+            browser_element_picker_button,
             active_pane_group: None,
             working_directories_model,
             maximize_button,
             code_review_state,
             #[cfg(feature = "local_fs")]
             code_review_session_env: None,
+            #[cfg(feature = "local_fs")]
+            file_tree_views: HashMap::new(),
+            active_mode: RightPanelMode::CodeReview,
+            browser_current_url: None,
+            browser_history: Vec::new(),
+            browser_history_index: None,
+            browser_load_state: BrowserLoadState::Blank,
+            browser_element_picker_enabled: false,
+            browser_element_mouse_states: Vec::new(),
+            browser_scroll_state: ClippedScrollStateHandle::new(),
             is_agent_management_view_open: false,
             panel_position: super::PanelPosition::Right,
         }
@@ -487,6 +1669,276 @@ impl RightPanelView {
     ) {
         self.panel_position = position;
         ctx.notify();
+    }
+
+    fn set_active_mode(&mut self, mode: RightPanelMode, ctx: &mut ViewContext<Self>) {
+        let was_files = self.active_mode == RightPanelMode::Files;
+        self.active_mode = mode;
+        if mode != RightPanelMode::Browser {
+            self.browser_element_picker_enabled = false;
+            if let Some(port) = external_browser_debugging_port() {
+                ctx.spawn(browser_disable_element_picker(port), |_, result, _| {
+                    if let Err(err) = result {
+                        log::warn!("failed to disable browser element picker: {err:?}");
+                    }
+                });
+            }
+            hide_external_browser_host();
+        }
+
+        #[cfg(feature = "local_fs")]
+        {
+            if was_files && mode != RightPanelMode::Files {
+                self.set_active_file_tree_visible(false, ctx);
+            }
+
+            if mode == RightPanelMode::Files {
+                self.update_file_tree_for_active_pane_group(ctx);
+                self.focus_active_file_tree(ctx);
+            } else if mode == RightPanelMode::CodeReview {
+                if let Some(repo_path) = self.selected_repo_path().cloned() {
+                    self.ensure_code_review_view_exists(&repo_path, ctx);
+                }
+                self.recompute_terminal_availability(ctx);
+            }
+        }
+
+        ctx.notify();
+    }
+
+    fn current_browser_url_from_editor(&self, app: &AppContext) -> Option<String> {
+        let editor_text = self
+            .browser_url_editor
+            .read(app, |editor, ctx| editor.buffer_text(ctx));
+        normalize_browser_url(&editor_text).or_else(|| self.browser_current_url.clone())
+    }
+
+    fn can_browser_go_back(&self) -> bool {
+        self.browser_history_index.is_some_and(|index| index > 0)
+    }
+
+    fn can_browser_go_forward(&self) -> bool {
+        self.browser_history_index
+            .is_some_and(|index| index + 1 < self.browser_history.len())
+    }
+
+    fn open_browser_url(&mut self, url: String, ctx: &mut ViewContext<Self>) {
+        let Some(url) = normalize_browser_url(&url) else {
+            return;
+        };
+
+        let should_push_history = match self.browser_history_index {
+            Some(index) => self
+                .browser_history
+                .get(index)
+                .map_or(true, |current| current != &url),
+            None => true,
+        };
+
+        if should_push_history {
+            if let Some(index) = self.browser_history_index {
+                self.browser_history.truncate(index + 1);
+            }
+            self.browser_history.push(url.clone());
+            self.browser_history_index = Some(self.browser_history.len() - 1);
+        }
+
+        self.load_browser_url(url, ctx);
+    }
+
+    fn load_browser_url(&mut self, url: String, ctx: &mut ViewContext<Self>) {
+        self.browser_current_url = Some(url.clone());
+        self.browser_element_picker_enabled = false;
+        self.browser_url_editor.update(ctx, |editor, ctx| {
+            editor.set_buffer_text(&url, ctx);
+        });
+
+        if url == "about:blank" {
+            self.browser_load_state = BrowserLoadState::Blank;
+            self.browser_element_mouse_states.clear();
+            hide_external_browser_host();
+            ctx.notify();
+            return;
+        }
+
+        self.browser_load_state = BrowserLoadState::Loading { url: url.clone() };
+        self.browser_element_mouse_states.clear();
+        ctx.notify();
+
+        ctx.spawn(
+            load_browser_document(url.clone()),
+            move |me, result, ctx| {
+                if me.browser_current_url.as_deref() != Some(url.as_str()) {
+                    return;
+                }
+
+                match result {
+                    Ok(document) => {
+                        me.browser_element_mouse_states
+                            .resize_with(document.elements.len(), MouseStateHandle::default);
+                        me.browser_load_state = BrowserLoadState::Loaded(document);
+                    }
+                    Err(message) => {
+                        me.browser_load_state = BrowserLoadState::Error {
+                            url: url.clone(),
+                            message,
+                        };
+                    }
+                }
+                ctx.notify();
+            },
+        );
+    }
+
+    fn navigate_browser_history(&mut self, offset: isize, ctx: &mut ViewContext<Self>) {
+        let Some(index) = self.browser_history_index else {
+            return;
+        };
+        let next_index = index as isize + offset;
+        if next_index < 0 || next_index as usize >= self.browser_history.len() {
+            return;
+        }
+
+        let next_index = next_index as usize;
+        let Some(url) = self.browser_history.get(next_index).cloned() else {
+            return;
+        };
+        self.browser_history_index = Some(next_index);
+        self.load_browser_url(url, ctx);
+    }
+
+    fn open_browser_external(&self, ctx: &mut ViewContext<Self>) {
+        if let Some(url) = self.current_browser_url_from_editor(ctx) {
+            ctx.open_url(&url);
+        }
+    }
+
+    fn format_browser_element_context(
+        document: &BrowserDocument,
+        element: &BrowserElementCandidate,
+    ) -> String {
+        let title = document.title.as_deref().unwrap_or("Untitled page");
+        let attributes = if element.attributes.is_empty() {
+            "Attributes: none".to_string()
+        } else {
+            format!(
+                "Attributes: {}",
+                element
+                    .attributes
+                    .iter()
+                    .map(|(name, value)| format!("{name}=\"{value}\""))
+                    .join(", ")
+            )
+        };
+
+        truncate_browser_text(
+            &format!(
+                "Web page element\nPage: {title}\nURL: {}\nSelector: {}\nTag: <{}>\n{}\nText:\n{}",
+                document.url, element.selector, element.tag, attributes, element.text
+            ),
+            BROWSER_MAX_CONTEXT_CHARS,
+        )
+    }
+
+    fn attach_browser_element_as_context(&mut self, index: usize, ctx: &mut ViewContext<Self>) {
+        let Some(text) = (match &self.browser_load_state {
+            BrowserLoadState::Loaded(document) => document
+                .elements
+                .get(index)
+                .map(|element| Self::format_browser_element_context(document, element)),
+            _ => None,
+        }) else {
+            return;
+        };
+
+        self.browser_element_picker_enabled = false;
+        ctx.emit(RightPanelEvent::AttachBrowserSelectionAsContext { text });
+        ctx.notify();
+    }
+
+    fn toggle_browser_element_picker(&mut self, ctx: &mut ViewContext<Self>) {
+        if self.browser_element_picker_enabled {
+            self.browser_element_picker_enabled = false;
+            if let Some(port) = external_browser_debugging_port() {
+                ctx.spawn(browser_disable_element_picker(port), |_, result, _| {
+                    if let Err(err) = result {
+                        log::warn!("failed to disable browser element picker: {err:?}");
+                    }
+                });
+            }
+            ctx.notify();
+            return;
+        }
+
+        let Some(port) = external_browser_debugging_port() else {
+            log::warn!("browser element picker requested before browser host was ready");
+            return;
+        };
+
+        self.browser_element_picker_enabled = true;
+        ctx.notify();
+        ctx.spawn(
+            browser_enable_element_picker(port),
+            |me, result, ctx| match result {
+                Ok(()) => {
+                    me.poll_browser_element_selection(ctx);
+                }
+                Err(err) => {
+                    log::warn!("failed to enable browser element picker: {err:?}");
+                    me.browser_element_picker_enabled = false;
+                    ctx.notify();
+                }
+            },
+        );
+    }
+
+    fn poll_browser_element_selection(&mut self, ctx: &mut ViewContext<Self>) {
+        if !self.browser_element_picker_enabled {
+            return;
+        }
+
+        let Some(port) = external_browser_debugging_port() else {
+            self.browser_element_picker_enabled = false;
+            ctx.notify();
+            return;
+        };
+
+        ctx.spawn(
+            async move {
+                Timer::after(BROWSER_ELEMENT_PICKER_POLL_INTERVAL).await;
+                browser_take_selected_element(port).await
+            },
+            |me, result, ctx| {
+                if !me.browser_element_picker_enabled {
+                    return;
+                }
+
+                match result {
+                    Ok(Some(text)) => {
+                        me.browser_element_picker_enabled = false;
+                        ctx.emit(RightPanelEvent::AttachBrowserSelectionAsContext { text });
+                        ctx.notify();
+                    }
+                    Ok(None) => {
+                        me.poll_browser_element_selection(ctx);
+                    }
+                    Err(err) => {
+                        log::warn!("failed to poll selected browser element: {err:?}");
+                        me.poll_browser_element_selection(ctx);
+                    }
+                }
+            },
+        );
+    }
+
+    fn handle_browser_url_editor_event(
+        &mut self,
+        event: &EditorEvent,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if matches!(event, EditorEvent::Enter) {
+            self.handle_action(&RightPanelAction::OpenBrowserCurrentUrl, ctx);
+        }
     }
 
     #[cfg(feature = "local_fs")]
@@ -527,6 +1979,19 @@ impl RightPanelView {
         ctx: &mut ViewContext<Self>,
     ) {
         match event {
+            #[cfg(feature = "local_fs")]
+            WorkingDirectoriesEvent::DirectoriesChanged {
+                pane_group_id,
+                directories: _,
+            } => {
+                let Some(active_pane_group) = &self.active_pane_group else {
+                    return;
+                };
+                if active_pane_group.id() != *pane_group_id {
+                    return;
+                }
+                self.update_file_tree_for_active_pane_group(ctx);
+            }
             WorkingDirectoriesEvent::RepositoriesChanged {
                 pane_group_id,
                 repositories,
@@ -586,7 +2051,160 @@ impl RightPanelView {
                 self.recompute_terminal_availability(ctx);
                 ctx.notify();
             }
-            _ => {}
+        }
+    }
+
+    #[cfg(feature = "local_fs")]
+    fn handle_file_tree_event(&mut self, event: &FileTreeEvent, ctx: &mut ViewContext<Self>) {
+        match event {
+            FileTreeEvent::FileRenamed { old_path, new_path } => {
+                ctx.emit(RightPanelEvent::FileTree(
+                    RightPanelFileTreeEvent::FileRenamed {
+                        old_path: old_path.clone(),
+                        new_path: new_path.clone(),
+                    },
+                ));
+            }
+            FileTreeEvent::FileDeleted { path } => {
+                ctx.emit(RightPanelEvent::FileTree(
+                    RightPanelFileTreeEvent::FileDeleted { path: path.clone() },
+                ));
+            }
+            FileTreeEvent::AttachAsContext { path } => {
+                ctx.emit(RightPanelEvent::FileTree(
+                    RightPanelFileTreeEvent::AttachPathAsContext { path: path.clone() },
+                ));
+            }
+            FileTreeEvent::OpenFile {
+                path,
+                target,
+                line_col,
+            } => {
+                ctx.emit(RightPanelEvent::OpenFileFromFileManager {
+                    location: path.clone(),
+                    target: target.clone(),
+                    line_col: *line_col,
+                });
+            }
+            FileTreeEvent::CDToDirectory { path } => {
+                ctx.emit(RightPanelEvent::FileTree(
+                    RightPanelFileTreeEvent::CDToDirectory { path: path.clone() },
+                ));
+            }
+            FileTreeEvent::OpenDirectoryInNewTab { path } => {
+                ctx.emit(RightPanelEvent::FileTree(
+                    RightPanelFileTreeEvent::OpenDirectoryInNewTab { path: path.clone() },
+                ));
+            }
+        }
+    }
+
+    #[cfg(feature = "local_fs")]
+    fn get_or_create_file_tree_view_for_pane_group(
+        &mut self,
+        pane_group_id: EntityId,
+        ctx: &mut ViewContext<Self>,
+    ) -> ViewHandle<FileTreeView> {
+        if let Some(view) = self.file_tree_views.get(&pane_group_id) {
+            return view.clone();
+        }
+
+        let file_tree_view = ctx.add_typed_action_view(FileTreeView::new);
+        ctx.subscribe_to_view(&file_tree_view, |me, _, event, ctx| {
+            me.handle_file_tree_event(event, ctx);
+        });
+        self.file_tree_views
+            .insert(pane_group_id, file_tree_view.clone());
+        file_tree_view
+    }
+
+    #[cfg(feature = "local_fs")]
+    fn update_file_tree_for_active_pane_group(&mut self, ctx: &mut ViewContext<Self>) {
+        let Some(pane_group) = self.active_pane_group.clone() else {
+            return;
+        };
+        let pane_group_id = pane_group.id();
+        let active_directories = self.working_directories_model.read(ctx, |model, _| {
+            model
+                .most_recent_directories_for_pane_group(pane_group_id)
+                .map(|dirs| dirs.collect_vec())
+                .unwrap_or_default()
+        });
+        let has_terminal_session = active_directories
+            .iter()
+            .any(|dir| dir.terminal_id.is_some());
+        let local_paths = active_directories
+            .iter()
+            .filter_map(|dir| dir.path.to_local_path().map(Path::to_path_buf))
+            .collect_vec();
+        let local_directories = deduplicate_paths(local_paths);
+        let remote_repos = active_directories
+            .iter()
+            .filter_map(|dir| match &dir.path {
+                LocalOrRemotePath::Remote(remote_path) => {
+                    Some(repo_metadata::RemoteRepositoryIdentifier::new(
+                        remote_path.host_id.clone(),
+                        remote_path.path.clone(),
+                    ))
+                }
+                LocalOrRemotePath::Local(_) => None,
+            })
+            .collect_vec();
+        let active_file_model = pane_group.as_ref(ctx).active_file_model().clone();
+        let is_visible = self.file_tree_should_be_active(ctx);
+        let file_tree_view = self.get_or_create_file_tree_view_for_pane_group(pane_group_id, ctx);
+
+        file_tree_view.update(ctx, |view, ctx| {
+            view.set_root_directories(local_directories, ctx);
+            view.set_remote_root_directories(&remote_repos, ctx);
+            view.set_has_terminal_session(has_terminal_session, ctx);
+            view.set_active_file_model(active_file_model, ctx);
+            view.set_is_active(is_visible, ctx);
+
+            if is_visible {
+                view.auto_expand_to_most_recent_directory(ctx);
+            }
+        });
+    }
+
+    #[cfg(feature = "local_fs")]
+    pub(crate) fn set_active_file_tree_visible(
+        &self,
+        is_visible: bool,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let Some(pane_group) = &self.active_pane_group else {
+            return;
+        };
+        if let Some(file_tree_view) = self.file_tree_views.get(&pane_group.id()) {
+            file_tree_view.update(ctx, |view, ctx| {
+                view.set_is_active(is_visible, ctx);
+            });
+        }
+    }
+
+    #[cfg(feature = "local_fs")]
+    fn file_tree_should_be_active(&self, app: &AppContext) -> bool {
+        self.active_mode == RightPanelMode::Files
+            && self
+                .active_pane_group
+                .as_ref()
+                .is_some_and(|pane_group| pane_group.as_ref(app).right_panel_open)
+    }
+
+    #[cfg(feature = "local_fs")]
+    fn active_file_tree_view(&self) -> Option<ViewHandle<FileTreeView>> {
+        let pane_group_id = self.active_pane_group.as_ref()?.id();
+        self.file_tree_views.get(&pane_group_id).cloned()
+    }
+
+    #[cfg(feature = "local_fs")]
+    fn focus_active_file_tree(&self, ctx: &mut ViewContext<Self>) {
+        if let Some(file_tree_view) = self.active_file_tree_view() {
+            file_tree_view.update(ctx, |view, ctx| {
+                view.on_left_panel_focused(ctx);
+            });
+            ctx.focus(&file_tree_view);
         }
     }
 
@@ -638,6 +2256,9 @@ impl RightPanelView {
             self.ensure_code_review_view_exists(selected, ctx);
         }
 
+        #[cfg(feature = "local_fs")]
+        self.update_file_tree_for_active_pane_group(ctx);
+
         let is_maximized = self.is_maximized(ctx);
         self.set_maximized(is_maximized, ctx);
 
@@ -663,6 +2284,7 @@ impl RightPanelView {
         if repo_path.is_remote() && !FeatureFlag::RemoteCodeReview.is_enabled() {
             return;
         }
+        self.active_mode = RightPanelMode::CodeReview;
         let pane_group_id = active_pane_group.id();
 
         if repo_dropdown_state.selected_repo_path.is_none() {
@@ -737,6 +2359,11 @@ impl RightPanelView {
         ctx.notify();
     }
 
+    pub fn hide_browser_host(&mut self, ctx: &mut ViewContext<Self>) {
+        hide_external_browser_host();
+        ctx.notify();
+    }
+
     fn render_repo_dropdown(&self) -> Option<Box<dyn Element>> {
         let Some(state) = &self.code_review_state else {
             return None;
@@ -791,12 +2418,83 @@ impl RightPanelView {
         .finish()
     }
 
-    fn render_simple_header(&self, close_button: Box<dyn Element>) -> Box<dyn Element> {
-        let left_spacer = Box::new(Shrinkable::new(1.0, Empty::new().finish()));
+    fn render_mode_button(
+        &self,
+        mode: RightPanelMode,
+        appearance: &Appearance,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let mouse_state = self.mode_button_mouse_states.handle(mode);
+        let is_active = self.active_mode == mode;
+        let icon_color = if is_active {
+            theme.main_text_color(theme.background())
+        } else {
+            theme.sub_text_color(theme.background())
+        };
+        let font_family = appearance.ui_font_family();
+
+        Hoverable::new(mouse_state, move |state| {
+            let mut row = Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_main_axis_size(MainAxisSize::Min)
+                .with_spacing(4.);
+            row.add_child(
+                ConstrainedBox::new(mode.icon().to_warpui_icon(icon_color).finish())
+                    .with_width(14.)
+                    .with_height(14.)
+                    .finish(),
+            );
+            row.add_child(
+                Text::new_inline(mode.label().to_string(), font_family, 12.)
+                    .with_style(Properties::default().weight(Weight::Semibold))
+                    .with_color(icon_color.into())
+                    .finish(),
+            );
+
+            let mut container = Container::new(row.finish())
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
+                .with_padding_left(8.)
+                .with_padding_right(8.)
+                .with_padding_top(3.)
+                .with_padding_bottom(3.);
+
+            if is_active {
+                container = container.with_background(internal_colors::fg_overlay_3(theme));
+            } else if state.is_hovered() {
+                container = container.with_background(internal_colors::fg_overlay_2(theme));
+            }
+
+            container.finish()
+        })
+        .on_click(move |ctx, _, _| {
+            ctx.dispatch_typed_action(RightPanelAction::SetMode(mode));
+        })
+        .with_cursor(Cursor::PointingHand)
+        .finish()
+    }
+
+    fn render_mode_switcher(&self, appearance: &Appearance) -> Box<dyn Element> {
+        Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_main_axis_size(MainAxisSize::Min)
+            .with_spacing(4.)
+            .with_child(self.render_mode_button(RightPanelMode::CodeReview, appearance))
+            .with_child(self.render_mode_button(RightPanelMode::Files, appearance))
+            .with_child(self.render_mode_button(RightPanelMode::Browser, appearance))
+            .finish()
+    }
+
+    fn render_simple_header(
+        &self,
+        appearance: &Appearance,
+        close_button: Box<dyn Element>,
+    ) -> Box<dyn Element> {
         Container::new(
             ConstrainedBox::new(
                 Flex::row()
-                    .with_child(left_spacer)
+                    .with_child(
+                        Shrinkable::new(1.0, self.render_mode_switcher(appearance)).finish(),
+                    )
                     .with_children(vec![close_button])
                     .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
                     .with_cross_axis_alignment(CrossAxisAlignment::Center)
@@ -811,11 +2509,19 @@ impl RightPanelView {
     }
 
     fn render_panel_content(&self, app: &AppContext) -> Box<dyn Element> {
+        match self.active_mode {
+            RightPanelMode::CodeReview => self.render_code_review_panel_content(app),
+            RightPanelMode::Files => self.render_files_panel_content(app),
+            RightPanelMode::Browser => self.render_browser_panel_content(app),
+        }
+    }
+
+    fn render_code_review_panel_content(&self, app: &AppContext) -> Box<dyn Element> {
         let appearance = Appearance::as_ref(app);
         let close_button = self.close_button(appearance, app);
 
         let Some(state) = &self.code_review_state else {
-            let simple_header = self.render_simple_header(close_button);
+            let simple_header = self.render_simple_header(appearance, close_button);
             return Flex::column()
                 .with_child(simple_header)
                 .with_child(
@@ -833,7 +2539,7 @@ impl RightPanelView {
         });
 
         let Some(selected_repo_path) = selected_repo_path else {
-            let simple_header = self.render_simple_header(close_button);
+            let simple_header = self.render_simple_header(appearance, close_button);
 
             #[cfg(feature = "local_fs")]
             let no_repo_body = {
@@ -885,7 +2591,7 @@ impl RightPanelView {
                 .with_child(code_review_content)
                 .finish()
         } else {
-            let simple_header = self.render_simple_header(close_button);
+            let simple_header = self.render_simple_header(appearance, close_button);
             Flex::column()
                 .with_child(simple_header)
                 .with_child(
@@ -893,6 +2599,448 @@ impl RightPanelView {
                 )
                 .finish()
         }
+    }
+
+    fn render_files_panel_content(&self, app: &AppContext) -> Box<dyn Element> {
+        let appearance = Appearance::as_ref(app);
+        let header = self.render_simple_header(appearance, self.close_button(appearance, app));
+
+        #[cfg(feature = "local_fs")]
+        let body = if let Some(file_tree_view) = self.active_file_tree_view() {
+            Shrinkable::new(
+                1.0,
+                Container::new(ChildView::new(&file_tree_view).finish())
+                    .with_padding_left(2.)
+                    .with_padding_right(2.)
+                    .finish(),
+            )
+            .finish()
+        } else {
+            self.render_empty_panel_state(
+                appearance,
+                Icon::FolderClosed,
+                "No project folder",
+                "Open a terminal in a project to manage files here.",
+            )
+        };
+
+        #[cfg(not(feature = "local_fs"))]
+        let body = self.render_empty_panel_state(
+            appearance,
+            Icon::FolderClosed,
+            "Files unavailable",
+            "File management requires local filesystem support.",
+        );
+
+        Flex::column()
+            .with_child(header)
+            .with_child(Shrinkable::new(1.0, body).finish())
+            .finish()
+    }
+
+    fn render_browser_panel_content(&self, app: &AppContext) -> Box<dyn Element> {
+        let appearance = Appearance::as_ref(app);
+        let theme = appearance.theme();
+        let header = self.render_simple_header(appearance, self.close_button(appearance, app));
+
+        let url_input = appearance
+            .ui_builder()
+            .text_input(self.browser_url_editor.clone())
+            .with_style(UiComponentStyles {
+                background: Some(theme.background().into()),
+                border_color: Some(theme.outline().into()),
+                border_width: Some(1.),
+                border_radius: Some(CornerRadius::with_all(Radius::Pixels(6.))),
+                padding: Some(Coords {
+                    top: 7.,
+                    bottom: 7.,
+                    left: 8.,
+                    right: 8.,
+                }),
+                ..Default::default()
+            })
+            .build()
+            .finish();
+
+        let address_row = Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_spacing(4.)
+            .with_child(self.render_browser_icon_button(&self.browser_back_button))
+            .with_child(self.render_browser_icon_button(&self.browser_forward_button))
+            .with_child(self.render_browser_icon_button(&self.browser_refresh_button))
+            .with_child(Shrinkable::new(1.0, url_input).finish())
+            .with_child(self.render_browser_icon_button(&self.browser_element_picker_button))
+            .with_child(self.render_browser_icon_button(&self.browser_copy_button))
+            .with_child(self.render_browser_icon_button(&self.browser_open_button))
+            .finish();
+
+        let browser_surface = self.render_browser_surface(appearance);
+
+        Flex::column()
+            .with_child(header)
+            .with_child(
+                Shrinkable::new(
+                    1.0,
+                    Container::new(
+                        Flex::column()
+                            .with_main_axis_size(MainAxisSize::Max)
+                            .with_spacing(12.)
+                            .with_child(address_row)
+                            .with_child(Shrinkable::new(1.0, browser_surface).finish())
+                            .finish(),
+                    )
+                    .with_padding_top(12.)
+                    .with_padding_left(12.)
+                    .with_padding_right(12.)
+                    .finish(),
+                )
+                .finish(),
+            )
+            .finish()
+    }
+
+    fn render_browser_surface(&self, appearance: &Appearance) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        if let Some(url) = self
+            .browser_current_url
+            .as_deref()
+            .filter(|url| *url != "about:blank")
+        {
+            return self.render_external_browser_surface(appearance, url.to_string());
+        }
+
+        match &self.browser_load_state {
+            BrowserLoadState::Blank => self.render_browser_empty_state(
+                appearance,
+                Icon::Globe4,
+                "浏览器",
+                "粘贴或输入 URL 以打开网页。",
+                true,
+            ),
+            BrowserLoadState::Loading { url } => self.render_browser_empty_state(
+                appearance,
+                Icon::Loading,
+                "Loading",
+                url.as_str(),
+                false,
+            ),
+            BrowserLoadState::Error { url, message } => self.render_browser_empty_state(
+                appearance,
+                Icon::AlertTriangle,
+                message,
+                url,
+                false,
+            ),
+            BrowserLoadState::Loaded(document) => {
+                Container::new(self.render_browser_document(document, appearance))
+                    .with_border(Border::all(1.).with_border_fill(theme.outline()))
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
+                    .finish()
+            }
+        }
+    }
+
+    fn render_external_browser_surface(
+        &self,
+        appearance: &Appearance,
+        url: String,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        LiveElement::new(
+            ExternalBrowserSurfaceElement::new(
+                self.window_id,
+                Some(url),
+                theme.background().into(),
+            )
+            .finish(),
+            BROWSER_HOST_REPAINT_INTERVAL,
+        )
+        .finish()
+    }
+
+    fn render_browser_empty_state(
+        &self,
+        appearance: &Appearance,
+        icon: Icon,
+        title: &str,
+        message: &str,
+        is_blank: bool,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let sub_text_color = theme.sub_text_color(theme.background());
+        let main_text_color = theme.main_text_color(theme.background());
+        let icon_size = if is_blank { 88. } else { 52. };
+        let title_size = if is_blank { 32. } else { 13. };
+        let message_size = if is_blank { 18. } else { 12. };
+        let title_weight = if is_blank {
+            Weight::Bold
+        } else {
+            Weight::Semibold
+        };
+
+        Align::new(
+            Flex::column()
+                .with_main_axis_size(MainAxisSize::Min)
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_spacing(if is_blank { 20. } else { 10. })
+                .with_child(
+                    ConstrainedBox::new(icon.to_warpui_icon(sub_text_color).finish())
+                        .with_width(icon_size)
+                        .with_height(icon_size)
+                        .finish(),
+                )
+                .with_child(
+                    Text::new(title.to_string(), appearance.ui_font_family(), title_size)
+                        .soft_wrap(true)
+                        .with_style(Properties::default().weight(title_weight))
+                        .with_color(main_text_color.into())
+                        .finish(),
+                )
+                .with_child(
+                    Container::new(
+                        Text::new(
+                            message.to_string(),
+                            appearance.ui_font_family(),
+                            message_size,
+                        )
+                        .soft_wrap(true)
+                        .with_color(sub_text_color.into())
+                        .finish(),
+                    )
+                    .with_horizontal_padding(24.)
+                    .finish(),
+                )
+                .finish(),
+        )
+        .finish()
+    }
+
+    fn render_browser_document(
+        &self,
+        document: &BrowserDocument,
+        appearance: &Appearance,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let sub_text_color = theme.sub_text_color(theme.background());
+        let main_text_color = theme.main_text_color(theme.background());
+        let title = document.title.as_deref().unwrap_or("Untitled page");
+        let picker_text = if self.browser_element_picker_enabled {
+            "Element picker active"
+        } else {
+            "Element picker idle"
+        };
+
+        let mut content = Flex::column()
+            .with_main_axis_size(MainAxisSize::Min)
+            .with_spacing(8.)
+            .with_child(
+                Container::new(
+                    Flex::column()
+                        .with_spacing(3.)
+                        .with_child(
+                            Text::new(title.to_string(), appearance.ui_font_family(), 14.)
+                                .soft_wrap(true)
+                                .with_style(Properties::default().weight(Weight::Semibold))
+                                .with_color(main_text_color.into())
+                                .finish(),
+                        )
+                        .with_child(
+                            Text::new(document.url.clone(), appearance.ui_font_family(), 12.)
+                                .soft_wrap(true)
+                                .with_color(sub_text_color.into())
+                                .finish(),
+                        )
+                        .with_child(
+                            Text::new(
+                                format!("{picker_text} - {} elements", document.elements.len()),
+                                appearance.ui_font_family(),
+                                12.,
+                            )
+                            .soft_wrap(true)
+                            .with_color(sub_text_color.into())
+                            .finish(),
+                        )
+                        .finish(),
+                )
+                .with_padding_left(10.)
+                .with_padding_right(10.)
+                .with_padding_top(10.)
+                .finish(),
+            );
+
+        if document.elements.is_empty() {
+            content.add_child(
+                Container::new(
+                    Text::new(
+                        "No selectable elements found.".to_string(),
+                        appearance.ui_font_family(),
+                        12.,
+                    )
+                    .soft_wrap(true)
+                    .with_color(sub_text_color.into())
+                    .finish(),
+                )
+                .with_uniform_padding(10.)
+                .finish(),
+            );
+        } else {
+            for (index, element) in document.elements.iter().enumerate() {
+                let mouse_state = self
+                    .browser_element_mouse_states
+                    .get(index)
+                    .cloned()
+                    .unwrap_or_default();
+                content.add_child(self.render_browser_element_row(
+                    index,
+                    element,
+                    mouse_state,
+                    appearance,
+                ));
+            }
+        }
+
+        ClippedScrollable::vertical(
+            self.browser_scroll_state.clone(),
+            content.finish(),
+            ScrollbarWidth::Auto,
+            internal_colors::fg_overlay_2(theme).into(),
+            internal_colors::fg_overlay_3(theme).into(),
+            internal_colors::fg_overlay_1(theme).into(),
+        )
+        .finish()
+    }
+
+    fn render_browser_element_row(
+        &self,
+        index: usize,
+        element: &BrowserElementCandidate,
+        mouse_state: MouseStateHandle,
+        appearance: &Appearance,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let font_family = appearance.ui_font_family();
+        let picker_enabled = self.browser_element_picker_enabled;
+        let tag = element.tag.clone();
+        let selector = element.selector.clone();
+        let text = element.text.clone();
+        let attrs = element
+            .attributes
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .join("  ");
+
+        Hoverable::new(mouse_state, move |state| {
+            let title_color = theme.main_text_color(theme.background());
+            let sub_text_color = theme.sub_text_color(theme.background());
+
+            let mut row = Flex::column()
+                .with_main_axis_size(MainAxisSize::Min)
+                .with_spacing(5.)
+                .with_child(
+                    Flex::row()
+                        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                        .with_spacing(6.)
+                        .with_child(
+                            Text::new_inline(format!("<{tag}>"), font_family, 12.)
+                                .with_style(Properties::default().weight(Weight::Semibold))
+                                .with_color(title_color.into())
+                                .finish(),
+                        )
+                        .with_child(
+                            Shrinkable::new(
+                                1.0,
+                                Clipped::new(
+                                    Text::new_inline(selector.clone(), font_family, 12.)
+                                        .with_color(sub_text_color.into())
+                                        .finish(),
+                                )
+                                .finish(),
+                            )
+                            .finish(),
+                        )
+                        .finish(),
+                )
+                .with_child(
+                    Text::new(text.clone(), font_family, 12.)
+                        .soft_wrap(true)
+                        .with_color(title_color.into())
+                        .finish(),
+                );
+
+            if !attrs.is_empty() {
+                row.add_child(
+                    Text::new(attrs.clone(), font_family, 11.)
+                        .soft_wrap(true)
+                        .with_color(sub_text_color.into())
+                        .finish(),
+                );
+            }
+
+            let mut container = Container::new(row.finish())
+                .with_margin_left(10.)
+                .with_margin_right(10.)
+                .with_margin_bottom(6.)
+                .with_uniform_padding(9.)
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
+                .with_border(Border::all(1.).with_border_fill(theme.outline()));
+
+            if picker_enabled {
+                container = container
+                    .with_background(internal_colors::fg_overlay_2(theme))
+                    .with_border(Border::all(1.).with_border_fill(theme.active_ui_text_color()));
+            } else if state.is_hovered() {
+                container = container.with_background(internal_colors::fg_overlay_1(theme));
+            }
+
+            container.finish()
+        })
+        .on_click(move |ctx, _, _| {
+            if picker_enabled {
+                ctx.dispatch_typed_action(RightPanelAction::AttachBrowserElement { index });
+            }
+        })
+        .with_cursor(Cursor::PointingHand)
+        .finish()
+    }
+
+    fn render_empty_panel_state(
+        &self,
+        appearance: &Appearance,
+        icon: Icon,
+        title: &str,
+        message: &str,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let sub_text_color = theme.sub_text_color(theme.background());
+        Flex::column()
+            .with_main_axis_alignment(MainAxisAlignment::Center)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_spacing(8.)
+            .with_child(
+                ConstrainedBox::new(icon.to_warpui_icon(sub_text_color).finish())
+                    .with_width(36.)
+                    .with_height(36.)
+                    .finish(),
+            )
+            .with_child(
+                Text::new_inline(title.to_string(), appearance.ui_font_family(), 13.)
+                    .with_style(Properties::default().weight(Weight::Semibold))
+                    .with_color(theme.main_text_color(theme.background()).into())
+                    .finish(),
+            )
+            .with_child(
+                Text::new_inline(message.to_string(), appearance.ui_font_family(), 12.)
+                    .with_color(sub_text_color.into())
+                    .finish(),
+            )
+            .finish()
+    }
+
+    fn render_browser_icon_button(&self, button: &ViewHandle<ActionButton>) -> Box<dyn Element> {
+        ConstrainedBox::new(ChildView::new(button).finish())
+            .with_width(warp_core::ui::icons::ICON_DIMENSIONS)
+            .with_height(warp_core::ui::icons::ICON_DIMENSIONS)
+            .finish()
     }
 
     #[cfg_attr(not(feature = "local_fs"), allow(dead_code))]
@@ -954,6 +3102,11 @@ impl RightPanelView {
         let mut left_section = Flex::row()
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
             .with_main_axis_size(MainAxisSize::Max);
+        left_section.add_child(
+            Container::new(self.render_mode_switcher(appearance))
+                .with_margin_right(8.)
+                .finish(),
+        );
         if let Some(repo_path_el) = repo_path_element {
             left_section.add_child(repo_path_el);
         }
@@ -1051,6 +3204,11 @@ impl RightPanelView {
         if let Some(nav_button) = file_navigation_button {
             left_section.add_child(nav_button);
         }
+        left_section.add_child(
+            Container::new(self.render_mode_switcher(appearance))
+                .with_margin_right(8.)
+                .finish(),
+        );
         left_section.add_child(title);
 
         let mut right_section = Vec::new();
@@ -1757,6 +3915,9 @@ impl TypedActionView for RightPanelView {
                     }
                 }
             }
+            RightPanelAction::SetMode(mode) => {
+                self.set_active_mode(*mode, ctx);
+            }
             RightPanelAction::SelectRepo {
                 repo_path,
                 from_dropdown,
@@ -1800,6 +3961,42 @@ impl TypedActionView for RightPanelView {
                 ctx.emit(RightPanelEvent::ToggleMaximize);
                 ctx.notify();
             }
+            RightPanelAction::OpenBrowserCurrentUrl => {
+                if let Some(url) = self.current_browser_url_from_editor(ctx) {
+                    self.open_browser_url(url, ctx);
+                }
+            }
+            RightPanelAction::OpenBrowserExternal => {
+                self.open_browser_external(ctx);
+            }
+            RightPanelAction::CopyBrowserUrl => {
+                if let Some(url) = self.current_browser_url_from_editor(ctx) {
+                    ctx.clipboard().write(ClipboardContent::plain_text(url));
+                }
+            }
+            RightPanelAction::RefreshBrowserUrl => {
+                if let Some(url) = self.browser_current_url.clone() {
+                    self.open_browser_url(url, ctx);
+                } else if let Some(url) = self.current_browser_url_from_editor(ctx) {
+                    self.open_browser_url(url, ctx);
+                }
+            }
+            RightPanelAction::BrowserBack => {
+                if self.can_browser_go_back() {
+                    self.navigate_browser_history(-1, ctx);
+                }
+            }
+            RightPanelAction::BrowserForward => {
+                if self.can_browser_go_forward() {
+                    self.navigate_browser_history(1, ctx);
+                }
+            }
+            RightPanelAction::ToggleBrowserElementPicker => {
+                self.toggle_browser_element_picker(ctx);
+            }
+            RightPanelAction::AttachBrowserElement { index } => {
+                self.attach_browser_element_as_context(*index, ctx);
+            }
             RightPanelAction::OpenRepository => {
                 if let Some(active_pane_group) = &self.active_pane_group {
                     let terminal_view = active_pane_group.read(ctx, |pane_group, ctx| {
@@ -1826,8 +4023,53 @@ impl TypedActionView for RightPanelView {
 impl TypedActionView for RightPanelView {
     type Action = RightPanelAction;
 
-    fn handle_action(&mut self, _action: &Self::Action, _ctx: &mut ViewContext<Self>) {
-        // No actions when local_fs is disabled
+    fn handle_action(&mut self, action: &Self::Action, ctx: &mut ViewContext<Self>) {
+        match action {
+            RightPanelAction::SetMode(mode) => self.set_active_mode(*mode, ctx),
+            RightPanelAction::ToggleMaximize => {
+                ctx.emit(RightPanelEvent::ToggleMaximize);
+                ctx.notify();
+            }
+            RightPanelAction::OpenBrowserCurrentUrl => {
+                if let Some(url) = self.current_browser_url_from_editor(ctx) {
+                    self.open_browser_url(url, ctx);
+                }
+            }
+            RightPanelAction::OpenBrowserExternal => {
+                self.open_browser_external(ctx);
+            }
+            RightPanelAction::CopyBrowserUrl => {
+                if let Some(url) = self.current_browser_url_from_editor(ctx) {
+                    ctx.clipboard().write(ClipboardContent::plain_text(url));
+                }
+            }
+            RightPanelAction::RefreshBrowserUrl => {
+                if let Some(url) = self.browser_current_url.clone() {
+                    self.open_browser_url(url, ctx);
+                } else if let Some(url) = self.current_browser_url_from_editor(ctx) {
+                    self.open_browser_url(url, ctx);
+                }
+            }
+            RightPanelAction::BrowserBack => {
+                if self.can_browser_go_back() {
+                    self.navigate_browser_history(-1, ctx);
+                }
+            }
+            RightPanelAction::BrowserForward => {
+                if self.can_browser_go_forward() {
+                    self.navigate_browser_history(1, ctx);
+                }
+            }
+            RightPanelAction::ToggleBrowserElementPicker => {
+                self.toggle_browser_element_picker(ctx);
+            }
+            RightPanelAction::AttachBrowserElement { index } => {
+                self.attach_browser_element_as_context(*index, ctx);
+            }
+            RightPanelAction::ToggleFileSidebar
+            | RightPanelAction::SelectRepo { .. }
+            | RightPanelAction::OpenRepository => {}
+        }
     }
 }
 

@@ -9,7 +9,7 @@ use warpui::App;
 
 use super::{
     build_diff_hunk_prompt, build_review_prompt, build_selection_line_range_prompt,
-    build_selection_substring_prompt, CLIAgent, UBER_TEAM_UID,
+    build_selection_substring_prompt, AgentReasoningEffort, CLIAgent, UBER_TEAM_UID,
 };
 use crate::ai::agent::{AgentReviewCommentBatch, DiffSetHunk};
 use crate::code::buffer_location::LocalOrRemotePath;
@@ -56,6 +56,100 @@ fn resume_command_quotes_session_ids() {
 fn resume_command_ignores_empty_or_unsupported_agents() {
     assert_eq!(CLIAgent::Claude.resume_command("   "), None);
     assert_eq!(CLIAgent::OpenCode.resume_command("session-id"), None);
+}
+
+#[test]
+fn command_with_reasoning_effort_maps_supported_agents() {
+    assert_eq!(
+        CLIAgent::Claude.command_with_reasoning_effort(AgentReasoningEffort::High),
+        "claude --effort high"
+    );
+    assert_eq!(
+        CLIAgent::Codex.command_with_reasoning_effort(AgentReasoningEffort::Medium),
+        "codex -c model_reasoning_effort=medium"
+    );
+    assert_eq!(
+        CLIAgent::Codex.command_with_reasoning_effort(AgentReasoningEffort::ExtraHigh),
+        "codex -c model_reasoning_effort=xhigh"
+    );
+    assert_eq!(
+        CLIAgent::Claude.command_with_reasoning_effort(AgentReasoningEffort::Max),
+        "claude --effort max"
+    );
+    assert_eq!(
+        CLIAgent::Claude.command_with_reasoning_effort(AgentReasoningEffort::Ultracode),
+        "claude --settings '{\"ultracode\":true}'"
+    );
+    assert_eq!(
+        CLIAgent::Droid.command_with_reasoning_effort(AgentReasoningEffort::High),
+        "droid --reasoning-effort high"
+    );
+    assert_eq!(
+        CLIAgent::Droid.command_with_reasoning_effort(AgentReasoningEffort::Off),
+        "droid --reasoning-effort off"
+    );
+    assert_eq!(
+        CLIAgent::Droid.command_with_reasoning_effort(AgentReasoningEffort::NoReasoning),
+        "droid --reasoning-effort none"
+    );
+}
+
+#[test]
+fn command_with_reasoning_effort_leaves_auto_and_unsupported_agents_plain() {
+    assert_eq!(
+        CLIAgent::Codex.command_with_reasoning_effort(AgentReasoningEffort::Auto),
+        "codex"
+    );
+    assert_eq!(
+        CLIAgent::Gemini.command_with_reasoning_effort(AgentReasoningEffort::High),
+        "gemini"
+    );
+    assert_eq!(
+        CLIAgent::OpenCode.command_with_reasoning_effort(AgentReasoningEffort::High),
+        "opencode"
+    );
+    assert_eq!(
+        CLIAgent::Codex.command_with_reasoning_effort(AgentReasoningEffort::Max),
+        "codex"
+    );
+    assert_eq!(
+        CLIAgent::Codex.command_with_reasoning_effort(AgentReasoningEffort::Ultracode),
+        "codex"
+    );
+}
+
+#[test]
+fn in_session_reasoning_effort_command_maps_supported_agents() {
+    assert_eq!(
+        CLIAgent::Claude
+            .in_session_reasoning_effort_command(AgentReasoningEffort::ExtraHigh, None,),
+        Some("/effort xhigh\n".to_owned())
+    );
+    assert_eq!(
+        CLIAgent::Codex.in_session_reasoning_effort_command(
+            AgentReasoningEffort::ExtraHigh,
+            Some(AgentReasoningEffort::High),
+        ),
+        Some("\x1b.".to_owned())
+    );
+    assert_eq!(
+        CLIAgent::Codex.in_session_reasoning_effort_command(
+            AgentReasoningEffort::Low,
+            Some(AgentReasoningEffort::ExtraHigh),
+        ),
+        Some("\x1b,\x1b,\x1b,".to_owned())
+    );
+    assert_eq!(
+        CLIAgent::Codex.in_session_reasoning_effort_command(
+            AgentReasoningEffort::High,
+            Some(AgentReasoningEffort::High),
+        ),
+        None
+    );
+    assert_eq!(
+        CLIAgent::Codex.in_session_reasoning_effort_command(AgentReasoningEffort::Low, None),
+        None
+    );
 }
 
 // ---------------------------------------------------------------------------

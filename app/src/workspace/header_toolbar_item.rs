@@ -28,6 +28,7 @@ use crate::workspace::tab_settings::TabSettings;
 pub enum HeaderToolbarItemKind {
     TabsPanel,
     ToolsPanel,
+    SshRemote,
     AgentManagement,
     CodeReview,
     NotificationsMailbox,
@@ -38,8 +39,9 @@ impl HeaderToolbarItemKind {
         match self {
             Self::TabsPanel => "Tabs Panel",
             Self::ToolsPanel => "Tools Panel",
+            Self::SshRemote => "SSH Remote",
             Self::AgentManagement => "Agent Management",
-            Self::CodeReview => "Code Review",
+            Self::CodeReview => "Right Panel",
             Self::NotificationsMailbox => "Notifications",
         }
     }
@@ -48,8 +50,9 @@ impl HeaderToolbarItemKind {
         match self {
             Self::TabsPanel => Icon::Menu,
             Self::ToolsPanel => Icon::Tool2,
+            Self::SshRemote => Icon::Cloud,
             Self::AgentManagement => Icon::Grid,
-            Self::CodeReview => Icon::Diff,
+            Self::CodeReview => Icon::Menu,
             Self::NotificationsMailbox => Icon::Inbox,
         }
     }
@@ -64,6 +67,7 @@ impl HeaderToolbarItemKind {
                     && *TabSettings::as_ref(app).use_vertical_tabs
             }
             Self::ToolsPanel => true,
+            Self::SshRemote => !cfg!(target_family = "wasm"),
             Self::AgentManagement => {
                 let is_web_anonymous_user = AuthStateProvider::as_ref(app)
                     .get()
@@ -94,15 +98,23 @@ impl HeaderToolbarItemKind {
     /// Whether this item opens a side panel (as opposed to replacing the content
     /// area or opening a popover).
     pub fn is_panel(&self) -> bool {
-        matches!(self, Self::TabsPanel | Self::ToolsPanel | Self::CodeReview)
+        matches!(
+            self,
+            Self::TabsPanel | Self::ToolsPanel | Self::SshRemote | Self::CodeReview
+        )
     }
 
     pub fn default_left() -> Vec<Self> {
-        vec![Self::TabsPanel, Self::ToolsPanel, Self::AgentManagement]
+        vec![
+            Self::TabsPanel,
+            Self::ToolsPanel,
+            Self::SshRemote,
+            Self::AgentManagement,
+        ]
     }
 
     pub fn default_right() -> Vec<Self> {
-        vec![Self::CodeReview, Self::NotificationsMailbox]
+        vec![Self::NotificationsMailbox, Self::CodeReview]
     }
 
     /// All toolbar item variants (availability filtering is done at the call site).
@@ -110,6 +122,7 @@ impl HeaderToolbarItemKind {
         vec![
             Self::TabsPanel,
             Self::ToolsPanel,
+            Self::SshRemote,
             Self::AgentManagement,
             Self::CodeReview,
             Self::NotificationsMailbox,

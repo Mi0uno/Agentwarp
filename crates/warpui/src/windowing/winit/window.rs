@@ -28,6 +28,8 @@ use winit::event_loop::{ActiveEventLoop, EventLoopProxy, OwnedDisplayHandle};
 use winit::monitor::MonitorHandle;
 #[cfg(windows)]
 use winit::platform::windows::{BackdropType, WindowExtWindows};
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{CursorIcon, Fullscreen, ResizeDirection, UserAttentionType, WindowLevel};
 
 use super::app::CustomEvent;
@@ -1618,6 +1620,17 @@ impl crate::platform::Window for Window {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    fn x11_window_id(&self) -> Option<u64> {
+        let inner = self.inner.borrow();
+        let window = inner.as_ref()?.window.window_handle().ok()?.as_raw();
+        match window {
+            RawWindowHandle::Xlib(handle) => Some(handle.window),
+            RawWindowHandle::Xcb(handle) => Some(handle.window.get() as u64),
+            _ => None,
+        }
     }
 
     fn set_titlebar_height(&self, height: f64) {

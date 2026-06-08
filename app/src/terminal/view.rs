@@ -232,7 +232,9 @@ use crate::ai::agent_conversations_model::{AgentConversationsModel, AgentConvers
 use crate::ai::ambient_agents::{
     conversation_output_status_from_conversation, AmbientAgentTaskId, AmbientConversationStatus,
 };
-use crate::ai::blocklist::agent_view::agent_input_footer::toolbar_item::AgentToolbarItemKind;
+use crate::ai::blocklist::agent_view::agent_input_footer::{
+    toolbar_item::AgentToolbarItemKind, SshRemoteTransferPhase, SshRemoteTransferStatus,
+};
 use crate::ai::blocklist::agent_view::{
     agent_view_bg_fill, fork_from_last_known_good_state_exchange_id,
     get_agent_view_entry_block_position_id, is_in_cloud_context, AgentViewController,
@@ -539,6 +541,7 @@ use crate::workflows::workflow::Workflow;
 use crate::workflows::WorkflowSelectionSource;
 use crate::workspace::sync_inputs::SyncedInputState;
 use crate::workspace::view::cloud_agent_capacity_modal::CloudAgentCapacityModalVariant;
+use crate::workspace::view::ssh_remote::{upload_local_files_to_remote_temp, SshRemoteModel};
 use crate::workspace::{
     CommandSearchOptions, ForkAIConversationParams, ForkFromExchange,
     ForkedConversationDestination, OneTimeModalModel, ToastStack, WorkspaceAction,
@@ -1935,6 +1938,10 @@ pub enum Event {
     ToggleLeftPanel {
         target_view: LeftPanelTargetView,
         force_open: bool,
+    },
+    /// Open the embedded SSH remote file explorer for the active remote environment.
+    OpenSshRemoteFileExplorer {
+        initial_path: Option<String>,
     },
     SlowBootstrap,
     OpenAgentProfileEditor {
@@ -5420,6 +5427,45 @@ impl TerminalView {
         });
     }
 
+    pub fn attach_selected_text_as_context(&mut self, text: String, ctx: &mut ViewContext<Self>) {
+        if text.trim().is_empty() {
+            return;
+        }
+
+        self.ai_context_model.update(ctx, |context_model, ctx| {
+            context_model.set_pending_context_selected_text(Some(text), false, ctx);
+        });
+        ctx.notify();
+    }
+
+    pub fn insert_browser_selection_into_agent(
+        &mut self,
+        text: String,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let text = text.trim().to_owned();
+        if text.is_empty() {
+            return;
+        }
+
+        let cli_agent_prompt = format!("Use this selected web page element as context:\n\n{text}");
+        if self
+            .try_send_text_to_cli_agent_or_rich_input(cli_agent_prompt, ctx)
+            .is_some()
+        {
+            return;
+        }
+
+        self.ai_context_model.update(ctx, |context_model, ctx| {
+            context_model.set_pending_context_selected_text(Some(text), false, ctx);
+        });
+        self.input.update(ctx, |input, ctx| {
+            input.ensure_agent_mode_for_ai_features(true, None, ctx);
+            input.focus_input_box(ctx);
+        });
+        ctx.notify();
+    }
+
     pub fn attach_plan_as_context(
         &mut self,
         ai_document_id: AIDocumentId,
@@ -8657,6 +8703,51 @@ impl TerminalView {
         ctx: &mut ViewContext<Self>,
     ) {
         self.typed_characters_on_terminal(text, ctx);
+    }
+
+    pub(crate) fn insert_paths_as_user_input(
+        &mut self,
+        paths: &[String],
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if paths.is_empty() {
+            return;
+        }
+        let input = warpui::clipboard_utils::escaped_paths_str(paths, Some(self.shell_family(ctx)));
+        self.typed_characters_on_terminal(&input, ctx);
+    }
+
+    fn set_ssh_remote_transfer_status(
+        &mut self,
+        phase: SshRemoteTransferPhase,
+        label: impl Into<String>,
+        progress: Option<f32>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let status = SshRemoteTransferStatus::new(label, phase, progress);
+        let agent_input_footer = self.input.as_ref(ctx).agent_input_footer().clone();
+        agent_input_footer.update(ctx, |footer, ctx| {
+            footer.set_ssh_remote_transfer_status(status, ctx);
+        });
+        self.use_agent_footer.update(ctx, |footer, ctx| {
+            footer.notify_and_notify_children(ctx);
+        });
+    }
+
+    fn clear_ssh_remote_transfer_status(&mut self, ctx: &mut ViewContext<Self>) {
+        let agent_input_footer = self.input.as_ref(ctx).agent_input_footer().clone();
+        agent_input_footer.update(ctx, |footer, ctx| {
+            footer.clear_ssh_remote_transfer_status(ctx);
+        });
+        self.use_agent_footer.update(ctx, |footer, ctx| {
+            footer.notify_and_notify_children(ctx);
+        });
+    }
+
+    fn clear_ssh_remote_transfer_status_after_delay(&mut self, ctx: &mut ViewContext<Self>) {
+        ctx.spawn(Timer::after(Duration::from_secs(2)), |terminal, _, ctx| {
+            terminal.clear_ssh_remote_transfer_status(ctx);
+        });
     }
 
     fn set_marked_text_on_terminal(
@@ -14500,6 +14591,11 @@ impl TerminalView {
         version: AgentOnboardingVersion,
         ctx: &mut ViewContext<Self>,
     ) {
+        if !AISettings::as_ref(ctx).is_any_ai_enabled(ctx) {
+            log::info!("Skipping agent onboarding tutorial because Warp Agent is disabled.");
+            return;
+        }
+
         // If we are already showing the onboarding callout, do nothing.
         if self.onboarding_callout_view.is_some() {
             log::warn!("Attempted to start onboarding tutorial when one is already active.");
@@ -16249,6 +16345,11 @@ impl TerminalView {
             let clipboard_content = ctx.clipboard().read();
 
             if is_cli_agent_paste && clipboard_content.has_image_data() {
+                if self.paste_clipboard_images_to_active_ssh_remote(clipboard_content.clone(), ctx)
+                {
+                    return;
+                }
+
                 if !cfg!(windows) {
                     self.write_user_bytes_to_pty(vec![escape_sequences::C0::SYN], ctx);
                     return;
@@ -16296,6 +16397,125 @@ impl TerminalView {
             }
             self.write_user_bytes_to_pty(copied.into_bytes(), ctx);
         }
+    }
+
+    fn paste_clipboard_images_to_active_ssh_remote(
+        &mut self,
+        clipboard_content: ClipboardContent,
+        ctx: &mut ViewContext<Self>,
+    ) -> bool {
+        let Some(host) = SshRemoteModel::as_ref(ctx).active_host().cloned() else {
+            return false;
+        };
+        let Some(images) = clipboard_content.images else {
+            return false;
+        };
+        if images.is_empty() {
+            return false;
+        }
+        let image_count = images.len();
+        let label = if image_count == 1 {
+            "Uploading image to SSH remote".to_owned()
+        } else {
+            format!("Uploading {image_count} images to SSH remote")
+        };
+        self.set_ssh_remote_transfer_status(
+            SshRemoteTransferPhase::Uploading,
+            label,
+            Some(0.45),
+            ctx,
+        );
+
+        ctx.spawn(
+            async move {
+                let upload_root = std::env::temp_dir()
+                    .join("agentwarp-ssh-clipboard")
+                    .join(Uuid::new_v4().to_string());
+                async_fs::create_dir_all(&upload_root)
+                    .await
+                    .map_err(|err| {
+                        format!(
+                            "Failed to create temporary image upload directory {}: {err}",
+                            upload_root.display()
+                        )
+                    })?;
+
+                let mut local_paths = Vec::new();
+                for (index, image) in images.into_iter().enumerate() {
+                    let ext = match image.mime_type.as_str() {
+                        "image/png" => "png",
+                        "image/jpeg" | "image/jpg" => "jpg",
+                        "image/gif" => "gif",
+                        "image/webp" => "webp",
+                        _ => "img",
+                    };
+                    let file_name = image
+                        .filename
+                        .filter(|name| !name.trim().is_empty())
+                        .unwrap_or_else(|| format!("pasted-image-{}.{}", index + 1, ext));
+                    let file_name = file_name
+                        .chars()
+                        .map(|ch| {
+                            if ch == '/' || ch == '\\' || ch == '\0' || ch.is_control() {
+                                '_'
+                            } else {
+                                ch
+                            }
+                        })
+                        .collect::<String>();
+                    let file_path = upload_root.join(file_name);
+                    async_fs::write(&file_path, image.data)
+                        .await
+                        .map_err(|err| {
+                            format!(
+                                "Failed to stage pasted image {}: {err}",
+                                file_path.display()
+                            )
+                        })?;
+                    local_paths.push(file_path.to_string_lossy().to_string());
+                }
+
+                let upload_result =
+                    upload_local_files_to_remote_temp(host, local_paths.clone()).await;
+                for local_path in &local_paths {
+                    let _ = async_fs::remove_file(local_path).await;
+                }
+                let _ = async_fs::remove_dir(&upload_root).await;
+                upload_result
+            },
+            |terminal, result, ctx| match result {
+                Ok(remote_paths) => {
+                    let uploaded_count = remote_paths.len();
+                    let label = if uploaded_count == 1 {
+                        "Image uploaded".to_owned()
+                    } else {
+                        format!("{uploaded_count} images uploaded")
+                    };
+                    terminal.set_ssh_remote_transfer_status(
+                        SshRemoteTransferPhase::Complete,
+                        label,
+                        Some(1.),
+                        ctx,
+                    );
+                    terminal.clear_ssh_remote_transfer_status_after_delay(ctx);
+                    terminal.insert_paths_as_user_input(&remote_paths, ctx);
+                }
+                Err(error) => {
+                    terminal.set_ssh_remote_transfer_status(
+                        SshRemoteTransferPhase::Failed,
+                        "Image upload failed",
+                        Some(1.),
+                        ctx,
+                    );
+                    terminal.clear_ssh_remote_transfer_status_after_delay(ctx);
+                    terminal.show_error_toast(
+                        format!("Failed to paste image to SSH remote: {error}"),
+                        ctx,
+                    );
+                }
+            },
+        );
+        true
     }
 
     fn has_active_cli_agent_session(&self, ctx: &AppContext) -> bool {
@@ -20610,9 +20830,11 @@ impl TerminalView {
         block_index: BlockIndex,
         ctx: &mut ViewContext<Self>,
     ) {
-        if AuthStateProvider::as_ref(ctx)
-            .get()
-            .is_anonymous_or_logged_out()
+        if !cfg!(feature = "skip_login")
+            && !FeatureFlag::SkipFirebaseAnonymousUser.is_enabled()
+            && AuthStateProvider::as_ref(ctx)
+                .get()
+                .is_anonymous_or_logged_out()
         {
             AuthManager::handle(ctx).update(ctx, |auth_manager, ctx| {
                 auth_manager.attempt_login_gated_feature(
@@ -25107,6 +25329,67 @@ impl TerminalView {
         self.cursor_position_id.clone()
     }
 
+    fn upload_and_insert_files_for_active_ssh_remote(
+        &mut self,
+        paths: &[String],
+        ctx: &mut ViewContext<Self>,
+    ) -> bool {
+        let Some(host) = SshRemoteModel::as_ref(ctx).active_host().cloned() else {
+            return false;
+        };
+        if paths.is_empty() {
+            return true;
+        }
+        let file_count = paths.len();
+        let label = if file_count == 1 {
+            "Uploading file to SSH remote".to_owned()
+        } else {
+            format!("Uploading {file_count} files to SSH remote")
+        };
+        self.set_ssh_remote_transfer_status(
+            SshRemoteTransferPhase::Uploading,
+            label,
+            Some(0.45),
+            ctx,
+        );
+        let paths = paths.to_vec();
+        ctx.spawn(
+            upload_local_files_to_remote_temp(host, paths),
+            |terminal, result, ctx| match result {
+                Ok(remote_paths) => {
+                    let uploaded_count = remote_paths.len();
+                    let label = if uploaded_count == 1 {
+                        "Uploaded file".to_owned()
+                    } else {
+                        format!("Uploaded {uploaded_count} files")
+                    };
+                    terminal.set_ssh_remote_transfer_status(
+                        SshRemoteTransferPhase::Complete,
+                        label,
+                        Some(1.),
+                        ctx,
+                    );
+                    terminal.clear_ssh_remote_transfer_status_after_delay(ctx);
+                    terminal.insert_paths_as_user_input(&remote_paths, ctx);
+                }
+                Err(error) => {
+                    terminal.set_ssh_remote_transfer_status(
+                        SshRemoteTransferPhase::Failed,
+                        "Upload failed",
+                        Some(1.),
+                        ctx,
+                    );
+                    terminal.clear_ssh_remote_transfer_status_after_delay(ctx);
+                    terminal.show_error_toast(
+                        format!("Failed to upload file to SSH remote: {error}"),
+                        ctx,
+                    );
+                }
+            },
+        );
+        true
+    }
+
     fn drag_and_drop_files(&mut self, paths: &[String], ctx: &mut ViewContext<Self>) {
         self.is_file_drop_target = false;
         if paths.is_empty() {
@@ -25115,6 +25398,10 @@ impl TerminalView {
 
         // Focus this pane when files are dropped on it.
         self.redetermine_global_focus(ctx);
+
+        if self.upload_and_insert_files_for_active_ssh_remote(paths, ctx) {
+            return;
+        }
 
         // Check if we're in a long-running command
         let is_in_long_running_command = self
@@ -26284,6 +26571,10 @@ impl TypedActionView for TerminalView {
                         self.add_agentic_suggestions_block(ctx);
                     }
                     OnboardingVersion::Agent(agent_version) => {
+                        if !AISettings::as_ref(ctx).is_any_ai_enabled(ctx) {
+                            return;
+                        }
+
                         // The first Agent Modality callout expects terminal mode. If the
                         // default session mode is Agent (e.g. cloud-synced settings),
                         // the tab may already be in agent view — exit it first.
@@ -26449,6 +26740,12 @@ impl TypedActionView for TerminalView {
                 ctx.open_url(&hyperlink.url);
             }
             AttemptLoginGatedFeature => {
+                if cfg!(feature = "skip_login")
+                    || FeatureFlag::SkipFirebaseAnonymousUser.is_enabled()
+                {
+                    return;
+                }
+
                 AuthManager::handle(ctx).update(ctx, |auth_manager, ctx| {
                     auth_manager.attempt_login_gated_feature(
                         "Upgrade AI Usage",

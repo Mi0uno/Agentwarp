@@ -36,12 +36,14 @@ use warpify_page::{WarpifyPageAction, WarpifyPageView};
 use warpui::elements::{
     Align, Border, ChildAnchor, ChildView, Clipped, ClippedScrollStateHandle, ClippedScrollable,
     ConstrainedBox, Container, CornerRadius, CrossAxisAlignment, DispatchEventResult, Empty,
-    EventHandler, Expanded, Fill, Flex, MainAxisSize, OffsetPositioning, ParentAnchor,
-    ParentElement, ParentOffsetBounds, Radius, SavePosition, ScrollbarWidth, Shrinkable, Stack,
-    Text,
+    EventHandler, Expanded, Fill, Flex, MainAxisSize, MouseStateHandle, OffsetPositioning,
+    ParentAnchor, ParentElement, ParentOffsetBounds, Radius, SavePosition, ScrollbarWidth,
+    Shrinkable, Stack, Text,
 };
 use warpui::fonts::{Properties, Weight};
 use warpui::keymap::{ContextPredicate, EnabledPredicate, FixedBinding};
+use warpui::platform::Cursor;
+use warpui::ui_components::components::UiComponent;
 use warpui::{
     id, Action, AppContext, Element, Entity, ModelHandle, SingletonEntity, TypedActionView,
     UpdateView as _, View, ViewContext, ViewHandle,
@@ -64,7 +66,8 @@ use crate::settings::{AISettings, BlockVisibilitySettings, SettingsFileError};
 use crate::settings_view::mcp_servers_page::{MCPServersSettingsPage, MCPServersSettingsPageEvent};
 use crate::terminal::model::blockgrid::BlockGrid;
 use crate::terminal::SizeInfo;
-use crate::ui_components::icons;
+use crate::ui_components::buttons::icon_button;
+use crate::ui_components::icons::{self, Icon};
 use crate::util::bindings::{keybinding_name_to_display_string, BindingGroup, CustomAction};
 use crate::view_components::ToastFlavor;
 use crate::workspace::WorkspaceAction;
@@ -237,10 +240,10 @@ pub enum SettingsViewEvent {
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum SettingsSection {
     About,
-    #[default]
     Account,
     MCPServers,
     BillingAndUsage,
+    #[default]
     Appearance,
     Features,
     Keybindings,
@@ -251,7 +254,7 @@ pub enum SettingsSection {
     WarpDrive,
     Warpify,
     /// Internal backing-page identifier for AISettingsPageView. Multiple subpages
-    /// (WarpAgent, AgentProfiles, Knowledge, ThirdPartyCLIAgents) share this single
+    /// (WarpAgent, AgentProfiles, Knowledge, AgentBuiltinPrompts, ThirdPartyCLIAgents, AgentApiProfiles) share this single
     /// backing page, so this variant is needed as the key in `settings_pages`.
     /// External callers should navigate to a specific subpage (e.g. `WarpAgent`) instead.
     AI,
@@ -260,7 +263,9 @@ pub enum SettingsSection {
     AgentProfiles,
     AgentMCPServers,
     Knowledge,
+    AgentBuiltinPrompts,
     ThirdPartyCLIAgents,
+    AgentApiProfiles,
     /// Internal backing-page identifier for CodeSettingsPageView. Multiple subpages
     /// (CodeIndexing, EditorAndCodeReview) share this single backing page,
     /// so this variant is needed as the key in `settings_pages`.
@@ -290,7 +295,9 @@ impl Display for SettingsSection {
             SettingsSection::AgentProfiles => write!(f, "Profiles"),
             SettingsSection::AgentMCPServers => write!(f, "MCP servers"),
             SettingsSection::Knowledge => write!(f, "Knowledge"),
+            SettingsSection::AgentBuiltinPrompts => write!(f, "System prompts"),
             SettingsSection::ThirdPartyCLIAgents => write!(f, "Third party CLI agents"),
+            SettingsSection::AgentApiProfiles => write!(f, "Agent API"),
             SettingsSection::CodeIndexing => write!(f, "Indexing and projects"),
             SettingsSection::EditorAndCodeReview => write!(f, "Editor and Code Review"),
             SettingsSection::CloudEnvironments => write!(f, "Environments"),
@@ -301,6 +308,13 @@ impl Display for SettingsSection {
 }
 
 impl SettingsSection {
+    pub fn is_account_module(&self) -> bool {
+        matches!(
+            self,
+            Self::Account | Self::BillingAndUsage | Self::Referrals | Self::Teams
+        )
+    }
+
     /// Returns true if this section is a subpage under any umbrella.
     pub fn is_subpage(&self) -> bool {
         self.is_ai_subpage() || self.is_code_subpage() || self.is_cloud_platform_subpage()
@@ -314,7 +328,9 @@ impl SettingsSection {
                 | Self::AgentProfiles
                 | Self::AgentMCPServers
                 | Self::Knowledge
+                | Self::AgentBuiltinPrompts
                 | Self::ThirdPartyCLIAgents
+                | Self::AgentApiProfiles
         )
     }
 
@@ -351,7 +367,9 @@ impl SettingsSection {
             Self::AgentProfiles,
             Self::AgentMCPServers,
             Self::Knowledge,
+            Self::AgentBuiltinPrompts,
             Self::ThirdPartyCLIAgents,
+            Self::AgentApiProfiles,
         ]
     }
 
@@ -391,7 +409,11 @@ impl FromStr for SettingsSection {
             "Profiles" | "AgentProfiles" => Ok(Self::AgentProfiles),
             "MCP servers" | "AgentMCPServers" => Ok(Self::AgentMCPServers),
             "Knowledge" => Ok(Self::Knowledge),
+            "Built-in prompts" | "System prompts" | "AgentBuiltinPrompts" => {
+                Ok(Self::AgentBuiltinPrompts)
+            }
             "Third party CLI agents" | "ThirdPartyCLIAgents" => Ok(Self::ThirdPartyCLIAgents),
+            "Agent API" | "AgentApiProfiles" => Ok(Self::AgentApiProfiles),
             "Indexing and projects" | "CodeIndexing" => Ok(Self::CodeIndexing),
             "Editor and Code Review" | "EditorAndCodeReview" => Ok(Self::EditorAndCodeReview),
             "CloudEnvironments" => Ok(Self::CloudEnvironments),
@@ -1098,6 +1120,7 @@ pub struct SettingsView {
     /// per `SettingsView` per `WARP.md`'s guidance that inline
     /// `MouseStateHandle::default()` breaks hover/click tracking.
     footer_mouse_states: SettingsFooterMouseStates,
+    back_button: MouseStateHandle,
 }
 
 impl SettingsView {
@@ -1277,12 +1300,10 @@ impl SettingsView {
         // Build sidebar nav items. AI page is presented as an "Agents" umbrella
         // with subpages; the actual AI SettingsPage is hidden from direct sidebar listing.
         let mut nav_items = vec![
-            SettingsNavItem::Page(SettingsSection::Account),
             SettingsNavItem::Umbrella(SettingsUmbrella::new(
                 "Agents",
                 SettingsSection::ai_subpages().to_vec(),
             )),
-            SettingsNavItem::Page(SettingsSection::BillingAndUsage),
             SettingsNavItem::Umbrella(SettingsUmbrella::new(
                 "Code",
                 vec![
@@ -1297,12 +1318,10 @@ impl SettingsView {
                     SettingsSection::OzCloudAPIKeys,
                 ],
             )),
-            SettingsNavItem::Page(SettingsSection::Teams),
             SettingsNavItem::Page(SettingsSection::Appearance),
             SettingsNavItem::Page(SettingsSection::Features),
             SettingsNavItem::Page(SettingsSection::Keybindings),
             SettingsNavItem::Page(SettingsSection::Warpify),
-            SettingsNavItem::Page(SettingsSection::Referrals),
             SettingsNavItem::Page(SettingsSection::SharedBlocks),
             SettingsNavItem::Page(SettingsSection::WarpDrive),
             SettingsNavItem::Page(SettingsSection::Privacy),
@@ -1313,6 +1332,7 @@ impl SettingsView {
         let initial_page = match page {
             Some(SettingsSection::AI) => SettingsSection::WarpAgent,
             Some(SettingsSection::Code) => SettingsSection::CodeIndexing,
+            Some(section) if section.is_account_module() => SettingsSection::Appearance,
             Some(section) if section.is_subpage() => section,
             other => other.unwrap_or_default(),
         };
@@ -1349,6 +1369,7 @@ impl SettingsView {
             settings_file_error: None,
             settings_error_banner_dismissed: false,
             footer_mouse_states: SettingsFooterMouseStates::default(),
+            back_button: MouseStateHandle::default(),
         }
     }
 
@@ -1949,6 +1970,7 @@ impl SettingsView {
         let section = match section {
             SettingsSection::AI => SettingsSection::WarpAgent,
             SettingsSection::Code => SettingsSection::CodeIndexing,
+            section if section.is_account_module() => SettingsSection::Appearance,
             other => other,
         };
 
@@ -2042,6 +2064,10 @@ impl SettingsView {
     }
 
     fn should_render_page(&self, settings_page: &SettingsPage, app: &AppContext) -> bool {
+        if settings_page.section.is_account_module() {
+            return false;
+        }
+
         match &settings_page.view_handle {
             SettingsPageViewHandle::Main(v) => v.as_ref(app).should_render(app),
             SettingsPageViewHandle::Teams(v) => v.as_ref(app).should_render(app),
@@ -2320,6 +2346,24 @@ impl SettingsView {
         .finish()
     }
 
+    fn render_back_button(&self, appearance: &Appearance) -> Box<dyn Element> {
+        let ui_builder = appearance.ui_builder().clone();
+        let button = icon_button(appearance, Icon::ArrowLeft, false, self.back_button.clone())
+            .with_tooltip(move || ui_builder.tool_tip("Back".to_string()).build().finish())
+            .build()
+            .on_click(|ctx, _, _| {
+                ctx.dispatch_typed_action(SettingsAction::Close);
+            })
+            .with_cursor(Cursor::PointingHand)
+            .finish();
+
+        Container::new(Align::new(button).left().finish())
+            .with_margin_left(16.)
+            .with_margin_right(16.)
+            .with_margin_bottom(8.)
+            .finish()
+    }
+
     fn render_search_zero_state(&self, appearance: &Appearance) -> Box<dyn Element> {
         let theme = appearance.theme();
         Container::new(
@@ -2386,6 +2430,7 @@ impl View for SettingsView {
 
         let mut buttons = Flex::column()
             .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+            .with_child(self.render_back_button(appearance))
             .with_child(self.render_search_editor(appearance));
 
         // Render sidebar using nav_items (pages + umbrellas).

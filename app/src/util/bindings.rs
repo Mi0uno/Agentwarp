@@ -132,6 +132,7 @@ pub enum CustomAction {
     GoToLine,
     ToggleGlobalSearch,
     ToggleConversationListView,
+    ToggleSshRemote,
 }
 
 lazy_static! {
@@ -426,6 +427,13 @@ pub fn custom_tag_to_keystroke(custom: CustomTag) -> Option<Keystroke> {
                 Keystroke::parse("ctrl-2").ok()
             } else {
                 Keystroke::parse("alt-2").ok()
+            }
+        }
+        CustomAction::ToggleSshRemote => {
+            if OperatingSystem::get().is_mac() {
+                Keystroke::parse("ctrl-5").ok()
+            } else {
+                Keystroke::parse("alt-5").ok()
             }
         }
         CustomAction::NewTerminalTab

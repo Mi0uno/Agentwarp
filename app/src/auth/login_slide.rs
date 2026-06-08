@@ -374,6 +374,11 @@ impl LoginSlideView {
     }
 
     fn handle_pasted_auth_url(&mut self, pasted_url: String, ctx: &mut ViewContext<Self>) {
+        if Self::warp_login_disabled() {
+            log::info!("Ignoring pasted Warp auth URL because login is disabled");
+            return;
+        }
+
         match AuthRedirectPayload::from_raw_url(pasted_url) {
             Ok(redirect_payload) => {
                 AuthManager::handle(ctx).update(ctx, |auth_manager, ctx| {
@@ -398,7 +403,7 @@ impl LoginSlideView {
             },
             ctx
         );
-        if FeatureFlag::SkipFirebaseAnonymousUser.is_enabled() {
+        if Self::warp_login_disabled() {
             AuthManager::handle(ctx).update(ctx, |_, ctx| {
                 ctx.emit(AuthManagerEvent::SkippedLogin);
             });
@@ -408,6 +413,10 @@ impl LoginSlideView {
             });
         }
         ctx.emit(LoginSlideEvent::LoginLaterConfirmed);
+    }
+
+    fn warp_login_disabled() -> bool {
+        cfg!(feature = "skip_login") || FeatureFlag::SkipFirebaseAnonymousUser.is_enabled()
     }
 
     // ------------------------------------------------------------------
@@ -1179,6 +1188,10 @@ impl TypedActionView for LoginSlideView {
                     self.handle_login_later(ctx);
                     return;
                 }
+                if Self::warp_login_disabled() {
+                    self.handle_login_later(ctx);
+                    return;
+                }
                 // Otherwise Enter is log in
                 send_telemetry_from_ctx!(
                     TelemetryEvent::LoginButtonClicked {
@@ -1267,6 +1280,9 @@ impl TypedActionView for LoginSlideView {
                 }
             },
             LoginSlideAction::CopyLoginUrl => {
+                if Self::warp_login_disabled() {
+                    return;
+                }
                 AuthManager::handle(ctx).update(ctx, |auth_manager, inner_ctx| {
                     let sign_in_url = auth_manager.sign_in_url();
                     inner_ctx.clipboard().write(ClipboardContent {

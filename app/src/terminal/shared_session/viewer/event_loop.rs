@@ -180,8 +180,11 @@ impl EventLoop {
                     let mut model = self.terminal_model.lock();
                     let decompressed = lz4_flex::block::decompress_size_prepended(&bytes)
                         .expect("Should be able to decompress the PtyBytesRead event");
-                    self.parser
-                        .parse_bytes(&mut *model, &decompressed, &mut self.sink);
+                    let filtered_bytes = model.filter_unrelated_pty_warning_bytes(&decompressed);
+                    if !filtered_bytes.is_empty() {
+                        self.parser
+                            .parse_bytes(&mut *model, &filtered_bytes, &mut self.sink);
+                    }
                 }
                 OrderedTerminalEventType::CommandExecutionStarted {
                     participant_id,

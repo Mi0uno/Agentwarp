@@ -105,6 +105,10 @@ impl CloudAgentCapacityModal {
     }
 
     fn cta_url(&self, ctx: &ViewContext<Self>) -> Option<String> {
+        if cfg!(feature = "skip_login") {
+            return None;
+        }
+
         let customer_type = UserWorkspaces::handle(ctx)
             .as_ref(ctx)
             .current_workspace()
@@ -142,8 +146,10 @@ impl CloudAgentCapacityModal {
             .finish();
 
         // Explanation.
-        let can_upgrade = Self::can_upgrade(customer_type, self.variant);
-        let show_cta = Self::should_show_cta(customer_type, self.variant);
+        let can_upgrade =
+            !cfg!(feature = "skip_login") && Self::can_upgrade(customer_type, self.variant);
+        let show_cta =
+            !cfg!(feature = "skip_login") && Self::should_show_cta(customer_type, self.variant);
         if can_upgrade {
             let upgrade_suffix = match self.variant {
                 CloudAgentCapacityModalVariant::ConcurrentLimit => {

@@ -95,6 +95,10 @@ impl Workspace {
             return;
         }
 
+        if !AISettings::as_ref(ctx).is_any_ai_enabled(ctx) {
+            return;
+        }
+
         match tutorial {
             OnboardingTutorial::InitProject {
                 ref path,
@@ -159,9 +163,7 @@ impl Workspace {
 
         // With new onboarding, skip the guided tour when AI is not enabled
         // (e.g. terminal-intent users or users who disabled AI).
-        if FeatureFlag::OpenWarpNewSettingsModes.is_enabled()
-            && !*AISettings::as_ref(ctx).is_any_ai_enabled
-        {
+        if !AISettings::as_ref(ctx).is_any_ai_enabled(ctx) {
             return;
         }
 
@@ -197,6 +199,10 @@ impl Workspace {
         intention: OnboardingIntention,
         ctx: &mut ViewContext<Self>,
     ) {
+        if !AISettings::as_ref(ctx).is_any_ai_enabled(ctx) {
+            return;
+        }
+
         let version = OnboardingVersion::Agent(if FeatureFlag::AgentView.is_enabled() {
             AgentOnboardingVersion::AgentModality {
                 has_project,
@@ -257,6 +263,7 @@ impl Workspace {
         if !AppExecutionMode::as_ref(ctx).can_show_onboarding() {
             return false;
         }
-        FeatureFlag::AgentOnboarding.is_enabled()
+
+        FeatureFlag::AgentOnboarding.is_enabled() && AISettings::as_ref(ctx).is_any_ai_enabled(ctx)
     }
 }

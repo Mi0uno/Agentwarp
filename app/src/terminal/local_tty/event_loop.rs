@@ -245,12 +245,15 @@ where
                 }),
             };
 
-            // Process the bytes read into the buffer.
-            state.parser.parse_bytes(
-                terminal.deref_mut(),
-                &buf[..bytes_in_buffer],
-                &mut self.pty.writer(),
-            );
+            let filtered_bytes =
+                terminal.filter_unrelated_pty_warning_bytes(&buf[..bytes_in_buffer]);
+            if !filtered_bytes.is_empty() {
+                state.parser.parse_bytes(
+                    terminal.deref_mut(),
+                    &filtered_bytes,
+                    &mut self.pty.writer(),
+                );
+            }
 
             bytes_processed += bytes_in_buffer;
             bytes_in_buffer = 0;

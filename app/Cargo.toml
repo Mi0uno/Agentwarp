@@ -53,6 +53,16 @@ name = "generate_settings_schema"
 path = "src/bin/generate_settings_schema.rs"
 test = false
 
+[[bin]]
+name = "agentwarp-ssh-pty"
+path = "src/bin/agentwarp_ssh_pty.rs"
+test = false
+
+[[bin]]
+name = "agentwarp-agent-api-proxy"
+path = "src/bin/agentwarp_agent_api_proxy.rs"
+test = false
+
 [dependencies]
 addr = "0.15.6"
 ai.workspace = true
@@ -119,6 +129,7 @@ handlebars.workspace = true
 hex.workspace = true
 http.workspace = true
 http_client.workspace = true
+html5ever.workspace = true
 image.workspace = true
 infer = "0.19.0"
 jaq-json.workspace = true
@@ -146,6 +157,7 @@ warp_logging.workspace = true
 sentry = { workspace = true, optional = true }
 lz4_flex = "0.11"
 markdown_parser.workspace = true
+markup5ever_rcdom = "0.35.0"
 memchr.workspace = true
 memo-map.workspace = true
 mermaid_to_svg.workspace = true
@@ -311,7 +323,8 @@ http_server.workspace = true
 hyper.workspace = true
 libsqlite3-sys = { version = "0.33.0", features = ["bundled"] }
 mio = { version = "1.1.1", features = ["os-poll", "os-ext"] }
-tokio.workspace = true
+ssh2.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "process", "rt-multi-thread"] }
 tokio-util.workspace = true
 
 # AWS SDK (loading credentials for BYO LLM)
@@ -658,6 +671,7 @@ default = [
     "trim_trailing_blank_lines",
     "open_warp_new_settings_modes",
     "skip_firebase_anonymous_user",
+    "skip_login",
     "settings_file",
     "directory_tab_colors",
     "git_credential_refresh",

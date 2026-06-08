@@ -1530,6 +1530,11 @@ impl ServerApiProvider {
                         ctx.dispatch_global_action("app:log_out", ());
                     }
                     AuthEvent::NeedsReauth => {
+                        if cfg!(feature = "skip_login") {
+                            log::info!("Ignoring reauth request because Warp login is disabled");
+                            return;
+                        }
+
                         // AuthManager depends on a reference to ServerApi, so ServerApi can't easily
                         // hold a ref to AuthManager. To get around this, we emit an event on ServerApi
                         // and handle calling the AuthManager here instead.

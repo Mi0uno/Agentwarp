@@ -1412,6 +1412,11 @@ fn handle_terminal_view_event(
                     force_open: *force_open,
                 });
             }
+            Event::OpenSshRemoteFileExplorer { initial_path } => {
+                ctx.emit(pane_group::Event::OpenSshRemoteFileExplorer {
+                    initial_path: initial_path.clone(),
+                });
+            }
             Event::ToggleAIDocumentPane {
                 document_id,
                 document_version,

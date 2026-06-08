@@ -3,9 +3,9 @@ use std::marker::PhantomData;
 
 use pathfinder_color::ColorU;
 use warpui::elements::{
-    Border, ChildAnchor, ChildView, ConstrainedBox, Container, CornerRadius, Element, Fill, Icon,
-    MainAxisAlignment, MainAxisSize, MouseStateHandle, OffsetPositioning, ParentElement,
-    PositionedElementAnchor, PositionedElementOffsetBounds, SavePosition, Stack,
+    Border, ChildAnchor, ChildView, ConstrainedBox, Container, CornerRadius, Element, Fill,
+    Icon as WarpUiIcon, MainAxisAlignment, MainAxisSize, MouseStateHandle, OffsetPositioning,
+    ParentElement, PositionedElementAnchor, PositionedElementOffsetBounds, SavePosition, Stack,
 };
 use warpui::fonts::FamilyId;
 use warpui::geometry::vector::vec2f;
@@ -20,6 +20,7 @@ use warpui::{
 
 use crate::appearance::Appearance;
 use crate::menu::{Event as MenuEvent, Menu, MenuItem, MenuItemFields, MenuVariant};
+use crate::ui_components::icons::Icon as UiIcon;
 
 pub const TOP_MENU_BAR_HEIGHT: f32 = 30.;
 pub const TOP_MENU_BAR_MAX_WIDTH: f32 = 190.;
@@ -117,6 +118,8 @@ pub struct Dropdown<A: DropdownItemAction = ()> {
     font_color: Option<ColorU>,
     font_size: Option<f32>,
     padding: Option<Coords>,
+    top_bar_icon: Option<UiIcon>,
+    top_bar_icon_only: bool,
     /// Optional override for the top-bar background fill, applied on top
     /// of the variant's default style. Used by callers that need a
     /// per-call appearance distinct from the shared `DropdownStyle`
@@ -292,6 +295,8 @@ where
             font_color: None,
             font_size: None,
             padding: None,
+            top_bar_icon: None,
+            top_bar_icon_only: false,
             background: None,
             border_color: None,
             border_width: None,
@@ -355,6 +360,16 @@ where
 
     pub fn set_padding(&mut self, padding: Coords, ctx: &mut ViewContext<Self>) {
         self.padding = Some(padding);
+        ctx.notify();
+    }
+
+    pub fn set_top_bar_icon(&mut self, icon: UiIcon, ctx: &mut ViewContext<Self>) {
+        self.top_bar_icon = Some(icon);
+        ctx.notify();
+    }
+
+    pub fn set_top_bar_icon_only(&mut self, icon_only: bool, ctx: &mut ViewContext<Self>) {
+        self.top_bar_icon_only = icon_only;
         ctx.notify();
     }
 
@@ -569,8 +584,6 @@ where
     }
 
     fn render_top_bar(&self, appearance: &Appearance) -> Box<dyn Element> {
-        let icon_path = "bundled/svg/chevron-down.svg";
-
         let (selected_item_text, font_family_id) = match self.selected_item.clone() {
             Some(MenuItem::Item(fields)) => {
                 let label = fields.label();
@@ -583,6 +596,18 @@ where
             }
             _ => (String::new(), None),
         };
+        let selected_item_text = if self.top_bar_icon_only {
+            String::new()
+        } else {
+            selected_item_text
+        };
+        let icon_color = self
+            .font_color
+            .unwrap_or_else(|| appearance.theme().active_ui_text_color().into());
+        let icon = self
+            .top_bar_icon
+            .map(|icon| WarpUiIcon::new(icon.into(), icon_color))
+            .unwrap_or_else(|| WarpUiIcon::new("bundled/svg/chevron-down.svg", icon_color));
         let mut top_bar = appearance
             .ui_builder()
             .button(
@@ -597,18 +622,22 @@ where
                 TextAndIcon::new(
                     TextAndIconAlignment::TextFirst,
                     selected_item_text,
-                    Icon::new(
-                        icon_path,
-                        self.font_color
-                            .unwrap_or_else(|| appearance.theme().active_ui_text_color().into()),
-                    ),
+                    icon,
                     self.main_axis_size,
-                    MainAxisAlignment::SpaceBetween,
+                    if self.top_bar_icon_only {
+                        MainAxisAlignment::Center
+                    } else {
+                        MainAxisAlignment::SpaceBetween
+                    },
                     vec2f(15., 15.),
                 )
-                .with_inner_padding(match self.style {
-                    DropdownStyle::Secondary | DropdownStyle::ActionButtonSecondary => 10.,
-                    DropdownStyle::Naked => 6.,
+                .with_inner_padding(if self.top_bar_icon_only {
+                    6.
+                } else {
+                    match self.style {
+                        DropdownStyle::Secondary | DropdownStyle::ActionButtonSecondary => 10.,
+                        DropdownStyle::Naked => 6.,
+                    }
                 }),
             )
             .with_style(self.style.ui_component_styles())

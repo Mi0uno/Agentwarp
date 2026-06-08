@@ -37,8 +37,8 @@ use crate::settings_view::{SettingsAction as SettingsTabAction, SettingsSection}
 use crate::tab::{NewSessionMenuItem, SelectedTabColor};
 use crate::tab_configs::TabConfig;
 use crate::terminal::available_shells::AvailableShell;
+use crate::terminal::cli_agent::{AgentReasoningEffort, CLIAgent};
 use crate::terminal::view::inline_banner::ZeroStatePromptSuggestionType;
-use crate::terminal::CLIAgent;
 use crate::themes::theme::AnsiColorIdentifier;
 use crate::themes::theme_chooser::ThemeChooserMode;
 use crate::workflows::{WorkflowSelectionSource, WorkflowSource, WorkflowType};
@@ -333,6 +333,7 @@ pub enum WorkspaceAction {
     /// Toggles the vertical tabs panel. This happens as an explicit action from the user.
     ToggleVerticalTabsPanel,
     SetVerticalTabsPanelMode(VerticalTabsPanelMode),
+    ToggleAgentTerminalTabsCollapsed,
     ToggleVerticalTabsSettingsPopup,
     SetVerticalTabsDisplayGranularity(VerticalTabsDisplayGranularity),
     SetVerticalTabsTabItemMode(VerticalTabsTabItemMode),
@@ -620,15 +621,46 @@ pub enum WorkspaceAction {
     },
     /// Open a project folder picker for the Agent Sessions side panel.
     OpenAgentSessionProjectPicker,
+    /// Open a folder picker to replace an Agent Sessions project path.
+    EditAgentSessionProject {
+        project_path: PathBuf,
+    },
+    /// Remove an Agent Sessions project and its local session records.
+    DeleteAgentSessionProject {
+        project_path: PathBuf,
+    },
+    /// Delete an Agent Session and close its live terminal panes.
+    DeleteAgentSession {
+        session_id: String,
+    },
+    /// Disband an Agent Session group without deleting its session records.
+    DisbandAgentSessionGroup {
+        parent_session_id: String,
+    },
+    /// Detach live Agent Session terminal panes from their previous layout after regrouping.
+    DetachAgentSessionTerminalViews {
+        terminal_view_ids: Vec<EntityId>,
+    },
     /// Start a CLI agent session for a project from the Agent Sessions side panel.
     StartAgentSession {
         project_path: PathBuf,
         agent: CLIAgent,
+        reasoning_effort: AgentReasoningEffort,
     },
+    /// Start a child CLI agent session grouped under an existing Agent Session.
+    StartAgentChildSession {
+        parent_session_id: String,
+    },
+    /// Start a child CLI agent session from the currently active Agent Session terminal.
+    StartAgentChildSessionFromActive,
     /// Restore a session from the Agent Sessions side panel, focusing its terminal if it is live
     /// or reopening the agent in the session's project directory.
     RestoreAgentSession {
         session_id: String,
+    },
+    /// Open a parent Agent Session and its child sessions in a tmux-backed group tab.
+    RestoreAgentSessionGroup {
+        parent_session_id: String,
     },
     /// Open the native folder picker for a repo param in the tab-config modal after the
     /// current interaction cycle finishes.
@@ -643,6 +675,9 @@ pub enum WorkspaceAction {
     ToggleGlobalSearch,
     OpenGlobalSearch,
     ToggleConversationListView,
+    ToggleSshRemote,
+    ToggleSshRemoteEnvironmentMenu,
+    SelectSshRemoteEnvironment(String),
     /// Open the Build Plan Migration Modal (for debugging)
     #[cfg(debug_assertions)]
     OpenBuildPlanMigrationModal,
@@ -881,8 +916,16 @@ impl WorkspaceAction {
             | ForkAIConversation { .. }
             | SummarizeAIConversation { .. }
             | OpenRepository { .. }
+            | EditAgentSessionProject { .. }
+            | DeleteAgentSessionProject { .. }
+            | DeleteAgentSession { .. }
+            | DisbandAgentSessionGroup { .. }
+            | DetachAgentSessionTerminalViews { .. }
             | StartAgentSession { .. }
+            | StartAgentChildSession { .. }
+            | StartAgentChildSessionFromActive
             | RestoreAgentSession { .. }
+            | RestoreAgentSessionGroup { .. }
             | SelectTabConfig(_)
             | ToggleVerticalTabsPanel => true, // actions that actually change a state of the state of user's
             // workspace would most likely require a save, so that if the app gets
@@ -965,6 +1008,7 @@ impl WorkspaceAction {
             | ToggleRightPanel
             | OpenCodeReviewPanel(..)
             | SetVerticalTabsPanelMode(_)
+            | ToggleAgentTerminalTabsCollapsed
             | ToggleVerticalTabsSettingsPopup
             | SetVerticalTabsDisplayGranularity(_)
             | SetVerticalTabsTabItemMode(_)
@@ -1044,6 +1088,9 @@ impl WorkspaceAction {
             | ToggleGlobalSearch
             | OpenGlobalSearch
             | ToggleConversationListView
+            | ToggleSshRemote
+            | ToggleSshRemoteEnvironmentMenu
+            | SelectSshRemoteEnvironment(_)
             | ToggleNotificationMailbox { .. }
             | ToggleAgentManagementView
             | ViewAgentRunsForEnvironment { .. }

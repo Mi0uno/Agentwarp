@@ -1625,6 +1625,10 @@ pub struct RootView {
     paste_auth_token_modal: Option<ViewHandle<PasteAuthTokenModalView>>,
 }
 
+fn warp_login_disabled() -> bool {
+    cfg!(feature = "skip_login") || FeatureFlag::SkipFirebaseAnonymousUser.is_enabled()
+}
+
 impl RootView {
     pub fn new(
         global_resource_handles: GlobalResourceHandles,
@@ -1675,7 +1679,11 @@ impl RootView {
                     let should_show_pre_login_onboarding = FeatureFlag::OpenWarpNewSettingsModes.is_enabled()
                         && FeatureFlag::AgentOnboarding.is_enabled()
                         && !has_completed_local_onboarding;
-                    if FeatureFlag::ForceLogin.is_enabled() {
+                    if warp_login_disabled() && !should_show_pre_login_onboarding {
+                        // Login is disabled for this build; go straight into the
+                        // local workspace after any first-launch onboarding.
+                        AuthOnboardingState::Terminal(workspace_args.create_workspace(ctx))
+                    } else if FeatureFlag::ForceLogin.is_enabled() && !warp_login_disabled() {
                         // ForceLogin is true for Preview
                         AuthOnboardingState::Auth(workspace_args.into())
                     } else if should_show_pre_login_onboarding {
@@ -2164,7 +2172,8 @@ impl RootView {
                 let ai_enabled = selected_settings.is_ai_enabled();
                 let warp_drive_enabled = selected_settings.is_warp_drive_enabled();
                 // With old onboarding, we ask user to log in before onboarding, so don't do it after onboarding completes.
-                let requires_login = !is_logged_in
+                let requires_login = !warp_login_disabled()
+                    && !is_logged_in
                     && (ai_enabled || warp_drive_enabled)
                     && FeatureFlag::OpenWarpNewSettingsModes.is_enabled();
 
@@ -2263,11 +2272,19 @@ impl RootView {
                 ctx.notify();
             }
             AgentOnboardingEvent::UpgradeRequested => {
+                if warp_login_disabled() {
+                    log::info!("Ignoring upgrade request because Warp login is disabled");
+                    return;
+                }
                 let upgrade_url = AuthManager::handle(ctx)
                     .update(ctx, |auth_manager, _| auth_manager.upgrade_url());
                 ctx.open_url(&upgrade_url);
             }
             AgentOnboardingEvent::UpgradeCopyUrlRequested => {
+                if warp_login_disabled() {
+                    log::info!("Ignoring upgrade URL copy because Warp login is disabled");
+                    return;
+                }
                 let upgrade_url = AuthManager::handle(ctx)
                     .update(ctx, |auth_manager, _| auth_manager.upgrade_url());
                 ctx.clipboard().write(ClipboardContent {
@@ -2277,6 +2294,10 @@ impl RootView {
                 });
             }
             AgentOnboardingEvent::UpgradePasteTokenFromClipboardRequested => {
+                if warp_login_disabled() {
+                    log::info!("Ignoring upgrade token paste because Warp login is disabled");
+                    return;
+                }
                 let modal = ctx.add_typed_action_view(PasteAuthTokenModalView::new);
                 ctx.subscribe_to_view(&modal, |me, _, event, ctx| match event {
                     PasteAuthTokenModalEvent::Cancelled => {
@@ -2344,6 +2365,12 @@ impl RootView {
                 ctx.notify();
             }
             AgentOnboardingEvent::LoginFromWelcomeRequested => {
+                if warp_login_disabled() {
+                    log::info!(
+                        "Ignoring welcome-slide login request because Warp login is disabled"
+                    );
+                    return;
+                }
                 let AuthOnboardingState::Onboarding {
                     target,
                     onboarding_view,
@@ -2394,6 +2421,9 @@ impl RootView {
                 ctx.notify();
             }
             AgentOnboardingEvent::AppBecameActive => {
+                if warp_login_disabled() {
+                    return;
+                }
                 // fetch the models / workspace metadata when the user tabs/intents back
                 // into the app during onboarding after potentially upgrading
                 LLMPreferences::handle(ctx).update(ctx, |prefs, ctx| {

@@ -456,6 +456,10 @@ pub trait Window: 'static + WindowContext + std::any::Any {
     fn callbacks(&self) -> &WindowCallbacks;
 
     fn as_any(&self) -> &dyn std::any::Any;
+
+    fn x11_window_id(&self) -> Option<u64> {
+        None
+    }
 }
 
 pub trait WindowContext {

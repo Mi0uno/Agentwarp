@@ -140,6 +140,12 @@ impl AuthManager {
         enforce_state_validation: bool,
         ctx: &mut ModelContext<Self>,
     ) {
+        if Self::warp_login_disabled() {
+            log::info!("Ignoring Warp auth redirect because login is disabled");
+            ctx.emit(AuthManagerEvent::SkippedLogin);
+            return;
+        }
+
         let AuthRedirectPayload {
             refresh_token,
             user_uid,
@@ -207,6 +213,12 @@ impl AuthManager {
         auth_payload: AuthRedirectPayload,
         ctx: &mut ModelContext<Self>,
     ) {
+        if Self::warp_login_disabled() {
+            log::info!("Ignoring interrupted Warp auth payload because login is disabled");
+            ctx.emit(AuthManagerEvent::SkippedLogin);
+            return;
+        }
+
         let AuthRedirectPayload {
             refresh_token,
             user_uid: _,
@@ -266,6 +278,12 @@ impl AuthManager {
     /// This is only used by the Warp CLI if running on a device that does not have the Warp app installed.
     #[cfg_attr(target_family = "wasm", allow(dead_code))]
     pub fn authorize_device(&self, ctx: &mut ModelContext<Self>) {
+        if Self::warp_login_disabled() {
+            log::info!("Skipping device authorization because Warp login is disabled");
+            ctx.emit(AuthManagerEvent::SkippedLogin);
+            return;
+        }
+
         // Clear any stale user state so old credentials don't interfere
         // with the fresh device auth flow.
         self.auth_state.set_credentials(None);
@@ -574,6 +592,12 @@ impl AuthManager {
         referral_code: Option<String>,
         ctx: &mut ModelContext<Self>,
     ) {
+        if Self::warp_login_disabled() {
+            log::info!("Skipping anonymous Warp user creation because login is disabled");
+            ctx.emit(AuthManagerEvent::SkippedLogin);
+            return;
+        }
+
         let anonymous_user_type = AnonymousUserType::NativeClientAnonymousUserFeatureGated;
 
         let auth_client = self.auth_client.clone();
@@ -637,6 +661,11 @@ impl AuthManager {
         auth_view_variant: AuthViewVariant,
         ctx: &mut ModelContext<Self>,
     ) {
+        if Self::warp_login_disabled() {
+            log::info!("Ignoring login-gated feature `{feature}` because Warp login is disabled");
+            return;
+        }
+
         if self.auth_state.is_anonymous_or_logged_out() {
             send_telemetry_from_ctx!(
                 TelemetryEvent::AnonymousUserAttemptLoginGatedFeature { feature },
@@ -647,6 +676,11 @@ impl AuthManager {
     }
 
     pub fn anonymous_user_hit_drive_object_limit(&self, ctx: &mut ModelContext<Self>) {
+        if Self::warp_login_disabled() {
+            log::info!("Ignoring anonymous user object limit because Warp login is disabled");
+            return;
+        }
+
         if self.auth_state.is_anonymous_or_logged_out() {
             send_telemetry_from_ctx!(TelemetryEvent::AnonymousUserHitCloudObjectLimit, ctx);
             ctx.emit(AuthManagerEvent::AttemptedLoginGatedFeature {
@@ -660,6 +694,12 @@ impl AuthManager {
         entrypoint: AnonymousUserSignupEntrypoint,
         ctx: &mut ModelContext<Self>,
     ) {
+        if Self::warp_login_disabled() {
+            log::info!("Ignoring anonymous user linking because Warp login is disabled");
+            let _ = entrypoint;
+            return;
+        }
+
         let auth_client = self.auth_client.clone();
         let _ = ctx.spawn(
             async move { auth_client.fetch_new_custom_token().await },
@@ -739,6 +779,11 @@ impl AuthManager {
     }
 
     pub fn copy_anonymous_user_linking_url_to_clipboard(&self, ctx: &mut ModelContext<Self>) {
+        if Self::warp_login_disabled() {
+            log::info!("Skipping anonymous user linking URL because Warp login is disabled");
+            return;
+        }
+
         if !self.auth_state.is_user_anonymous().unwrap_or_default() {
             return;
         }
@@ -823,6 +868,10 @@ impl AuthManager {
             email,
             state,
         )
+    }
+
+    fn warp_login_disabled() -> bool {
+        cfg!(feature = "skip_login") || FeatureFlag::SkipFirebaseAnonymousUser.is_enabled()
     }
 
     /// Validates and consumes the pending auth state token. Returns `true` if the

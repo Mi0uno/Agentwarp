@@ -670,6 +670,7 @@ fn prepare_claude_config(
 
 fn prepare_claude_settings(claude_settings_path: &Path) -> Result<()> {
     let mut settings: ClaudeSettings = read_json_file_or_default(claude_settings_path)?;
+    settings.skip_introduction = true;
     settings.skip_dangerous_mode_permission_prompt = true;
     write_json_file(
         claude_settings_path,
@@ -720,6 +721,8 @@ struct ClaudeProjectConfig {
 #[derive(Default, Deserialize, Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
 struct ClaudeSettings {
+    #[serde(default)]
+    skip_introduction: bool,
     #[serde(default)]
     skip_dangerous_mode_permission_prompt: bool,
     #[serde(flatten)]

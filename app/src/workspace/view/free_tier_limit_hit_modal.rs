@@ -9,7 +9,7 @@ use warp_core::ui::theme::{Fill, WarpTheme};
 use warp_graphql::billing::{PlanPricing, StripeSubscriptionPlan};
 use warpui::elements::{
     Align, Border, CacheOption, ChildAnchor, ConstrainedBox, Container, CornerRadius,
-    CrossAxisAlignment, DropShadow, Flex, FormattedTextElement, HighlightedHyperlink, Image,
+    CrossAxisAlignment, DropShadow, Empty, Flex, FormattedTextElement, HighlightedHyperlink, Image,
     MainAxisAlignment, MainAxisSize, MouseStateHandle, OffsetPositioning, ParentAnchor,
     ParentElement, ParentOffsetBounds, Radius, Stack,
 };
@@ -314,7 +314,9 @@ impl FreeTierLimitHitModal {
                         )
                         .finish(),
                 )
-                .with_child(
+                .with_child(if cfg!(feature = "skip_login") {
+                    Empty::new().finish()
+                } else {
                     Align::new(
                         appearance
                             .ui_builder()
@@ -337,8 +339,8 @@ impl FreeTierLimitHitModal {
                             .finish(),
                     )
                     .bottom_left()
-                    .finish(),
-                )
+                    .finish()
+                })
                 .finish(),
         )
         .with_background_color(blended_colors::neutral_1(theme))
@@ -443,6 +445,10 @@ impl TypedActionView for FreeTierLimitHitModal {
                 send_telemetry_from_ctx!(TelemetryEvent::FreeTierLimitHitInterstitialClosed, ctx);
             }
             FreeTierLimitHitModalAction::OpenUpgrade => {
+                if cfg!(feature = "skip_login") {
+                    return;
+                }
+
                 let upgrade_url = Self::get_upgrade_url(ctx);
                 ctx.open_url(&upgrade_url);
                 ctx.emit(FreeTierLimitHitModalEvent::Close);

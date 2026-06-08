@@ -208,9 +208,12 @@ impl EventLoop {
     /// Processes a byte slice through the `Processor`.
     fn process_pty_bytes(&mut self, bytes: &[u8]) {
         let mut terminal_model = self.terminal_model.lock();
-        self.parser
-            .parse_bytes(&mut *terminal_model, bytes, &mut io::sink());
-        self.channel_event_listener.send_wakeup_event();
+        let filtered_bytes = terminal_model.filter_unrelated_pty_warning_bytes(bytes);
+        if !filtered_bytes.is_empty() {
+            self.parser
+                .parse_bytes(&mut *terminal_model, &filtered_bytes, &mut io::sink());
+            self.channel_event_listener.send_wakeup_event();
+        }
     }
 }
 

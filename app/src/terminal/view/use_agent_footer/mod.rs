@@ -25,6 +25,7 @@ use std::time::Duration;
 use anyhow::anyhow;
 use parking_lot::FairMutex;
 use pathfinder_color::ColorU;
+use uuid::Uuid;
 use warp_core::features::FeatureFlag;
 use warp_core::settings::Setting;
 use warp_core::ui::appearance::Appearance;
@@ -46,7 +47,9 @@ use warpui::{
     ViewContext, ViewHandle,
 };
 
-use super::{RichContentInsertionPosition, TerminalAction, TerminalView};
+use super::{
+    Event as TerminalViewEvent, RichContentInsertionPosition, TerminalAction, TerminalView,
+};
 use crate::ai::blocklist::agent_view::agent_view_bg_fill;
 use crate::ai::blocklist::block::cli_controller::CLISubagentEvent;
 use crate::cmd_or_ctrl_shift;
@@ -66,6 +69,7 @@ use crate::ui_components::icons::Icon;
 use crate::view_components::action_button::{
     ActionButton, ActionButtonTheme, ButtonSize, KeystrokeSource, TooltipAlignment,
 };
+use crate::workspace::view::ssh_remote::{upload_local_files_to_remote_temp, SshRemoteModel};
 
 /// Small delay inserted between separate PTY writes to CLI agents.
 /// (Used both for the mode-switch prefix split and for the `DelayedEnter`
@@ -227,6 +231,9 @@ impl TerminalView {
                     input.insert_into_cli_agent_rich_input(text, ctx);
                 });
             }
+            UseAgentToolbarEvent::UploadLocalFilesToSshRemote(paths) => {
+                self.upload_and_insert_files_for_active_ssh_remote(paths, ctx);
+            }
             UseAgentToolbarEvent::ToggleCodeReviewPane(cli_agent) => {
                 self.toggle_code_review_pane(
                     GitDeltaPreference::Always,
@@ -237,7 +244,12 @@ impl TerminalView {
                 );
             }
             UseAgentToolbarEvent::ToggleFileExplorer(cli_agent) => {
-                self.toggle_file_tree(Some((*cli_agent).into()), ctx);
+                if SshRemoteModel::as_ref(ctx).active_host().is_some() {
+                    let pwd = self.pwd().filter(|path| !path.trim().is_empty());
+                    ctx.emit(TerminalViewEvent::OpenSshRemoteFileExplorer { initial_path: pwd });
+                } else {
+                    self.toggle_file_tree(Some((*cli_agent).into()), ctx);
+                }
             }
             UseAgentToolbarEvent::StartRemoteControl { scrollback_type } => {
                 self.auto_stop_sharing_on_cli_end =
@@ -645,9 +657,10 @@ impl TerminalView {
         }
 
         let prompt_length = text.chars().count();
-        let cli_agent: Option<CLIAgentType> = CLIAgentSessionsModel::as_ref(ctx)
+        let active_agent = CLIAgentSessionsModel::as_ref(ctx)
             .session(self.view_id)
-            .map(|s| s.agent.into());
+            .map(|s| s.agent);
+        let cli_agent: Option<CLIAgentType> = active_agent.map(Into::into);
         if let Some(cli_agent) = cli_agent {
             send_telemetry_from_ctx!(
                 TelemetryEvent::CLIAgentRichInputSubmitted {
@@ -669,6 +682,18 @@ impl TerminalView {
             .map(|s| rich_input_submit_strategy(s.agent))
             .unwrap_or(RichInputSubmitStrategy::Inline);
 
+        let should_apply_builtin_prompt = match text.as_bytes().first() {
+            Some(first_byte) => !CLI_AGENT_MODE_SWITCH_PREFIXES.contains(first_byte),
+            None => false,
+        };
+        let text = if should_apply_builtin_prompt {
+            match active_agent {
+                Some(agent) => AISettings::as_ref(ctx).apply_cli_agent_builtin_prompt(agent, text),
+                None => text,
+            }
+        } else {
+            text
+        };
         let text_bytes = text.into_bytes();
 
         // Clear the buffer eagerly so that any close path (auto-dismiss,
@@ -736,6 +761,7 @@ impl TerminalView {
             return;
         };
 
+        let text = AISettings::as_ref(ctx).apply_cli_agent_builtin_prompt(agent, text);
         let text_bytes = text.into_bytes();
         if text_bytes.is_empty() {
             return;
@@ -768,6 +794,13 @@ impl TerminalView {
 
         if images.is_empty() {
             self.write_cli_agent_text_then_submit(text_bytes, strategy, ctx);
+            return;
+        }
+
+        if SshRemoteModel::as_ref(ctx).active_host().is_some() {
+            self.upload_rich_input_images_to_ssh_remote_then_submit(
+                images, text_bytes, strategy, ctx,
+            );
             return;
         }
 
@@ -828,6 +861,142 @@ impl TerminalView {
         );
     }
 
+    fn upload_rich_input_images_to_ssh_remote_then_submit(
+        &mut self,
+        images: Vec<ImageContext>,
+        text_bytes: Vec<u8>,
+        strategy: RichInputSubmitStrategy,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let Some(host) = SshRemoteModel::as_ref(ctx).active_host().cloned() else {
+            self.write_cli_agent_text_then_submit(text_bytes, strategy, ctx);
+            return;
+        };
+        let image_count = images.len();
+        let label = if image_count == 1 {
+            "Uploading image to SSH remote".to_owned()
+        } else {
+            format!("Uploading {image_count} images to SSH remote")
+        };
+        self.set_ssh_remote_transfer_status(
+            crate::ai::blocklist::agent_view::agent_input_footer::SshRemoteTransferPhase::Uploading,
+            label,
+            Some(0.45),
+            ctx,
+        );
+
+        ctx.spawn(
+            async move {
+                let upload_root = std::env::temp_dir()
+                    .join("agentwarp-ssh-rich-input")
+                    .join(Uuid::new_v4().to_string());
+                async_fs::create_dir_all(&upload_root)
+                    .await
+                    .map_err(|err| {
+                        format!(
+                            "Failed to create temporary rich input image directory {}: {err}",
+                            upload_root.display()
+                        )
+                    })?;
+
+                let mut local_paths = Vec::new();
+                for (index, image) in images.into_iter().enumerate() {
+                    let raw_bytes =
+                        base64::engine::general_purpose::STANDARD.decode(&image.data).map_err(
+                            |_| format!("Failed to decode image data for {}", image.file_name),
+                        )?;
+                    let file_name = image
+                        .file_name
+                        .chars()
+                        .map(|ch| {
+                            if ch == '/' || ch == '\\' || ch == '\0' || ch.is_control() {
+                                '_'
+                            } else {
+                                ch
+                            }
+                        })
+                        .collect::<String>();
+                    let file_name = if file_name.trim().is_empty() {
+                        format!("rich-input-image-{}", index + 1)
+                    } else {
+                        file_name
+                    };
+                    let file_path = upload_root.join(file_name);
+                    async_fs::write(&file_path, raw_bytes)
+                        .await
+                        .map_err(|err| {
+                            format!(
+                                "Failed to stage rich input image {}: {err}",
+                                file_path.display()
+                            )
+                        })?;
+                    local_paths.push(file_path.to_string_lossy().to_string());
+                }
+
+                let upload_result =
+                    upload_local_files_to_remote_temp(host, local_paths.clone()).await;
+                for local_path in &local_paths {
+                    let _ = async_fs::remove_file(local_path).await;
+                }
+                let _ = async_fs::remove_dir(&upload_root).await;
+                upload_result
+            },
+            move |me, result, ctx| {
+                if !me.has_active_cli_agent_input_session(ctx) {
+                    return;
+                }
+                match result {
+                    Ok(remote_paths) => {
+                        let uploaded_count = remote_paths.len();
+                        let label = if uploaded_count == 1 {
+                            "Image uploaded".to_owned()
+                        } else {
+                            format!("{uploaded_count} images uploaded")
+                        };
+                        me.set_ssh_remote_transfer_status(
+                            crate::ai::blocklist::agent_view::agent_input_footer::SshRemoteTransferPhase::Complete,
+                            label,
+                            Some(1.),
+                            ctx,
+                        );
+                        me.clear_ssh_remote_transfer_status_after_delay(ctx);
+
+                        let path_text = warpui::clipboard_utils::escaped_paths_str(
+                            &remote_paths,
+                            Some(me.shell_family(ctx)),
+                        );
+                        let mut combined = path_text.into_bytes();
+                        if !text_bytes.is_empty() {
+                            if !combined.is_empty() {
+                                combined.extend_from_slice(b"\n");
+                            }
+                            combined.extend_from_slice(&text_bytes);
+                        }
+                        if !combined.is_empty() {
+                            me.write_cli_agent_text_then_submit(combined, strategy, ctx);
+                        }
+                    }
+                    Err(error) => {
+                        me.set_ssh_remote_transfer_status(
+                            crate::ai::blocklist::agent_view::agent_input_footer::SshRemoteTransferPhase::Failed,
+                            "Image upload failed",
+                            Some(1.),
+                            ctx,
+                        );
+                        me.clear_ssh_remote_transfer_status_after_delay(ctx);
+                        me.show_error_toast(
+                            format!("Failed to upload image to SSH remote: {error}"),
+                            ctx,
+                        );
+                        if !text_bytes.is_empty() {
+                            me.write_cli_agent_text_then_submit(text_bytes, strategy, ctx);
+                        }
+                    }
+                }
+            },
+        );
+    }
+
     /// Mirrors the CLI-agent Cmd+V image-paste path in `TerminalView::paste`
     /// for dropped image files: reads each file, writes its bytes to the
     /// system clipboard as image data, and sends the agent's paste keystroke
@@ -840,6 +1009,9 @@ impl TerminalView {
         ctx: &mut ViewContext<Self>,
     ) {
         if image_filepaths.is_empty() {
+            return;
+        }
+        if self.upload_and_insert_files_for_active_ssh_remote(&image_filepaths, ctx) {
             return;
         }
         let spawner = ctx.spawner();
@@ -1183,6 +1355,11 @@ impl UseAgentToolbar {
             AgentInputFooterEvent::InsertIntoCLIRichInput(text) => {
                 ctx.emit(UseAgentToolbarEvent::InsertIntoRichInput(text.clone()));
             }
+            AgentInputFooterEvent::UploadLocalFilesToSshRemote(paths) => {
+                ctx.emit(UseAgentToolbarEvent::UploadLocalFilesToSshRemote(
+                    paths.clone(),
+                ));
+            }
             AgentInputFooterEvent::ToggleCodeReviewPane(agent) => {
                 ctx.emit(UseAgentToolbarEvent::ToggleCodeReviewPane(*agent));
             }
@@ -1293,6 +1470,7 @@ pub enum UseAgentToolbarEvent {
     WriteToPty(String),
     /// Insert text into CLI agent rich input.
     InsertIntoRichInput(String),
+    UploadLocalFilesToSshRemote(Vec<String>),
     /// Toggle the code review pane (from CLI agent view).
     ToggleCodeReviewPane(CLIAgent),
     /// Toggle the file explorer (from CLI agent view).
@@ -1308,7 +1486,9 @@ pub enum UseAgentToolbarEvent {
     /// Hide the rich input editor (same as Escape).
     HideRichInput,
     /// User chose to warpify the subshell/SSH session.
-    Warpify { mode: WarpificationMode },
+    Warpify {
+        mode: WarpificationMode,
+    },
     /// User chose to use the agent.
     UseAgent,
 }

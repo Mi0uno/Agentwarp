@@ -139,6 +139,10 @@ pub enum AuthViewBodyAction {
 }
 
 impl AuthViewBody {
+    fn warp_login_disabled() -> bool {
+        cfg!(feature = "skip_login") || FeatureFlag::SkipFirebaseAnonymousUser.is_enabled()
+    }
+
     pub fn new(variant: AuthViewVariant, ctx: &mut ViewContext<Self>) -> Self {
         let experiment_group = AuthFlowInstructions::get_group(ctx);
         let auth_token_input = ctx.add_typed_action_view(|ctx| {
@@ -203,6 +207,9 @@ impl AuthViewBody {
     }
 
     pub fn handle_paste(&mut self, ctx: &mut ViewContext<Self>) {
+        if Self::warp_login_disabled() {
+            return;
+        }
         self.show_auth_token_input = true;
         self.auth_token_input
             .update(ctx, |editor, ctx| editor.paste(ctx));
@@ -841,6 +848,10 @@ impl TypedActionView for AuthViewBody {
     fn handle_action(&mut self, action: &AuthViewBodyAction, ctx: &mut ViewContext<Self>) {
         match action {
             AuthViewBodyAction::Login => {
+                if Self::warp_login_disabled() {
+                    ctx.emit(AuthViewBodyEvent::LoginLaterClicked);
+                    return;
+                }
                 send_telemetry_from_ctx!(
                     TelemetryEvent::LoginButtonClicked {
                         source: LoginEventSource::AuthModal,
@@ -875,6 +886,9 @@ impl TypedActionView for AuthViewBody {
                 ctx.emit(AuthViewBodyEvent::LoginLaterClicked);
             }
             AuthViewBodyAction::EnterToken => {
+                if Self::warp_login_disabled() {
+                    return;
+                }
                 self.auth_token_input
                     .update(ctx, |editor, ctx| editor.paste(ctx));
                 self.show_auth_token_input = true;
@@ -882,6 +896,9 @@ impl TypedActionView for AuthViewBody {
                 ctx.notify();
             }
             AuthViewBodyAction::CopyLoginUrl => {
+                if Self::warp_login_disabled() {
+                    return;
+                }
                 self.copy_url_click_count += 1;
                 if AuthStateProvider::as_ref(ctx)
                     .get()
@@ -903,6 +920,10 @@ impl TypedActionView for AuthViewBody {
                 }
             }
             AuthViewBodyAction::Signup => {
+                if Self::warp_login_disabled() {
+                    ctx.emit(AuthViewBodyEvent::LoginLaterClicked);
+                    return;
+                }
                 // Send synchronously since this is an important event in the sign up funnel and we
                 // don't want to lose events if the user quits before the event queue is flushed.
                 send_telemetry_sync_from_ctx!(TelemetryEvent::SignUpButtonClicked, ctx);
@@ -914,6 +935,10 @@ impl TypedActionView for AuthViewBody {
                 });
             }
             AuthViewBodyAction::SignupAnonymousUser => {
+                if Self::warp_login_disabled() {
+                    ctx.emit(AuthViewBodyEvent::LoginLaterClicked);
+                    return;
+                }
                 let entrypoint = match self.variant {
                     AuthViewVariant::RequireLoginCloseable
                     | AuthViewVariant::ShareRequirementCloseable => {

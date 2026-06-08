@@ -74,7 +74,8 @@ use crate::workspace::tab_settings::{
     TabSettings, VerticalTabsCompactSubtitle, VerticalTabsDisplayGranularity,
     VerticalTabsPrimaryInfo, VerticalTabsTabItemMode, VerticalTabsViewMode,
 };
-use crate::workspace::view::agent_sessions::AgentSessionsView;
+use crate::workspace::view::agent_sessions::{AgentSessionsModel, AgentSessionsView};
+use crate::workspace::view::ssh_remote::{SshRemoteModel, SSH_REMOTE_LOCAL_ENVIRONMENT_ID};
 use crate::workspace::view::vertical_tabs::telemetry::{
     VerticalTabsChipEntrypoint, VerticalTabsTelemetryEvent,
 };
@@ -594,6 +595,8 @@ pub(super) struct VerticalTabsPanelState {
     new_tab_button_state: MouseStateHandle,
     terminal_mode_mouse_state: MouseStateHandle,
     agent_mode_mouse_state: MouseStateHandle,
+    agent_terminal_group_mouse_states: TabGroupMouseStates,
+    pub(super) agent_terminal_group_collapsed: bool,
     pub(super) panel_mode: VerticalTabsPanelMode,
     pub(super) search_query: String,
     settings_button_mouse_state: MouseStateHandle,
@@ -634,6 +637,8 @@ impl Default for VerticalTabsPanelState {
             new_tab_button_state: Default::default(),
             terminal_mode_mouse_state: Default::default(),
             agent_mode_mouse_state: Default::default(),
+            agent_terminal_group_mouse_states: Default::default(),
+            agent_terminal_group_collapsed: true,
             panel_mode: VerticalTabsPanelMode::Terminal,
             search_query: String::new(),
             settings_button_mouse_state: Default::default(),
@@ -1704,6 +1709,100 @@ fn render_vertical_tabs_panel(
         .finish()
 }
 
+fn agent_session_terminal_view_ids(app: &AppContext) -> Vec<EntityId> {
+    AgentSessionsModel::as_ref(app)
+        .records()
+        .iter()
+        .flat_map(|record| [record.terminal_view_id, record.group_terminal_view_id])
+        .flatten()
+        .collect()
+}
+
+fn tab_contains_agent_session_terminal(
+    tab: &TabData,
+    agent_terminal_view_ids: &[EntityId],
+    app: &AppContext,
+) -> bool {
+    let pane_group = tab.pane_group.as_ref(app);
+    if pane_group
+        .custom_title(app)
+        .as_deref()
+        .is_some_and(|title| is_agent_session_group_title(title, app))
+    {
+        return true;
+    }
+
+    pane_group.visible_pane_ids().into_iter().any(|pane_id| {
+        let Some(terminal_view) = pane_group.terminal_view_from_pane_id(pane_id, app) else {
+            return false;
+        };
+        let terminal_view_id = terminal_view.id();
+        agent_terminal_view_ids.contains(&terminal_view_id)
+            || CLIAgentSessionsModel::as_ref(app)
+                .session(terminal_view_id)
+                .is_some()
+    })
+}
+
+fn terminal_view_environment_id(terminal_view_id: EntityId, app: &AppContext) -> String {
+    if let Some(environment_id) =
+        SshRemoteModel::as_ref(app).terminal_environment_id(terminal_view_id)
+    {
+        return environment_id;
+    }
+
+    AgentSessionsModel::as_ref(app)
+        .records()
+        .iter()
+        .find(|record| {
+            record.terminal_view_id == Some(terminal_view_id)
+                || record.group_terminal_view_id == Some(terminal_view_id)
+        })
+        .map(|record| record.environment_id.clone())
+        .unwrap_or_else(|| SSH_REMOTE_LOCAL_ENVIRONMENT_ID.to_owned())
+}
+
+fn tab_matches_environment(tab: &TabData, active_environment_id: &str, app: &AppContext) -> bool {
+    let pane_group = tab.pane_group.as_ref(app);
+    let mut saw_terminal = false;
+    for pane_id in pane_group.visible_pane_ids() {
+        let Some(terminal_view) = pane_group.terminal_view_from_pane_id(pane_id, app) else {
+            continue;
+        };
+        saw_terminal = true;
+        if terminal_view_environment_id(terminal_view.id(), app) == active_environment_id {
+            return true;
+        }
+    }
+
+    !saw_terminal && active_environment_id == SSH_REMOTE_LOCAL_ENVIRONMENT_ID
+}
+
+fn is_generated_agent_session_group_title(title: &str) -> bool {
+    let title = title.trim();
+    !title.is_empty() && (title == "Agent group" || title.ends_with(" agents"))
+}
+
+fn is_agent_session_group_title(title: &str, app: &AppContext) -> bool {
+    let title = title.trim();
+    if is_generated_agent_session_group_title(title) {
+        return true;
+    }
+
+    AgentSessionsModel::as_ref(app)
+        .records()
+        .iter()
+        .any(|record| {
+            let record_title = record.title.trim();
+            let expected = if record_title.is_empty() {
+                "Agent group".to_owned()
+            } else {
+                format!("{record_title} agents")
+            };
+            title == expected
+        })
+}
+
 fn render_groups(
     state: &VerticalTabsPanelState,
     workspace: &Workspace,
@@ -1732,18 +1831,22 @@ fn render_groups(
     let uses_outer_group_container = uses_outer_group_container(display_granularity);
     let query = state.search_query.as_str();
     let visible_tabs: Vec<(usize, Option<Vec<PaneId>>)> = if query.is_empty() {
+        let active_environment_id = SshRemoteModel::as_ref(app).active_environment_id();
         workspace
             .tabs
             .iter()
             .enumerate()
+            .filter(|(_, tab)| tab_matches_environment(tab, &active_environment_id, app))
             .map(|(tab_index, _)| (tab_index, None))
             .collect()
     } else {
         let query_lower = query.to_lowercase();
+        let active_environment_id = SshRemoteModel::as_ref(app).active_environment_id();
         workspace
             .tabs
             .iter()
             .enumerate()
+            .filter(|(_, tab)| tab_matches_environment(tab, &active_environment_id, app))
             .filter_map(|(tab_index, tab)| {
                 let pane_group = tab.pane_group.as_ref(app);
                 let visible_pane_ids = pane_group.visible_pane_ids();
@@ -1854,6 +1957,16 @@ fn render_groups(
         }
     }
 
+    let agent_terminal_view_ids = agent_session_terminal_view_ids(app);
+    let (agent_visible_tabs, visible_tabs): (Vec<_>, Vec<_>) =
+        visible_tabs.into_iter().partition(|(tab_index, _)| {
+            tab_contains_agent_session_terminal(
+                &workspace.tabs[*tab_index],
+                &agent_terminal_view_ids,
+                app,
+            )
+        });
+
     let is_any_pane_dragging = any_workspace_pane_being_dragged(workspace, app);
     // Ghost state for cross-window drag hovering over this window's vertical tabs panel.
     let ghost_state = CrossWindowTabDrag::as_ref(app).ghost_state_for_window(workspace.window_id);
@@ -1926,6 +2039,16 @@ fn render_groups(
     // Ghost after all tab groups (fencepost).
     if ghost_insertion_index == Some(workspace.tabs.len()) {
         groups.add_child(render_ghost_vertical_tab_slot(workspace, app));
+    }
+
+    if !agent_visible_tabs.is_empty() {
+        groups.add_child(render_agent_terminal_group_container(
+            state,
+            workspace,
+            &agent_visible_tabs,
+            is_any_pane_dragging,
+            app,
+        ));
     }
 
     // Prune stale badge mouse states for panes that no longer exist.
@@ -2733,6 +2856,190 @@ fn render_grouped_tabs_header(
         });
     });
     hoverable.finish()
+}
+
+fn render_agent_terminal_group_header(
+    member_count: usize,
+    mouse_states: &TabGroupMouseStates,
+    is_collapsed: bool,
+    is_header_selected: bool,
+    app: &AppContext,
+) -> Box<dyn Element> {
+    let appearance = Appearance::as_ref(app);
+    let theme = appearance.theme();
+    let font_family = appearance.ui_font_family();
+    let main_text_color = theme.main_text_color(theme.background());
+    let sub_text_color = theme.sub_text_color(theme.background());
+
+    let chevron_icon = if is_collapsed {
+        WarpIcon::ChevronRight
+    } else {
+        WarpIcon::ChevronDown
+    };
+    let chevron_button = render_tab_group_header_icon_button(
+        chevron_icon,
+        TAB_GROUP_ICON_SIZE,
+        main_text_color,
+        internal_colors::fg_overlay_2(theme),
+        mouse_states.chevron.clone(),
+        Some(WorkspaceAction::ToggleAgentTerminalTabsCollapsed),
+    );
+    let chevron_slot = ConstrainedBox::new(
+        Flex::row()
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_main_axis_alignment(MainAxisAlignment::Center)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_child(chevron_button)
+            .finish(),
+    )
+    .with_width(VERTICAL_TABS_ICON_SIZE)
+    .with_height(VERTICAL_TABS_ICON_SIZE)
+    .finish();
+
+    let folder_icon = ConstrainedBox::new(WarpIcon::Folder.to_warpui_icon(sub_text_color).finish())
+        .with_width(TAB_GROUP_ICON_SIZE)
+        .with_height(TAB_GROUP_ICON_SIZE)
+        .finish();
+    let title = Text::new_inline("Agent sessions", font_family, 12.)
+        .with_clip(ClipConfig::ellipsis())
+        .with_color(main_text_color.into())
+        .finish();
+    let subtitle_text = if member_count == 1 {
+        "1 session".to_string()
+    } else {
+        format!("{member_count} sessions")
+    };
+    let subtitle = Text::new_inline(subtitle_text, font_family, 10.)
+        .with_clip(ClipConfig::ellipsis())
+        .with_color(sub_text_color.into())
+        .finish();
+    let text_column = Flex::column()
+        .with_main_axis_size(MainAxisSize::Min)
+        .with_cross_axis_alignment(CrossAxisAlignment::Start)
+        .with_spacing(1.)
+        .with_child(title)
+        .with_child(subtitle)
+        .finish();
+
+    let row = Flex::row()
+        .with_main_axis_size(MainAxisSize::Max)
+        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+        .with_spacing(ICON_WITH_STATUS_GAP)
+        .with_child(chevron_slot)
+        .with_child(folder_icon)
+        .with_child(Shrinkable::new(1., text_column).finish())
+        .finish();
+
+    Hoverable::new(mouse_states.header.clone(), move |state| {
+        let border_fill = if is_header_selected {
+            internal_colors::fg_overlay_3(theme)
+        } else {
+            WarpThemeFill::Solid(ColorU::transparent_black())
+        };
+        let mut container = Container::new(row)
+            .with_padding(Padding::uniform(GROUP_HORIZONTAL_PADDING))
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(ROW_CORNER_RADIUS)))
+            .with_border(Border::all(1.).with_border_fill(border_fill));
+        if is_header_selected || state.is_hovered() {
+            container = container.with_background(internal_colors::fg_overlay_2(theme));
+        }
+        container.finish()
+    })
+    .with_cursor(Cursor::PointingHand)
+    .with_defer_events_to_children()
+    .on_click(|ctx, _, _| {
+        ctx.dispatch_typed_action(WorkspaceAction::ToggleAgentTerminalTabsCollapsed);
+    })
+    .finish()
+}
+
+fn render_agent_terminal_group_container(
+    state: &VerticalTabsPanelState,
+    workspace: &Workspace,
+    members: &[(usize, Option<Vec<PaneId>>)],
+    is_any_pane_dragging: bool,
+    app: &AppContext,
+) -> Box<dyn Element> {
+    let theme = Appearance::as_ref(app).theme();
+    let mouse_states = state.agent_terminal_group_mouse_states.clone();
+    let member_count = members.len();
+    let any_member_active = members
+        .iter()
+        .any(|(tab_index, _)| *tab_index == workspace.active_tab_index);
+    let is_collapsed = state.agent_terminal_group_collapsed && state.search_query.is_empty();
+
+    let resolved_mode = resolve_vertical_tabs_mode(app);
+    let needs_outer_horizontal_padding = uses_outer_group_container(match resolved_mode {
+        VerticalTabsResolvedMode::Panes => VerticalTabsDisplayGranularity::Panes,
+        _ => VerticalTabsDisplayGranularity::Tabs,
+    });
+
+    Hoverable::new(mouse_states.container.clone(), |hover_state| {
+        let mut content = Flex::column()
+            .with_main_axis_size(MainAxisSize::Min)
+            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+            .with_spacing(TABS_MODE_ITEM_SPACING);
+
+        content.add_child(render_agent_terminal_group_header(
+            member_count,
+            &mouse_states,
+            is_collapsed,
+            is_collapsed && any_member_active,
+            app,
+        ));
+
+        if !is_collapsed {
+            let last_member_idx = members.len().saturating_sub(1);
+            for (i, (tab_index, filtered_pane_ids)) in members.iter().enumerate() {
+                let tab = &workspace.tabs[*tab_index];
+                let insert_after_index = (i == last_member_idx).then_some(*tab_index + 1);
+                let tab_element = render_tab_group(
+                    state,
+                    workspace,
+                    *tab_index,
+                    tab,
+                    filtered_pane_ids.as_deref(),
+                    TabGroupDragState {
+                        is_any_pane_dragging,
+                        insert_before_index: *tab_index,
+                        insert_after_index,
+                    },
+                    true,
+                    app,
+                );
+                content.add_child(
+                    Container::new(tab_element)
+                        .with_padding(
+                            Padding::uniform(0.)
+                                .with_left(TAB_GROUP_MEMBER_INDENT)
+                                .with_right(TAB_GROUP_CONTENT_INSET),
+                        )
+                        .finish(),
+                );
+            }
+        }
+
+        let background = if hover_state.is_hovered() || any_member_active {
+            internal_colors::fg_overlay_1(theme)
+        } else {
+            ThemeFill::Solid(ColorU::transparent_black())
+        };
+
+        let mut padding = Padding::uniform(0.);
+        if needs_outer_horizontal_padding {
+            padding = Padding::uniform(GROUP_HORIZONTAL_PADDING);
+        } else if !is_collapsed {
+            padding = padding.with_bottom(TAB_GROUP_CONTENT_INSET);
+        }
+
+        Container::new(content.finish())
+            .with_padding(padding)
+            .with_background(background)
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(ROW_CORNER_RADIUS)))
+            .finish()
+    })
+    .with_defer_events_to_children()
+    .finish()
 }
 
 /// Renders a tab group: pane-like header followed by indented member rows. Background only paints

@@ -967,6 +967,12 @@ impl TypedActionView for CommandSearchView {
                 ctx.open_url(upgrade_link);
             }
             AttemptLoginGatedUpgrade => {
+                if cfg!(feature = "skip_login")
+                    || FeatureFlag::SkipFirebaseAnonymousUser.is_enabled()
+                {
+                    return;
+                }
+
                 AuthManager::handle(ctx).update(ctx, |auth_manager, ctx| {
                     auth_manager.attempt_login_gated_feature(
                         "Upgrade AI Usage",
