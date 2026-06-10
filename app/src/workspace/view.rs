@@ -1226,7 +1226,9 @@ fn cli_agent_restart_runtime_command_with_options(
             .and_then(|session_id| {
                 agent.resume_command_with_runtime_options(session_id, reasoning_effort, cli_options)
             })
-            .or_else(|| agent.resume_last_command_with_runtime_options(reasoning_effort, cli_options));
+            .or_else(|| {
+                agent.resume_last_command_with_runtime_options(reasoning_effort, cli_options)
+            });
     }
 
     let command = agent.command_with_runtime_options(reasoning_effort, cli_options);
@@ -6078,6 +6080,23 @@ impl Workspace {
             };
             terminal_view.as_ref(ctx).is_long_running()
         })
+    }
+
+    fn live_terminal_environment_id<V: View>(
+        terminal_view_id: EntityId,
+        ctx: &mut ViewContext<V>,
+    ) -> String {
+        SshRemoteModel::as_ref(ctx)
+            .terminal_environment_id(terminal_view_id)
+            .unwrap_or_else(|| SSH_REMOTE_LOCAL_ENVIRONMENT_ID.to_owned())
+    }
+
+    fn terminal_view_matches_agent_session_environment<V: View>(
+        record: &AgentSessionRecord,
+        terminal_view_id: EntityId,
+        ctx: &mut ViewContext<V>,
+    ) -> bool {
+        Self::live_terminal_environment_id(terminal_view_id, ctx) == record.environment_id
     }
 
     /// Searches other windows for the given terminal view and focuses it there.
@@ -13638,19 +13657,16 @@ impl Workspace {
                 };
 
                 for record in pane_sessions {
-                    if let Some((view_id, pane_id)) = record.terminal_view_id.and_then(|view_id| {
+                    if let Some((_view_id, pane_id)) = record.terminal_view_id.and_then(|view_id| {
                         pane_group
                             .find_pane_id_for_terminal_view(view_id, pane_ctx)
                             .map(|pane_id| (view_id, pane_id))
                     }) {
-                        let is_agent_active = CLIAgentSessionsModel::as_ref(pane_ctx)
-                            .session(view_id)
-                            .is_some_and(|session| session.agent == record.agent)
-                            || pane_group
-                                .terminal_view_from_pane_id(pane_id, pane_ctx)
-                                .is_some_and(|terminal_view| {
-                                    terminal_view.as_ref(pane_ctx).is_long_running()
-                                });
+                        let is_agent_active = pane_group
+                            .terminal_view_from_pane_id(pane_id, pane_ctx)
+                            .is_some_and(|terminal_view| {
+                                terminal_view.as_ref(pane_ctx).is_long_running()
+                            });
                         if is_agent_active {
                             continue;
                         }
@@ -13760,7 +13776,17 @@ impl Workspace {
             self.capture_agent_session_transcript(terminal_view_id, ctx);
         }
 
-        if let Some(group_terminal_view_id) = parent_session.group_terminal_view_id {
+        if let Some(group_terminal_view_id) =
+            parent_session
+                .group_terminal_view_id
+                .filter(|terminal_view_id| {
+                    Self::terminal_view_matches_agent_session_environment(
+                        &parent_session,
+                        *terminal_view_id,
+                        ctx,
+                    )
+                })
+        {
             if self.focus_terminal_view_locally(group_terminal_view_id, ctx) {
                 self.ensure_agent_session_group_panes(&parent_session, &pane_sessions, ctx);
                 return;
@@ -13770,7 +13796,15 @@ impl Workspace {
             }
         }
 
-        if let Some(parent_terminal_view_id) = parent_session.terminal_view_id {
+        if let Some(parent_terminal_view_id) =
+            parent_session.terminal_view_id.filter(|terminal_view_id| {
+                Self::terminal_view_matches_agent_session_environment(
+                    &parent_session,
+                    *terminal_view_id,
+                    ctx,
+                )
+            })
+        {
             if self.focus_terminal_view_locally(parent_terminal_view_id, ctx) {
                 AgentSessionsModel::handle(ctx).update(ctx, |model, ctx| {
                     model.attach_group_terminal(&parent_session.id, parent_terminal_view_id, ctx);
@@ -13843,11 +13877,10 @@ impl Workspace {
             return;
         };
 
-        if let Some(terminal_view_id) = record.terminal_view_id {
-            let is_agent_active = CLIAgentSessionsModel::as_ref(ctx)
-                .session(terminal_view_id)
-                .is_some_and(|session| session.agent == record.agent)
-                || self.terminal_view_is_long_running_locally(terminal_view_id, ctx);
+        if let Some(terminal_view_id) = record.terminal_view_id.filter(|terminal_view_id| {
+            Self::terminal_view_matches_agent_session_environment(&record, *terminal_view_id, ctx)
+        }) {
+            let is_agent_active = self.terminal_view_is_long_running_locally(terminal_view_id, ctx);
 
             if is_agent_active {
                 if self.focus_terminal_view_locally(terminal_view_id, ctx)
@@ -13871,7 +13904,9 @@ impl Workspace {
             }
         }
 
-        if let Some(terminal_view_id) = record.terminal_view_id {
+        if let Some(terminal_view_id) = record.terminal_view_id.filter(|terminal_view_id| {
+            Self::terminal_view_matches_agent_session_environment(&record, *terminal_view_id, ctx)
+        }) {
             if self.restore_agent_session_in_existing_terminal(&record, terminal_view_id, ctx) {
                 return;
             }
@@ -13893,6 +13928,10 @@ impl Workspace {
         terminal_view_id: EntityId,
         ctx: &mut ViewContext<Self>,
     ) -> bool {
+        if !Self::terminal_view_matches_agent_session_environment(record, terminal_view_id, ctx) {
+            return false;
+        }
+
         if !self.focus_terminal_view_locally(terminal_view_id, ctx) {
             return false;
         }
@@ -13938,27 +13977,25 @@ impl Workspace {
         let cli_session = CLIAgentSessionsModel::as_ref(ctx)
             .session(terminal_view_id)
             .cloned();
-        let fallback_directory = self.terminal_view(terminal_view_id, ctx).and_then(
-            |terminal_view| {
-                let terminal_view = terminal_view.as_ref(ctx);
-                terminal_view
-                    .active_session_path_if_local(ctx)
-                    .or_else(|| terminal_view.pwd_if_local(ctx).map(PathBuf::from))
-                    .or_else(|| {
-                        terminal_view
-                            .pwd()
-                            .map(PathBuf::from)
-                            .filter(|path| path.is_dir())
-                    })
-            },
-        );
+        let fallback_directory =
+            self.terminal_view(terminal_view_id, ctx)
+                .and_then(|terminal_view| {
+                    let terminal_view = terminal_view.as_ref(ctx);
+                    terminal_view
+                        .active_session_path_if_local(ctx)
+                        .or_else(|| terminal_view.pwd_if_local(ctx).map(PathBuf::from))
+                        .or_else(|| {
+                            terminal_view
+                                .pwd()
+                                .map(PathBuf::from)
+                                .filter(|path| path.is_dir())
+                        })
+                });
 
         AgentSessionsModel::handle(ctx).update(ctx, |model, ctx| {
             model.sync_agent_session_id_for_terminal(
                 terminal_view_id,
-                cli_session
-                    .as_ref()
-                    .map(|session| &session.session_context),
+                cli_session.as_ref().map(|session| &session.session_context),
                 ctx,
             );
         });

@@ -50,14 +50,14 @@ use crate::ui_components::icons::Icon;
 const SSH_REMOTE_HOSTS_PREF_KEY: &str = "WorkspaceSshRemoteHosts";
 const SIDEBAR_HORIZONTAL_PADDING: f32 = 12.;
 const ICON_BUTTON_SIZE: f32 = 22.;
-const WIZARD_WIDTH: f32 = 780.;
-const WIZARD_HEIGHT: f32 = 610.;
-const WIZARD_LEFT_WIDTH: f32 = 220.;
-const WIZARD_RIGHT_WIDTH: f32 = WIZARD_WIDTH - WIZARD_LEFT_WIDTH;
+const WIZARD_WIDTH: f32 = 700.;
+const WIZARD_HEIGHT: f32 = 600.;
+const WIZARD_RIGHT_WIDTH: f32 = WIZARD_WIDTH;
 const WIZARD_RIGHT_HORIZONTAL_PADDING: f32 = 22.;
 const WIZARD_BODY_WIDTH: f32 = WIZARD_RIGHT_WIDTH - WIZARD_RIGHT_HORIZONTAL_PADDING * 2.;
+const WIZARD_BODY_INNER_PADDING: f32 = 12.;
+const WIZARD_BODY_CONTENT_WIDTH: f32 = WIZARD_BODY_WIDTH - WIZARD_BODY_INNER_PADDING * 2.;
 const WIZARD_HEADER_HEIGHT: f32 = 58.;
-const STEP_CIRCLE_SIZE: f32 = 28.;
 const RESOURCE_SUMMARY_WIDTH: f32 = 238.;
 const DEFAULT_REMOTE_SETUP_DIR: &str = "/home/.miowarp";
 const NODE_INSTALL_VERSION: &str = "v22.11.0";
@@ -4148,123 +4148,110 @@ impl SshRemoteView {
         ConstrainedBox::new(child).with_width(width).finish()
     }
 
-    fn render_step(&self, step: WizardStep, appearance: &Appearance) -> Box<dyn Element> {
+    fn render_wizard_step_pill(
+        &self,
+        step: WizardStep,
+        appearance: &Appearance,
+    ) -> Box<dyn Element> {
         let theme = appearance.theme();
-        let is_active = step == self.wizard_step;
-        let is_done = step.index() < self.wizard_step.index();
-        let circle_fill = if is_done {
+        let is_active = self.wizard_step == step;
+        let is_complete = step.index() < self.wizard_step.index();
+        let accent = if is_active || is_complete {
             theme.accent()
-        } else if is_active {
-            theme.main_text_color(theme.background())
         } else {
-            theme.surface_overlay_2()
+            theme.sub_text_color(theme.background())
         };
-        let number_fill = if is_done || is_active {
-            theme.background().into_solid()
-        } else {
-            theme.sub_text_color(theme.background()).into_solid()
-        };
-        let step_index = step.index() + 1;
-        let circle_child = if is_done {
-            Self::render_icon(Icon::Check, ThemeFill::Solid(number_fill), 14.)
-        } else {
-            Text::new_inline(step_index.to_string(), appearance.ui_font_family(), 12.)
-                .with_color(number_fill)
-                .with_style(Properties::default().weight(Weight::Semibold))
-                .finish()
-        };
-
-        let text_color = if is_active {
+        let label_color = if is_active {
             theme.main_text_color(theme.background())
         } else {
             theme.sub_text_color(theme.background())
+        };
+        let marker = if is_complete {
+            Self::render_icon(Icon::Check, accent, 11.)
+        } else {
+            Container::new(
+                Text::new_inline(
+                    format!("{}", step.index() + 1),
+                    appearance.ui_font_family(),
+                    10.5,
+                )
+                .with_color(accent.into_solid())
+                .with_style(Properties::default().weight(Weight::Semibold))
+                .finish(),
+            )
+            .finish()
         };
 
         let mut container = Container::new(
             Flex::row()
                 .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                .with_spacing(10.)
+                .with_spacing(6.)
                 .with_child(
                     ConstrainedBox::new(
-                        Container::new(Align::new(circle_child).finish())
-                            .with_background(circle_fill)
-                            .with_corner_radius(CornerRadius::with_all(Radius::Percentage(50.)))
+                        Container::new(Align::new(marker).finish())
+                            .with_background(if is_active {
+                                theme.surface_overlay_2()
+                            } else {
+                                theme.surface_2()
+                            })
+                            .with_border(Border::all(1.).with_border_fill(if is_active {
+                                theme.active_ui_detail()
+                            } else {
+                                theme.surface_3()
+                            }))
+                            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(10.)))
                             .finish(),
                     )
-                    .with_width(STEP_CIRCLE_SIZE)
-                    .with_height(STEP_CIRCLE_SIZE)
+                    .with_width(20.)
+                    .with_height(20.)
                     .finish(),
                 )
                 .with_child(
                     Shrinkable::new(
                         1.,
-                        Flex::column()
-                            .with_spacing(1.)
-                            .with_child(
-                                Text::new_inline(step.title(), appearance.ui_font_family(), 12.)
-                                    .with_color(text_color.into())
-                                    .with_style(Properties::default().weight(if is_active {
-                                        Weight::Semibold
-                                    } else {
-                                        Weight::Medium
-                                    }))
-                                    .finish(),
-                            )
-                            .with_child(
-                                Text::new_inline(
-                                    match step {
-                                        WizardStep::Method => "方式",
-                                        WizardStep::Config => "配置",
-                                        WizardStep::Resources => "资源",
-                                        WizardStep::Install => "安装",
-                                    },
-                                    appearance.ui_font_family(),
-                                    10.5,
-                                )
-                                .with_color(theme.sub_text_color(theme.background()).into())
-                                .finish(),
-                            )
+                        Text::new_inline(step.title(), appearance.ui_font_family(), 11.)
+                            .with_color(label_color.into())
+                            .with_style(Properties::default().weight(if is_active {
+                                Weight::Semibold
+                            } else {
+                                Weight::Medium
+                            }))
+                            .with_clip(ClipConfig::ellipsis())
                             .finish(),
                     )
                     .finish(),
                 )
                 .finish(),
         )
-        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
         .with_horizontal_padding(8.)
-        .with_vertical_padding(7.);
+        .with_vertical_padding(7.)
+        .with_border(Border::all(1.).with_border_fill(if is_active {
+            theme.active_ui_detail()
+        } else {
+            theme.surface_3()
+        }))
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(5.)));
+
         if is_active {
             container = container.with_background(theme.surface_overlay_1());
+        } else {
+            container = container.with_background(theme.surface_2());
         }
+
         container.finish()
     }
 
-    fn render_wizard_left_panel(&self, appearance: &Appearance) -> Box<dyn Element> {
-        let theme = appearance.theme();
-        let mut steps = Flex::column()
-            .with_spacing(8.)
-            .with_child(
-                Text::new_inline("SSH Remote", appearance.ui_font_family(), 13.)
-                    .with_color(theme.main_text_color(theme.background()).into())
-                    .with_style(Properties::default().weight(Weight::Semibold))
-                    .finish(),
-            )
-            .with_child(
-                Text::new_inline("Environment setup", appearance.ui_font_family(), 11.)
-                    .with_color(theme.sub_text_color(theme.background()).into())
-                    .finish(),
-            );
-
+    fn render_wizard_step_bar(&self, appearance: &Appearance) -> Box<dyn Element> {
+        let mut row = Flex::row()
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_spacing(6.);
         for step in WizardStep::all() {
-            steps.add_child(self.render_step(*step, appearance));
+            row.add_child(
+                Shrinkable::new(1., self.render_wizard_step_pill(*step, appearance)).finish(),
+            );
         }
-
-        Container::new(steps.finish())
-            .with_background(theme.surface_2())
-            .with_border(Border::right(1.).with_border_fill(theme.surface_3()))
-            .with_horizontal_padding(16.)
-            .with_vertical_padding(18.)
-            .finish()
+        row.finish()
     }
 
     fn render_method_step(&self, appearance: &Appearance) -> Box<dyn Element> {
@@ -4319,7 +4306,7 @@ impl SshRemoteView {
                             ),
                             appearance,
                         ),
-                        (WIZARD_BODY_WIDTH - 10.) / 2.,
+                        (WIZARD_BODY_CONTENT_WIDTH - 10.) / 2.,
                     ))
                     .with_child(Self::fixed_width(
                         self.render_option_card(
@@ -4334,7 +4321,7 @@ impl SshRemoteView {
                             ),
                             appearance,
                         ),
-                        (WIZARD_BODY_WIDTH - 10.) / 2.,
+                        (WIZARD_BODY_CONTENT_WIDTH - 10.) / 2.,
                     ))
                     .finish(),
             )
@@ -4408,7 +4395,7 @@ impl SshRemoteView {
                         SshRemoteViewAction::SelectAuthMethod(SshRemoteAuthMethod::PasswordPrompt),
                         appearance,
                     ),
-                    (WIZARD_BODY_WIDTH - 10.) / 2.,
+                    (WIZARD_BODY_CONTENT_WIDTH - 10.) / 2.,
                 ))
                 .with_child(Self::fixed_width(
                     self.render_option_card(
@@ -4421,7 +4408,7 @@ impl SshRemoteView {
                         SshRemoteViewAction::SelectAuthMethod(SshRemoteAuthMethod::PrivateKey),
                         appearance,
                     ),
-                    (WIZARD_BODY_WIDTH - 10.) / 2.,
+                    (WIZARD_BODY_CONTENT_WIDTH - 10.) / 2.,
                 ))
                 .finish(),
         );
@@ -4836,26 +4823,35 @@ impl SshRemoteView {
 
         let mut right_panel = Flex::column()
             .with_main_axis_size(MainAxisSize::Max)
-            .with_spacing(14.)
+            .with_spacing(12.)
             .with_child(self.render_wizard_header(title, appearance))
+            .with_child(self.render_wizard_step_bar(appearance))
             .with_child(
                 ConstrainedBox::new(
-                    ClippedScrollable::vertical(
-                        self.wizard_body_scroll_state.clone(),
-                        Self::fixed_width(
-                            self.render_wizard_body(appearance, app),
-                            WIZARD_BODY_WIDTH,
-                        ),
-                        ScrollbarWidth::Auto,
-                        theme.nonactive_ui_detail().into(),
-                        theme.active_ui_detail().into(),
-                        ElementFill::None,
+                    Container::new(
+                        ClippedScrollable::vertical(
+                            self.wizard_body_scroll_state.clone(),
+                            Self::fixed_width(
+                                self.render_wizard_body(appearance, app),
+                                WIZARD_BODY_CONTENT_WIDTH,
+                            ),
+                            ScrollbarWidth::Auto,
+                            theme.nonactive_ui_detail().into(),
+                            theme.active_ui_detail().into(),
+                            ElementFill::None,
+                        )
+                        .with_overlayed_scrollbar()
+                        .finish(),
                     )
-                    .with_overlayed_scrollbar()
+                    .with_background(theme.background())
+                    .with_border(Border::all(1.).with_border_fill(theme.surface_3()))
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
+                    .with_horizontal_padding(WIZARD_BODY_INNER_PADDING)
+                    .with_vertical_padding(WIZARD_BODY_INNER_PADDING)
                     .finish(),
                 )
                 .with_width(WIZARD_BODY_WIDTH)
-                .with_height(430.)
+                .with_height(378.)
                 .finish(),
             );
 
@@ -4938,25 +4934,10 @@ impl SshRemoteView {
 
         Container::new(
             ConstrainedBox::new(
-                Flex::row()
-                    .with_child(
-                        ConstrainedBox::new(self.render_wizard_left_panel(appearance))
-                            .with_width(WIZARD_LEFT_WIDTH)
-                            .with_height(WIZARD_HEIGHT)
-                            .finish(),
-                    )
-                    .with_child(
-                        ConstrainedBox::new(
-                            Container::new(right_panel.finish())
-                                .with_background(theme.surface_1())
-                                .with_horizontal_padding(WIZARD_RIGHT_HORIZONTAL_PADDING)
-                                .with_vertical_padding(20.)
-                                .finish(),
-                        )
-                        .with_width(WIZARD_RIGHT_WIDTH)
-                        .with_height(WIZARD_HEIGHT)
-                        .finish(),
-                    )
+                Container::new(right_panel.finish())
+                    .with_background(theme.surface_1())
+                    .with_horizontal_padding(WIZARD_RIGHT_HORIZONTAL_PADDING)
+                    .with_vertical_padding(18.)
                     .finish(),
             )
             .with_width(WIZARD_WIDTH)

@@ -43,6 +43,18 @@ fn enable_cli_agent_api_takeover_for_test(app: &mut App) {
     });
 }
 
+#[test]
+fn warp_agent_defaults_to_disabled() {
+    App::test((), |mut app| async move {
+        initialize_settings_for_tests(&mut app);
+        add_ai_enablement_dependencies_for_test(&mut app);
+
+        AISettings::handle(&app).read(&app, |settings, ctx| {
+            assert!(!settings.is_any_ai_enabled(ctx));
+        });
+    });
+}
+
 // FocusedTerminalInfo Tests
 
 #[test]

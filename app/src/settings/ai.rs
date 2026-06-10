@@ -1734,7 +1734,7 @@ define_settings_group!(AISettings, settings: [
     // If `false`, all AI features are disabled.
     is_any_ai_enabled: IsAnyAIEnabled {
         type: bool,
-        default: true,
+        default: false,
         supported_platforms: SupportedPlatforms::ALL,
         sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::No),
         private: false,

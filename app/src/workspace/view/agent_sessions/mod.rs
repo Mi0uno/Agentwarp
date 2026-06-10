@@ -5473,12 +5473,12 @@ fn visit_codex_session_files(
             .and_then(|metadata| metadata.modified().ok())
             .unwrap_or(SystemTime::UNIX_EPOCH);
 
-        let should_replace = best.as_ref().is_none_or(
-            |(best_match_score, best_modified_at, _)| {
+        let should_replace = best
+            .as_ref()
+            .is_none_or(|(best_match_score, best_modified_at, _)| {
                 match_score > *best_match_score
                     || (match_score == *best_match_score && modified_at > *best_modified_at)
-            },
-        );
+            });
         if should_replace {
             *best = Some((match_score, modified_at, meta.id));
         }
