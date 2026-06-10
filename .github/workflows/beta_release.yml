@@ -131,6 +131,30 @@ jobs:
               throw "Missing OSS Windows icon"
           }
 
+      - name: Install OpenSSL
+        shell: pwsh
+        run: |
+          $vcpkgRoot = $env:VCPKG_INSTALLATION_ROOT
+          if (-not $vcpkgRoot) {
+            $vcpkgRoot = "C:\vcpkg"
+          }
+
+          if (-not (Test-Path (Join-Path $vcpkgRoot "vcpkg.exe"))) {
+            git clone https://github.com/microsoft/vcpkg.git $vcpkgRoot
+            & (Join-Path $vcpkgRoot "bootstrap-vcpkg.bat") -disableMetrics
+          }
+
+          if ("${{ matrix.arch }}" -eq "arm64") {
+            $triplet = "arm64-windows-static"
+          } else {
+            $triplet = "x64-windows-static"
+          }
+
+          & (Join-Path $vcpkgRoot "vcpkg.exe") install "openssl:$triplet" --clean-after-build
+          "VCPKG_ROOT=$vcpkgRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "VCPKGRS_TRIPLET=$triplet" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "OPENSSL_STATIC=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: Build installer
         shell: pwsh
         run: |
