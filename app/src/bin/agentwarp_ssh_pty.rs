@@ -15,6 +15,69 @@ const WARP_BOOTSTRAP_DONE_MARKER: &[u8] = b"eval \"$WARP_BOOTSTRAP_VAR\"; unset 
 const WARP_PASTE_PREFIX_MARKER: &[u8] = b"\x1bi";
 const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
 const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
+const SSH_PREFERRED_KEX_ALGORITHMS: &[&str] = &[
+    "curve25519-sha256",
+    "curve25519-sha256@libssh.org",
+    "ecdh-sha2-nistp256",
+    "ecdh-sha2-nistp384",
+    "ecdh-sha2-nistp521",
+    "diffie-hellman-group-exchange-sha256",
+    "diffie-hellman-group16-sha512",
+    "diffie-hellman-group18-sha512",
+    "diffie-hellman-group14-sha256",
+    "diffie-hellman-group14-sha1",
+    "diffie-hellman-group-exchange-sha1",
+    "diffie-hellman-group1-sha1",
+    "ext-info-c",
+    "kex-strict-c-v00@openssh.com",
+];
+const SSH_PREFERRED_HOST_KEY_ALGORITHMS: &[&str] = &[
+    "ssh-ed25519",
+    "ssh-ed25519-cert-v01@openssh.com",
+    "ecdsa-sha2-nistp256",
+    "ecdsa-sha2-nistp384",
+    "ecdsa-sha2-nistp521",
+    "ecdsa-sha2-nistp256-cert-v01@openssh.com",
+    "ecdsa-sha2-nistp384-cert-v01@openssh.com",
+    "ecdsa-sha2-nistp521-cert-v01@openssh.com",
+    "rsa-sha2-512",
+    "rsa-sha2-256",
+    "rsa-sha2-512-cert-v01@openssh.com",
+    "rsa-sha2-256-cert-v01@openssh.com",
+    "ssh-rsa",
+    "ssh-rsa-cert-v01@openssh.com",
+    "ssh-dss",
+];
+const SSH_PREFERRED_CIPHER_ALGORITHMS: &[&str] = &[
+    "chacha20-poly1305@openssh.com",
+    "aes256-gcm@openssh.com",
+    "aes128-gcm@openssh.com",
+    "aes256-ctr",
+    "aes192-ctr",
+    "aes128-ctr",
+    "aes256-cbc",
+    "rijndael-cbc@lysator.liu.se",
+    "aes192-cbc",
+    "aes128-cbc",
+    "blowfish-cbc",
+    "cast128-cbc",
+    "3des-cbc",
+    "arcfour128",
+    "arcfour",
+];
+const SSH_PREFERRED_MAC_ALGORITHMS: &[&str] = &[
+    "hmac-sha2-512-etm@openssh.com",
+    "hmac-sha2-256-etm@openssh.com",
+    "hmac-sha2-512",
+    "hmac-sha2-256",
+    "hmac-sha1-etm@openssh.com",
+    "hmac-sha1",
+    "hmac-sha1-96",
+    "hmac-ripemd160@openssh.com",
+    "hmac-ripemd160",
+    "hmac-md5",
+    "hmac-md5-96",
+];
 
 #[derive(Debug)]
 enum Auth {
@@ -112,6 +175,94 @@ fn debug_log_line(line: impl AsRef<str>) {
         return;
     };
     let _ = writeln!(log, "{}", line.as_ref());
+}
+
+fn apply_ssh_algorithm_preferences(session: &ssh2::Session) {
+    set_preferred_ssh_algorithms(
+        session,
+        ssh2::MethodType::Kex,
+        SSH_PREFERRED_KEX_ALGORITHMS,
+        "kex",
+    );
+    set_preferred_ssh_algorithms(
+        session,
+        ssh2::MethodType::HostKey,
+        SSH_PREFERRED_HOST_KEY_ALGORITHMS,
+        "host key",
+    );
+    set_preferred_ssh_algorithms(
+        session,
+        ssh2::MethodType::CryptCs,
+        SSH_PREFERRED_CIPHER_ALGORITHMS,
+        "client cipher",
+    );
+    set_preferred_ssh_algorithms(
+        session,
+        ssh2::MethodType::CryptSc,
+        SSH_PREFERRED_CIPHER_ALGORITHMS,
+        "server cipher",
+    );
+    set_preferred_ssh_algorithms(
+        session,
+        ssh2::MethodType::MacCs,
+        SSH_PREFERRED_MAC_ALGORITHMS,
+        "client mac",
+    );
+    set_preferred_ssh_algorithms(
+        session,
+        ssh2::MethodType::MacSc,
+        SSH_PREFERRED_MAC_ALGORITHMS,
+        "server mac",
+    );
+}
+
+fn set_preferred_ssh_algorithms(
+    session: &ssh2::Session,
+    method_type: ssh2::MethodType,
+    preferred_algorithms: &[&str],
+    label: &str,
+) {
+    let algorithms = match session.supported_algs(method_type) {
+        Ok(supported_algorithms) => preferred_algorithms
+            .iter()
+            .copied()
+            .filter(|algorithm| {
+                supported_algorithms
+                    .iter()
+                    .any(|supported| supported == algorithm)
+            })
+            .collect::<Vec<_>>(),
+        Err(err) => {
+            debug_log_line(format!(
+                "could not inspect supported ssh {label} algorithms: {err}"
+            ));
+            preferred_algorithms.to_vec()
+        }
+    };
+
+    if algorithms.is_empty() {
+        return;
+    }
+
+    let preferences = algorithms.join(",");
+    if let Err(err) = session.method_pref(method_type, &preferences) {
+        debug_log_line(format!(
+            "could not set ssh {label} algorithm preferences: {err}"
+        ));
+    }
+}
+
+fn ssh_handshake_error(error: ssh2::Error) -> io::Error {
+    let error = error.to_string();
+    let hint = if error.contains("Unable to exchange encryption keys") {
+        " The SSH server and embedded client could not agree on key exchange, host key, cipher, or MAC algorithms."
+    } else {
+        ""
+    };
+    io::Error::new(
+        io::ErrorKind::Other,
+        format!("ssh handshake failed: {error}.{hint}"),
+    )
 }
 
 fn shell_quote(value: &str) -> String {
@@ -589,9 +740,9 @@ fn connect(config: &Config) -> io::Result<ssh2::Session> {
     let mut session =
         ssh2::Session::new().map_err(|err| ssh_error("failed to create ssh session", err))?;
     session.set_tcp_stream(tcp);
-    session
-        .handshake()
-        .map_err(|err| ssh_error("ssh handshake failed", err))?;
+    session.set_blocking(true);
+    apply_ssh_algorithm_preferences(&session);
+    session.handshake().map_err(ssh_handshake_error)?;
     match &config.auth {
         Auth::Password(password) => session
             .userauth_password(&config.user, password)

@@ -1128,6 +1128,14 @@ fn handle_terminal_view_event(
             Event::TerminalViewStateChanged => {
                 ctx.emit(pane_group::Event::TerminalViewStateChanged);
             }
+            Event::RestartCliAgentSession => {
+                if let Some(terminal_view) = group.terminal_view_from_pane_id(terminal_pane_id, ctx)
+                {
+                    ctx.emit(pane_group::Event::RestartCliAgentSession {
+                        terminal_view_id: terminal_view.id(),
+                    });
+                }
+            }
             Event::OnboardingTutorialCompleted => {
                 ctx.emit(pane_group::Event::OnboardingTutorialCompleted);
             }

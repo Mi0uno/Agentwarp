@@ -88,15 +88,17 @@ use crate::settings::{
     AgentModeCodingPermissionsType, AgentModeCommandExecutionDenylist,
     AgentModeCommandExecutionPredicate, AgentModeQuerySuggestionsEnabled, AwsBedrockAutoLogin,
     AwsBedrockCredentialsEnabled, CLIAgentApiModelMapping, CLIAgentApiProfile,
-    CLIAgentApiProfileHealth, CLIAgentBuiltinPromptMode, CanUseWarpCreditsForFallback,
-    CodeSettings, CodebaseContextEnabled, FileBasedMcpEnabled, GitOperationsAutogenEnabled,
-    IncludeAgentCommandsInHistory, InputSettings, IntelligentAutosuggestionsEnabled, MemoryEnabled,
-    NLDInTerminalEnabled, NaturalLanguageAutosuggestionsEnabled, PromptSubmissionMode,
-    RuleSuggestionsEnabled, SharedBlockTitleGenerationEnabled, ShouldRenderCLIAgentToolbar,
+    CLIAgentApiProfileHealth, CLIAgentApiTakeoverEnabled, CLIAgentBuiltinPromptMode,
+    CanUseWarpCreditsForFallback, CodeSettings, CodebaseContextEnabled, FileBasedMcpEnabled,
+    GitOperationsAutogenEnabled, IncludeAgentCommandsInHistory, InputSettings,
+    IntelligentAutosuggestionsEnabled, MemoryEnabled, NLDInTerminalEnabled,
+    NaturalLanguageAutosuggestionsEnabled, PromptSubmissionMode, RuleSuggestionsEnabled,
+    SharedBlockTitleGenerationEnabled, ShouldRenderCLIAgentToolbar,
     ShouldRenderUseAgentToolbarForUserCommands, ShouldShowOzUpdatesInZeroState, ShowAgentTips,
     ShowConversationHistory, ShowHintText, ThinkingDisplayMode, VoiceInputEnabled,
     WarpDriveContextEnabled, CLI_AGENT_API_ALL_ENVIRONMENTS_ID, CLI_AGENT_API_LOCAL_ENVIRONMENT_ID,
 };
+use crate::terminal::cli_agent::{AgentRuntimeSettingsModel, DEFAULT_CLI_AGENT_MODEL_LABEL};
 use crate::terminal::session_settings::{SessionSettings, SessionSettingsChangedEvent};
 use crate::terminal::CLIAgent;
 use crate::view_components::action_button::{ActionButton, ButtonSize, SecondaryTheme};
@@ -122,6 +124,8 @@ pub enum AISubpage {
     ThirdPartyCLIAgents,
     /// Unified API endpoint, model mapping, and failover settings for CLI agents.
     AgentApiProfiles,
+    /// Local CLI agent resume identifiers.
+    SessionIds,
 }
 
 impl AISubpage {
@@ -133,6 +137,7 @@ impl AISubpage {
             SettingsSection::AgentBuiltinPrompts => Some(Self::BuiltinPrompts),
             SettingsSection::ThirdPartyCLIAgents => Some(Self::ThirdPartyCLIAgents),
             SettingsSection::AgentApiProfiles => Some(Self::AgentApiProfiles),
+            SettingsSection::AgentSessionIds => Some(Self::SessionIds),
             // AgentMCPServers renders the standalone MCPServers page, not an AI subpage.
             _ => None,
         }
@@ -166,6 +171,7 @@ use crate::workspace::view::ssh_remote::{
     ssh_remote_environment_id, sync_remote_claude_agent_api_settings,
     sync_remote_codex_agent_api_settings, SshRemoteModel,
 };
+use crate::workspace::view::agent_sessions::AgentSessionsModel;
 use crate::workspaces::workspace::{AdminEnablementSetting, CustomerType};
 use crate::{
     report_error, report_if_error, send_telemetry_from_ctx, TelemetryEvent, UserWorkspaces,
@@ -660,6 +666,7 @@ pub struct AISettingsPageView {
     cli_agent_builtin_prompt_mode_dropdowns: Vec<ViewHandle<Dropdown<AISettingsPageAction>>>,
     cli_agent_api_profile_preset_dropdown: ViewHandle<Dropdown<AISettingsPageAction>>,
     cli_agent_api_profile_selected_preset_id: String,
+    cli_agent_api_takeover_toggle: SwitchStateHandle,
     cli_agent_api_profile_agent_dropdown: ViewHandle<Dropdown<AISettingsPageAction>>,
     cli_agent_api_profile_environment_dropdown: ViewHandle<Dropdown<AISettingsPageAction>>,
     cli_agent_api_profile_draft_agent: CLIAgent,
@@ -705,6 +712,12 @@ pub struct AISettingsPageView {
     cli_agent_api_profile_check_mouse_state_handles: Vec<MouseStateHandle>,
     cli_agent_api_profile_toggle_mouse_state_handles: Vec<MouseStateHandle>,
     cli_agent_api_profile_remove_mouse_state_handles: Vec<MouseStateHandle>,
+    agent_session_id_search_editor: ViewHandle<EditorView>,
+    agent_session_id_editing_record_id: Option<String>,
+    agent_session_id_agent_editor: ViewHandle<EditorView>,
+    agent_session_id_project_editor: ViewHandle<EditorView>,
+    agent_session_id_value_editor: ViewHandle<EditorView>,
+    agent_session_id_title_editor: ViewHandle<EditorView>,
     agent_toolbar_inline_editor: ViewHandle<AgentToolbarInlineEditor>,
     cli_agent_toolbar_inline_editor: ViewHandle<AgentToolbarInlineEditor>,
 
@@ -1277,6 +1290,19 @@ impl AISettingsPageView {
             );
         let cli_agent_api_profiles_json_editor =
             Self::create_cli_agent_api_profiles_json_editor(ctx);
+        let agent_session_id_search_editor =
+            Self::create_cli_agent_api_profile_editor("Search sessions", false, ctx);
+        ctx.subscribe_to_view(&agent_session_id_search_editor, |_, _, _, ctx| {
+            ctx.notify();
+        });
+        let agent_session_id_agent_editor =
+            Self::create_cli_agent_api_profile_editor("codex", false, ctx);
+        let agent_session_id_project_editor =
+            Self::create_cli_agent_api_profile_editor("/path/to/project", false, ctx);
+        let agent_session_id_value_editor =
+            Self::create_cli_agent_api_profile_editor("session id", false, ctx);
+        let agent_session_id_title_editor =
+            Self::create_cli_agent_api_profile_editor("Title", false, ctx);
         let cli_agent_api_profile_count = AISettings::as_ref(ctx)
             .cli_agent_api_profiles()
             .profiles
@@ -2048,6 +2074,7 @@ impl AISettingsPageView {
             cli_agent_builtin_prompt_mode_dropdowns,
             cli_agent_api_profile_preset_dropdown,
             cli_agent_api_profile_selected_preset_id,
+            cli_agent_api_takeover_toggle: SwitchStateHandle::default(),
             cli_agent_api_profile_agent_dropdown,
             cli_agent_api_profile_environment_dropdown,
             cli_agent_api_profile_draft_agent,
@@ -2096,6 +2123,12 @@ impl AISettingsPageView {
             cli_agent_api_profile_check_mouse_state_handles,
             cli_agent_api_profile_toggle_mouse_state_handles,
             cli_agent_api_profile_remove_mouse_state_handles,
+            agent_session_id_search_editor,
+            agent_session_id_editing_record_id: None,
+            agent_session_id_agent_editor,
+            agent_session_id_project_editor,
+            agent_session_id_value_editor,
+            agent_session_id_title_editor,
             agent_toolbar_inline_editor,
             cli_agent_toolbar_inline_editor,
             base_model_dropdown,
@@ -2679,6 +2712,9 @@ impl AISettingsPageView {
             }
             Some(AISubpage::AgentApiProfiles) => {
                 widgets.push(Box::new(CLIAgentApiProfilesWidget::default()));
+            }
+            Some(AISubpage::SessionIds) => {
+                widgets.push(Box::new(CLIAgentSessionIdsWidget::default()));
             }
             Some(AISubpage::BuiltinPrompts) => {
                 widgets.push(Box::new(CLIAgentBuiltinPromptsWidget::default()));
@@ -5655,6 +5691,7 @@ pub enum AISettingsPageAction {
         agent: CLIAgent,
         mode: CLIAgentBuiltinPromptMode,
     },
+    ToggleCLIAgentApiTakeover,
     SetCLIAgentApiProfilePreset(String),
     SetCLIAgentApiProfileDraftAgent(CLIAgent),
     SetCLIAgentApiProfileDraftEnvironment(String),
@@ -5685,6 +5722,10 @@ pub enum AISettingsPageAction {
         environment_id: String,
         profile_id: String,
     },
+    SaveAgentSessionId,
+    EditAgentSessionId(String),
+    CancelEditAgentSessionId,
+    RemoveAgentSessionId(String),
     SetCLIAgentForCommand {
         pattern: String,
         agent: Option<CLIAgent>,
@@ -5698,6 +5739,52 @@ impl From<&AISettingsPageAction> for LoginGatedFeature {
             AttemptLoginGatedUpgrade => "Upgrade AI Usage",
             _ => "Unknown reason",
         }
+    }
+}
+
+impl AISettingsPageView {
+    fn parse_agent_session_id_agent(agent: &str) -> Option<CLIAgent> {
+        match agent.trim().to_lowercase().as_str() {
+            "codex" => Some(CLIAgent::Codex),
+            "claude" | "claude code" => Some(CLIAgent::Claude),
+            "opencode" | "open code" => Some(CLIAgent::OpenCode),
+            _ => None,
+        }
+    }
+
+    fn agent_session_id_editor_text(editor: &ViewHandle<EditorView>, ctx: &AppContext) -> String {
+        editor.as_ref(ctx).buffer_text(ctx).trim().to_owned()
+    }
+
+    fn agent_session_id_project_path(text: &str) -> PathBuf {
+        let text = text.trim();
+        if text == "~" {
+            return std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(text));
+        }
+        if let Some(rest) = text.strip_prefix("~/") {
+            return std::env::var_os("HOME")
+                .map(|home| PathBuf::from(home).join(rest))
+                .unwrap_or_else(|| PathBuf::from(text));
+        }
+        PathBuf::from(text)
+    }
+
+    fn set_agent_session_id_editor_text(
+        editor: &ViewHandle<EditorView>,
+        text: &str,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        editor.update(ctx, |editor, ctx| editor.set_buffer_text(text, ctx));
+    }
+
+    fn clear_agent_session_id_editors(&mut self, ctx: &mut ViewContext<Self>) {
+        self.agent_session_id_editing_record_id = None;
+        Self::set_agent_session_id_editor_text(&self.agent_session_id_agent_editor, "codex", ctx);
+        Self::set_agent_session_id_editor_text(&self.agent_session_id_project_editor, "", ctx);
+        Self::set_agent_session_id_editor_text(&self.agent_session_id_value_editor, "", ctx);
+        Self::set_agent_session_id_editor_text(&self.agent_session_id_title_editor, "", ctx);
     }
 }
 
@@ -6106,6 +6193,20 @@ impl TypedActionView for AISettingsPageView {
                     settings.set_cli_agent_builtin_prompt_mode(*agent, *mode, ctx);
                 });
             }
+            AISettingsPageAction::ToggleCLIAgentApiTakeover => {
+                AISettings::handle(ctx).update(ctx, |settings, ctx| {
+                    report_if_error!(settings
+                        .cli_agent_api_takeover_enabled
+                        .toggle_and_save_value(ctx));
+                });
+                if !AISettings::as_ref(ctx).is_cli_agent_api_takeover_enabled() {
+                    AgentRuntimeSettingsModel::handle(ctx).update(ctx, |settings, ctx| {
+                        for agent in AISettings::cli_agent_api_profile_agents() {
+                            settings.set_model(agent, DEFAULT_CLI_AGENT_MODEL_LABEL, ctx);
+                        }
+                    });
+                }
+            }
             AISettingsPageAction::SetCLIAgentApiProfilePreset(preset_id) => {
                 self.handle_set_cli_agent_api_profile_preset(preset_id, ctx);
             }
@@ -6302,6 +6403,79 @@ impl TypedActionView for AISettingsPageView {
                 AISettings::handle(ctx).update(ctx, |settings, ctx| {
                     settings.set_cli_agent_for_command(pattern, *agent, ctx);
                 });
+            }
+            AISettingsPageAction::SaveAgentSessionId => {
+                let agent_text =
+                    Self::agent_session_id_editor_text(&self.agent_session_id_agent_editor, ctx);
+                let Some(agent) = Self::parse_agent_session_id_agent(&agent_text) else {
+                    log::warn!("Invalid agent for session id record: {agent_text}");
+                    return;
+                };
+                let project_path = Self::agent_session_id_project_path(
+                    &Self::agent_session_id_editor_text(
+                        &self.agent_session_id_project_editor,
+                        ctx,
+                    ),
+                );
+                let agent_session_id =
+                    Self::agent_session_id_editor_text(&self.agent_session_id_value_editor, ctx);
+                let title =
+                    Self::agent_session_id_editor_text(&self.agent_session_id_title_editor, ctx);
+                let record_id = self.agent_session_id_editing_record_id.clone();
+                let result = AgentSessionsModel::handle(ctx).update(ctx, |model, ctx| {
+                    model.save_session_id_record(
+                        record_id.as_deref(),
+                        agent,
+                        project_path,
+                        agent_session_id,
+                        title,
+                        ctx,
+                    )
+                });
+                if let Err(error) = result {
+                    log::warn!("Failed to save agent session id record: {error}");
+                    return;
+                }
+                self.clear_agent_session_id_editors(ctx);
+                ctx.notify();
+            }
+            AISettingsPageAction::EditAgentSessionId(session_id) => {
+                let record = AgentSessionsModel::as_ref(ctx).session(session_id).cloned();
+                let Some(record) = record else {
+                    return;
+                };
+                self.agent_session_id_editing_record_id = Some(record.id.clone());
+                Self::set_agent_session_id_editor_text(
+                    &self.agent_session_id_agent_editor,
+                    record.agent.command_prefix(),
+                    ctx,
+                );
+                Self::set_agent_session_id_editor_text(
+                    &self.agent_session_id_project_editor,
+                    &record.project_path.to_string_lossy(),
+                    ctx,
+                );
+                Self::set_agent_session_id_editor_text(
+                    &self.agent_session_id_value_editor,
+                    record.agent_session_id.as_deref().unwrap_or_default(),
+                    ctx,
+                );
+                Self::set_agent_session_id_editor_text(
+                    &self.agent_session_id_title_editor,
+                    &record.title,
+                    ctx,
+                );
+                ctx.notify();
+            }
+            AISettingsPageAction::CancelEditAgentSessionId => {
+                self.clear_agent_session_id_editors(ctx);
+                ctx.notify();
+            }
+            AISettingsPageAction::RemoveAgentSessionId(session_id) => {
+                AgentSessionsModel::handle(ctx).update(ctx, |model, ctx| {
+                    model.delete_session(session_id, ctx);
+                });
+                ctx.notify();
             }
             AISettingsPageAction::RemoveFromCommandExecutionAllowlist(cmd) => {
                 BlocklistAIPermissions::handle(ctx).update(ctx, |model, ctx| {
@@ -10964,7 +11138,7 @@ impl SettingsWidget for CLIAgentApiProfilesWidget {
         let description = appearance
             .ui_builder()
             .paragraph(
-                "管理自定义模型供应商，配置后本地和 SSH remote 的 Agent 端点会统一注入并可直接使用。",
+                "管理自定义模型供应商。启用接管后，本地和 SSH remote 的 Agent 端点会统一注入并可直接使用。",
             )
             .with_style(UiComponentStyles {
                 font_size: Some(appearance.ui_font_size()),
@@ -10978,6 +11152,34 @@ impl SettingsWidget for CLIAgentApiProfilesWidget {
             })
             .build()
             .finish();
+        let ai_settings = AISettings::as_ref(app);
+        let takeover_toggle = build_toggle_element(
+            render_body_item_label::<AISettingsPageAction>(
+                "启用 Agent API 接管".to_owned(),
+                Some(styles::header_font_color(true, app)),
+                None,
+                LocalOnlyIconState::for_setting(
+                    CLIAgentApiTakeoverEnabled::storage_key(),
+                    CLIAgentApiTakeoverEnabled::sync_to_cloud(),
+                    &mut view.local_only_icon_tooltip_states.borrow_mut(),
+                    app,
+                ),
+                ToggleState::Enabled,
+                appearance,
+            ),
+            render_ai_feature_switch(
+                view.cli_agent_api_takeover_toggle.clone(),
+                ai_settings.is_cli_agent_api_takeover_enabled(),
+                true,
+                AISettingsPageAction::ToggleCLIAgentApiTakeover,
+                app,
+            ),
+            appearance,
+            Some(
+                "关闭时，Agentwarp 不接管本机或 SSH remote 中的 Agent API 配置；模型切换只使用 CLI 原生配置。"
+                    .to_owned(),
+            ),
+        );
 
         Flex::column()
             .with_spacing(12.)
@@ -10991,8 +11193,399 @@ impl SettingsWidget for CLIAgentApiProfilesWidget {
                 .finish(),
             )
             .with_child(description)
+            .with_child(takeover_toggle)
             .with_child(self.render_provider_manager(view, appearance, app))
             .finish()
+    }
+}
+
+#[derive(Default)]
+struct CLIAgentSessionIdsWidget;
+
+impl CLIAgentSessionIdsWidget {
+    fn record_matches_query(
+        record: &crate::workspace::view::agent_sessions::AgentSessionRecord,
+        query: &str,
+    ) -> bool {
+        if query.is_empty() {
+            return true;
+        }
+
+        let haystack = format!(
+            "{} {} {} {} {}",
+            record.agent.display_name(),
+            record.title,
+            record.agent_session_id.as_deref().unwrap_or_default(),
+            record.project_path.display(),
+            record.environment_id
+        )
+        .to_lowercase();
+        haystack.contains(query)
+    }
+
+    fn render_record_row(
+        record: &crate::workspace::view::agent_sessions::AgentSessionRecord,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let active_color = theme.active_ui_text_color();
+        let description_color = styles::description_font_color(true, app);
+        let session_id = record
+            .agent_session_id
+            .as_deref()
+            .unwrap_or("No resume id");
+        let details = format!(
+            "{}  ·  {}  ·  {}",
+            session_id,
+            record.project_path.display(),
+            record.status.label()
+        );
+        let title = appearance
+            .ui_builder()
+            .span(record.title.clone())
+            .with_style(UiComponentStyles {
+                font_size: Some(CONTENT_FONT_SIZE),
+                font_weight: Some(Weight::Semibold),
+                font_color: Some(active_color.into()),
+                ..Default::default()
+            })
+            .build()
+            .finish();
+        let details = appearance
+            .ui_builder()
+            .paragraph(details)
+            .with_style(UiComponentStyles {
+                font_size: Some(CONTENT_FONT_SIZE),
+                font_color: Some(description_color.into()),
+                margin: Some(Coords::default().top(2.)),
+                ..Default::default()
+            })
+            .build()
+            .finish();
+        let edit_action = AISettingsPageAction::EditAgentSessionId(record.id.clone());
+        let edit_button = appearance
+            .ui_builder()
+            .button(ButtonVariant::Text, MouseStateHandle::default())
+            .with_text_label("Edit".to_owned())
+            .with_style(UiComponentStyles {
+                font_size: Some(CONTENT_FONT_SIZE),
+                font_weight: Some(Weight::Semibold),
+                font_color: Some(active_color.into()),
+                padding: Some(Coords {
+                    top: 4.,
+                    bottom: 4.,
+                    left: 6.,
+                    right: 6.,
+                }),
+                ..Default::default()
+            })
+            .build()
+            .with_cursor(Cursor::PointingHand)
+            .on_click(move |ctx, _, _| {
+                ctx.dispatch_typed_action(edit_action.clone());
+            })
+            .finish();
+        let remove_action = AISettingsPageAction::RemoveAgentSessionId(record.id.clone());
+        let remove_button = appearance
+            .ui_builder()
+            .close_button(16., MouseStateHandle::default())
+            .build()
+            .on_click(move |ctx, _, _| {
+                ctx.dispatch_typed_action(remove_action.clone());
+            })
+            .finish();
+
+        Container::new(
+            Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
+                .with_main_axis_size(MainAxisSize::Max)
+                .with_children([
+                    Shrinkable::new(
+                        1.,
+                        Flex::column()
+                            .with_spacing(2.)
+                            .with_child(title)
+                            .with_child(details)
+                            .finish(),
+                    )
+                    .finish(),
+                    Flex::row()
+                        .with_spacing(8.)
+                        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                        .with_child(edit_button)
+                        .with_child(remove_button)
+                        .finish(),
+                ])
+                .finish(),
+        )
+        .with_uniform_padding(12.)
+        .with_background(theme.surface_2())
+        .with_border(Border::all(1.).with_border_fill(theme.outline()))
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
+        .finish()
+    }
+
+    fn render_editor_field(
+        label: &str,
+        editor: &ViewHandle<EditorView>,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let label = appearance
+            .ui_builder()
+            .span(label.to_owned())
+            .with_style(UiComponentStyles {
+                font_size: Some(CONTENT_FONT_SIZE),
+                font_color: Some(styles::description_font_color(true, app).into()),
+                ..Default::default()
+            })
+            .build()
+            .finish();
+        Flex::column()
+            .with_spacing(4.)
+            .with_child(label)
+            .with_child(
+                ConstrainedBox::new(ChildView::new(editor).finish())
+                    .with_max_width(260.)
+                    .finish(),
+            )
+            .finish()
+    }
+
+    fn render_text_button(
+        label: &str,
+        action: AISettingsPageAction,
+        appearance: &Appearance,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        appearance
+            .ui_builder()
+            .button(ButtonVariant::Text, MouseStateHandle::default())
+            .with_text_label(label.to_owned())
+            .with_style(UiComponentStyles {
+                font_size: Some(CONTENT_FONT_SIZE),
+                font_weight: Some(Weight::Semibold),
+                font_color: Some(theme.active_ui_text_color().into()),
+                padding: Some(Coords {
+                    top: 6.,
+                    bottom: 6.,
+                    left: 8.,
+                    right: 8.,
+                }),
+                ..Default::default()
+            })
+            .build()
+            .with_cursor(Cursor::PointingHand)
+            .on_click(move |ctx, _, _| {
+                ctx.dispatch_typed_action(action.clone());
+            })
+            .finish()
+    }
+}
+
+impl SettingsWidget for CLIAgentSessionIdsWidget {
+    type View = AISettingsPageView;
+
+    fn search_terms(&self) -> &str {
+        "session ids resume id history codex claude opencode agent sessions restore"
+    }
+
+    fn render(
+        &self,
+        view: &Self::View,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let query = view
+            .agent_session_id_search_editor
+            .as_ref(app)
+            .buffer_text(app)
+            .trim()
+            .to_lowercase();
+        let records = AgentSessionsModel::as_ref(app).records();
+        let agents = [CLIAgent::Codex, CLIAgent::Claude, CLIAgent::OpenCode];
+        let save_label = if view.agent_session_id_editing_record_id.is_some() {
+            "Save changes"
+        } else {
+            "Add session"
+        };
+        let mut column = Flex::column()
+            .with_spacing(12.)
+            .with_child(
+                build_sub_header(
+                    appearance,
+                    "Session IDs",
+                    Some(styles::header_font_color(true, app)),
+                )
+                .with_padding_bottom(HEADER_PADDING)
+                .finish(),
+            )
+            .with_child(
+                appearance
+                    .ui_builder()
+                    .paragraph(
+                        "Manage local resume identifiers used when Agentwarp restarts a CLI agent to apply model, permission, or reasoning changes.",
+                    )
+                    .with_style(UiComponentStyles {
+                        font_size: Some(appearance.ui_font_size()),
+                        font_color: Some(styles::description_font_color(true, app).into()),
+                        margin: Some(
+                            Coords::default()
+                                .bottom(styles::DESCRIPTION_MARGIN_BOTTOM)
+                                .right(styles::TOGGLE_WIDTH_MARGIN),
+                        ),
+                        ..Default::default()
+                    })
+                    .build()
+                    .finish(),
+            )
+            .with_child(
+                Container::new(
+                    Flex::column()
+                        .with_spacing(10.)
+                        .with_child(
+                            Flex::row()
+                                .with_spacing(10.)
+                                .with_child(Self::render_editor_field(
+                                    "Agent",
+                                    &view.agent_session_id_agent_editor,
+                                    appearance,
+                                    app,
+                                ))
+                                .with_child(Self::render_editor_field(
+                                    "Project path",
+                                    &view.agent_session_id_project_editor,
+                                    appearance,
+                                    app,
+                                ))
+                                .finish(),
+                        )
+                        .with_child(
+                            Flex::row()
+                                .with_spacing(10.)
+                                .with_child(Self::render_editor_field(
+                                    "Session ID",
+                                    &view.agent_session_id_value_editor,
+                                    appearance,
+                                    app,
+                                ))
+                                .with_child(Self::render_editor_field(
+                                    "Title",
+                                    &view.agent_session_id_title_editor,
+                                    appearance,
+                                    app,
+                                ))
+                                .finish(),
+                        )
+                        .with_child(
+                            Flex::row()
+                                .with_spacing(8.)
+                                .with_child(Self::render_text_button(
+                                    save_label,
+                                    AISettingsPageAction::SaveAgentSessionId,
+                                    appearance,
+                                ))
+                                .with_child(Self::render_text_button(
+                                    "Cancel",
+                                    AISettingsPageAction::CancelEditAgentSessionId,
+                                    appearance,
+                                ))
+                                .finish(),
+                        )
+                        .finish(),
+                )
+                .with_uniform_padding(12.)
+                .with_background(appearance.theme().surface_2())
+                .with_border(Border::all(1.).with_border_fill(appearance.theme().outline()))
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
+                .finish(),
+            )
+            .with_child(
+                ConstrainedBox::new(
+                    ChildView::new(&view.agent_session_id_search_editor).finish(),
+                )
+                .with_max_width(360.)
+                .finish(),
+            );
+
+        let mut any = false;
+        for agent in agents {
+            let mut agent_records = records
+                .iter()
+                .filter(|record| {
+                    record.agent == agent && Self::record_matches_query(record, &query)
+                })
+                .collect::<Vec<_>>();
+            agent_records.sort_by(|a, b| b.updated_at_ms.cmp(&a.updated_at_ms));
+            if agent_records.is_empty() {
+                continue;
+            }
+            any = true;
+            column.add_child(
+                appearance
+                    .ui_builder()
+                    .span(agent.display_name().to_owned())
+                    .with_style(UiComponentStyles {
+                        font_size: Some(CONTENT_FONT_SIZE),
+                        font_weight: Some(Weight::Semibold),
+                        font_color: Some(styles::header_font_color(true, app).into()),
+                        margin: Some(Coords::default().top(6.)),
+                        ..Default::default()
+                    })
+                    .build()
+                    .finish(),
+            );
+            for record in agent_records {
+                column.add_child(Self::render_record_row(record, appearance, app));
+            }
+        }
+
+        let mut other_records = records
+            .iter()
+            .filter(|record| {
+                !agents.contains(&record.agent) && Self::record_matches_query(record, &query)
+            })
+            .collect::<Vec<_>>();
+        other_records.sort_by(|a, b| b.updated_at_ms.cmp(&a.updated_at_ms));
+        if !other_records.is_empty() {
+            any = true;
+            column.add_child(
+                appearance
+                    .ui_builder()
+                    .span("Other".to_owned())
+                    .with_style(UiComponentStyles {
+                        font_size: Some(CONTENT_FONT_SIZE),
+                        font_weight: Some(Weight::Semibold),
+                        font_color: Some(styles::header_font_color(true, app).into()),
+                        margin: Some(Coords::default().top(6.)),
+                        ..Default::default()
+                    })
+                    .build()
+                    .finish(),
+            );
+            for record in other_records {
+                column.add_child(Self::render_record_row(record, appearance, app));
+            }
+        }
+
+        if !any {
+            column.add_child(
+                appearance
+                    .ui_builder()
+                    .paragraph("No matching session IDs.")
+                    .with_style(UiComponentStyles {
+                        font_size: Some(appearance.ui_font_size()),
+                        font_color: Some(styles::description_font_color(true, app).into()),
+                        ..Default::default()
+                    })
+                    .build()
+                    .finish(),
+            );
+        }
+
+        column.finish()
     }
 }
 

@@ -238,6 +238,248 @@ impl AgentReasoningEffortModel {
     }
 }
 
+pub const DEFAULT_CLI_AGENT_MODEL_LABEL: &str = "Default";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AgentPermissionMode {
+    AskForApproval,
+    ApproveForMe,
+    FullAccess,
+}
+
+impl AgentPermissionMode {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::AskForApproval => "询问确认",
+            Self::ApproveForMe => "默认模式",
+            Self::FullAccess => "完全访问",
+        }
+    }
+
+    pub fn short_label(&self) -> &'static str {
+        match self {
+            Self::AskForApproval => "确认",
+            Self::ApproveForMe => "默认模式",
+            Self::FullAccess => "完全访问",
+        }
+    }
+
+    pub fn description(&self) -> &'static str {
+        match self {
+            Self::AskForApproval => "编辑外部文件或使用网络前始终请求确认",
+            Self::ApproveForMe => "仅在 CLI 认为操作不安全时请求确认",
+            Self::FullAccess => "不使用审批提示或沙箱限制",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentRuntimeOptions {
+    pub model: Option<String>,
+    pub permission_mode: Option<AgentPermissionMode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentControlWrite {
+    pub text: String,
+    pub delay_ms: u64,
+}
+
+impl AgentControlWrite {
+    pub fn immediate(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            delay_ms: 0,
+        }
+    }
+
+    pub fn delayed(delay_ms: u64, text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            delay_ms,
+        }
+    }
+}
+
+const CLI_AGENT_PICKER_QUERY_DELAY_MS: u64 = 180;
+const CLI_AGENT_PICKER_ENTER_DELAY_MS: u64 = 360;
+const CLAUDE_PERMISSION_CYCLE_INPUT: &str = "\x1bm";
+const CLAUDE_PERMISSION_CYCLE_BACK_INPUT: &str = "\x1b[Z";
+const CLAUDE_PERMISSION_CYCLE_LEN: usize = 4;
+
+#[derive(Debug, Clone)]
+pub struct AgentRuntimeSettingsModelEvent;
+
+pub struct AgentRuntimeSettingsModel {
+    models_by_agent: HashMap<CLIAgent, String>,
+    permissions_by_agent: HashMap<CLIAgent, AgentPermissionMode>,
+}
+
+impl Entity for AgentRuntimeSettingsModel {
+    type Event = AgentRuntimeSettingsModelEvent;
+}
+
+impl SingletonEntity for AgentRuntimeSettingsModel {}
+
+impl AgentRuntimeSettingsModel {
+    pub fn new(_ctx: &mut ModelContext<Self>) -> Self {
+        Self {
+            models_by_agent: HashMap::new(),
+            permissions_by_agent: HashMap::new(),
+        }
+    }
+
+    pub fn model_label_for_with_custom_models(
+        &self,
+        agent: CLIAgent,
+        allow_custom_models: bool,
+    ) -> &str {
+        self.models_by_agent
+            .get(&agent)
+            .filter(|model| {
+                if allow_custom_models {
+                    agent.supports_model(model)
+                } else {
+                    agent.model_options().contains(&model.as_str())
+                }
+            })
+            .map(String::as_str)
+            .unwrap_or(DEFAULT_CLI_AGENT_MODEL_LABEL)
+    }
+
+    pub fn model_label_for(&self, agent: CLIAgent) -> &str {
+        self.model_label_for_with_custom_models(agent, true)
+    }
+
+    pub fn set_model(
+        &mut self,
+        agent: CLIAgent,
+        model: impl Into<String>,
+        ctx: &mut ModelContext<Self>,
+    ) -> bool {
+        let model = model.into();
+        let model = model.trim().to_owned();
+        if model != DEFAULT_CLI_AGENT_MODEL_LABEL && !agent.supports_model(&model) {
+            return false;
+        }
+
+        if model == DEFAULT_CLI_AGENT_MODEL_LABEL {
+            if self.models_by_agent.remove(&agent).is_some() {
+                ctx.emit(AgentRuntimeSettingsModelEvent);
+                return true;
+            }
+            return false;
+        }
+
+        if self.models_by_agent.get(&agent) == Some(&model) {
+            return false;
+        }
+
+        self.models_by_agent.insert(agent, model);
+        ctx.emit(AgentRuntimeSettingsModelEvent);
+        true
+    }
+
+    pub fn permission_mode_for(&self, agent: CLIAgent) -> Option<AgentPermissionMode> {
+        if agent.permission_mode_options().is_empty() {
+            return None;
+        }
+
+        self.permissions_by_agent
+            .get(&agent)
+            .copied()
+            .filter(|mode| agent.supports_permission_mode(*mode))
+            .or(Some(AgentPermissionMode::ApproveForMe))
+    }
+
+    pub fn set_permission_mode(
+        &mut self,
+        agent: CLIAgent,
+        permission_mode: AgentPermissionMode,
+        ctx: &mut ModelContext<Self>,
+    ) -> bool {
+        if !agent.supports_permission_mode(permission_mode) {
+            return false;
+        }
+
+        if self.permissions_by_agent.get(&agent) == Some(&permission_mode) {
+            return false;
+        }
+
+        self.permissions_by_agent.insert(agent, permission_mode);
+        ctx.emit(AgentRuntimeSettingsModelEvent);
+        true
+    }
+
+    pub fn launch_options_for(&self, agent: CLIAgent) -> AgentRuntimeOptions {
+        self.launch_options_for_with_custom_models(agent, true)
+    }
+
+    pub fn launch_options_for_with_custom_models(
+        &self,
+        agent: CLIAgent,
+        allow_custom_models: bool,
+    ) -> AgentRuntimeOptions {
+        let model_label = self.model_label_for_with_custom_models(agent, allow_custom_models);
+        AgentRuntimeOptions {
+            model: (model_label != DEFAULT_CLI_AGENT_MODEL_LABEL).then(|| model_label.to_owned()),
+            permission_mode: self.permission_mode_for(agent),
+        }
+    }
+}
+
+fn append_arg(command: &mut String, arg: impl AsRef<str>) {
+    if !command.is_empty() {
+        command.push(' ');
+    }
+    command.push_str(arg.as_ref());
+}
+
+fn shell_quote(value: &str) -> String {
+    shell_words::quote(value).into_owned()
+}
+
+fn normalize_agent_control_arg(value: &str) -> Option<&str> {
+    let value = value.trim();
+    if value.is_empty() || value.chars().any(char::is_control) {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn cli_model_control_value(model: &str) -> &str {
+    if model == DEFAULT_CLI_AGENT_MODEL_LABEL {
+        "default"
+    } else {
+        model
+    }
+}
+
+fn picker_control_sequence(command: &str, query: &str) -> Vec<AgentControlWrite> {
+    vec![
+        AgentControlWrite::immediate(command),
+        AgentControlWrite::delayed(CLI_AGENT_PICKER_QUERY_DELAY_MS, query),
+        AgentControlWrite::delayed(CLI_AGENT_PICKER_ENTER_DELAY_MS, "\n"),
+    ]
+}
+
+fn codex_permission_picker_label(permission_mode: AgentPermissionMode) -> &'static str {
+    match permission_mode {
+        AgentPermissionMode::AskForApproval => "Read Only",
+        AgentPermissionMode::ApproveForMe => "Auto",
+        AgentPermissionMode::FullAccess => "Full Access",
+    }
+}
+
+fn claude_permission_cycle_index(permission_mode: AgentPermissionMode) -> Option<usize> {
+    match permission_mode {
+        AgentPermissionMode::AskForApproval => Some(0),
+        AgentPermissionMode::ApproveForMe => Some(1),
+        AgentPermissionMode::FullAccess => Some(3),
+    }
+}
+
 impl CLIAgent {
     /// The command prefix used to invoke this CLI agent.
     pub fn command_prefix(&self) -> &'static str {
@@ -259,28 +501,373 @@ impl CLIAgent {
         }
     }
 
+    pub fn model_options(&self) -> &'static [&'static str] {
+        const CODEX_MODELS: &[&str] = &[
+            DEFAULT_CLI_AGENT_MODEL_LABEL,
+            "gpt-5.5",
+            "gpt-5.4",
+            "gpt-5.4-mini",
+            "gpt-5.3-codex",
+            "gpt-5.2",
+        ];
+        const CLAUDE_MODELS: &[&str] = &[
+            DEFAULT_CLI_AGENT_MODEL_LABEL,
+            "sonnet",
+            "opus",
+            "haiku",
+            "claude-sonnet-4-6",
+            "claude-opus-4-5",
+            "claude-haiku-4-5",
+        ];
+        const GEMINI_MODELS: &[&str] = &[
+            DEFAULT_CLI_AGENT_MODEL_LABEL,
+            "gemini-2.5-pro",
+            "gemini-2.5-flash",
+            "gemini-2.0-flash",
+            "gemini-1.5-pro-latest",
+        ];
+        const OPENCODE_MODELS: &[&str] = &[
+            DEFAULT_CLI_AGENT_MODEL_LABEL,
+            "openai/gpt-5.5",
+            "openai/gpt-5-codex",
+            "anthropic/claude-sonnet-4-6",
+            "anthropic/claude-opus-4-5",
+            "google/gemini-2.5-pro",
+        ];
+
+        match self {
+            CLIAgent::Codex => CODEX_MODELS,
+            CLIAgent::Claude => CLAUDE_MODELS,
+            CLIAgent::Gemini => GEMINI_MODELS,
+            CLIAgent::OpenCode => OPENCODE_MODELS,
+            _ => &[DEFAULT_CLI_AGENT_MODEL_LABEL],
+        }
+    }
+
+    pub fn supports_model_selection(&self) -> bool {
+        self.model_options().len() > 1
+    }
+
+    pub fn supports_model(&self, model: &str) -> bool {
+        let model = model.trim();
+        !model.is_empty() && model != DEFAULT_CLI_AGENT_MODEL_LABEL
+    }
+
+    pub fn permission_mode_options(&self) -> &'static [AgentPermissionMode] {
+        const PERMISSION_MODES: &[AgentPermissionMode] = &[
+            AgentPermissionMode::AskForApproval,
+            AgentPermissionMode::ApproveForMe,
+            AgentPermissionMode::FullAccess,
+        ];
+
+        match self {
+            CLIAgent::Codex | CLIAgent::Claude | CLIAgent::Gemini | CLIAgent::OpenCode => {
+                PERMISSION_MODES
+            }
+            _ => &[],
+        }
+    }
+
+    pub fn supports_permission_mode(&self, permission_mode: AgentPermissionMode) -> bool {
+        self.permission_mode_options().contains(&permission_mode)
+    }
+
     pub fn command_with_reasoning_effort(&self, effort: AgentReasoningEffort) -> String {
+        self.command_with_runtime_options(
+            effort,
+            &AgentRuntimeOptions {
+                model: None,
+                permission_mode: None,
+            },
+        )
+    }
+
+    pub fn command_with_runtime_options(
+        &self,
+        effort: AgentReasoningEffort,
+        options: &AgentRuntimeOptions,
+    ) -> String {
         let prefix = self.command_prefix();
+        if prefix.is_empty() {
+            return String::new();
+        }
+
+        let mut command = prefix.to_owned();
+        self.append_runtime_options(&mut command, effort, options);
+        command
+    }
+
+    pub fn in_session_model_control_sequence(&self, model: &str) -> Option<Vec<AgentControlWrite>> {
+        let model = normalize_agent_control_arg(model)?;
+
+        match self {
+            CLIAgent::Claude => Some(vec![AgentControlWrite::immediate(format!(
+                "/model {}\n",
+                cli_model_control_value(model)
+            ))]),
+            CLIAgent::Codex => Some(picker_control_sequence(
+                "/model\n",
+                cli_model_control_value(model),
+            )),
+            _ => None,
+        }
+    }
+
+    pub fn in_session_permission_mode_control_sequence(
+        &self,
+        permission_mode: AgentPermissionMode,
+        current_permission_mode: Option<AgentPermissionMode>,
+    ) -> Option<Vec<AgentControlWrite>> {
+        match self {
+            CLIAgent::Codex => Some(picker_control_sequence(
+                "/permissions\n",
+                codex_permission_picker_label(permission_mode),
+            )),
+            CLIAgent::Claude => {
+                let current_permission_mode = current_permission_mode?;
+                if current_permission_mode == permission_mode {
+                    return None;
+                }
+
+                let current_index = claude_permission_cycle_index(current_permission_mode)?;
+                let target_index = claude_permission_cycle_index(permission_mode)?;
+                let forward_steps = (target_index + CLAUDE_PERMISSION_CYCLE_LEN - current_index)
+                    % CLAUDE_PERMISSION_CYCLE_LEN;
+                let backward_steps = (current_index + CLAUDE_PERMISSION_CYCLE_LEN - target_index)
+                    % CLAUDE_PERMISSION_CYCLE_LEN;
+                if forward_steps == 0 {
+                    None
+                } else if backward_steps < forward_steps {
+                    Some(vec![AgentControlWrite::immediate(
+                        CLAUDE_PERMISSION_CYCLE_BACK_INPUT.repeat(backward_steps),
+                    )])
+                } else {
+                    Some(vec![AgentControlWrite::immediate(
+                        CLAUDE_PERMISSION_CYCLE_INPUT.repeat(forward_steps),
+                    )])
+                }
+            }
+            _ => None,
+        }
+    }
+
+    pub fn in_session_reasoning_effort_command(
+        &self,
+        effort: AgentReasoningEffort,
+        current_effort: Option<AgentReasoningEffort>,
+    ) -> Option<String> {
+        match self {
+            CLIAgent::Claude => Some(format!("/effort {}\n", effort.command_value()?)),
+            CLIAgent::Codex => self.codex_reasoning_effort_shortcut_input(effort, current_effort?),
+            _ => None,
+        }
+    }
+
+    fn codex_reasoning_effort_shortcut_input(
+        &self,
+        effort: AgentReasoningEffort,
+        current_effort: AgentReasoningEffort,
+    ) -> Option<String> {
+        const CODEX_REASONING_ORDER: &[AgentReasoningEffort] = &[
+            AgentReasoningEffort::Low,
+            AgentReasoningEffort::Medium,
+            AgentReasoningEffort::High,
+            AgentReasoningEffort::ExtraHigh,
+        ];
+
+        let current_index = CODEX_REASONING_ORDER
+            .iter()
+            .position(|candidate| *candidate == current_effort)?;
+        let target_index = CODEX_REASONING_ORDER
+            .iter()
+            .position(|candidate| *candidate == effort)?;
+
+        match target_index.cmp(&current_index) {
+            std::cmp::Ordering::Less => Some("\x1b,".repeat(current_index - target_index)),
+            std::cmp::Ordering::Greater => Some("\x1b.".repeat(target_index - current_index)),
+            std::cmp::Ordering::Equal => None,
+        }
+    }
+
+    pub fn resume_command_with_runtime_options(
+        &self,
+        session_id: &str,
+        effort: AgentReasoningEffort,
+        options: &AgentRuntimeOptions,
+    ) -> Option<String> {
+        let session_id = session_id.trim();
+        if session_id.is_empty() {
+            return None;
+        }
+
+        let mut command = match self {
+            CLIAgent::Codex => "codex resume".to_owned(),
+            CLIAgent::Claude => "claude".to_owned(),
+            _ => return self.resume_command(session_id),
+        };
+        self.append_runtime_options(&mut command, effort, options);
+
+        match self {
+            CLIAgent::Codex => {
+                append_arg(&mut command, shell_quote(session_id));
+            }
+            CLIAgent::Claude => {
+                append_arg(&mut command, "--resume");
+                append_arg(&mut command, shell_quote(session_id));
+            }
+            _ => {}
+        }
+
+        Some(command)
+    }
+
+    pub fn resume_last_command_with_runtime_options(
+        &self,
+        effort: AgentReasoningEffort,
+        options: &AgentRuntimeOptions,
+    ) -> Option<String> {
+        let mut command = match self {
+            CLIAgent::Codex => "codex resume".to_owned(),
+            _ => return None,
+        };
+        self.append_runtime_options(&mut command, effort, options);
+        append_arg(&mut command, "--last");
+        Some(command)
+    }
+
+    fn append_runtime_options(
+        &self,
+        command: &mut String,
+        effort: AgentReasoningEffort,
+        options: &AgentRuntimeOptions,
+    ) {
+        if let Some(permission_mode) = options
+            .permission_mode
+            .filter(|mode| self.supports_permission_mode(*mode))
+        {
+            self.append_permission_mode(command, permission_mode);
+        }
+
+        if let Some(model) = options
+            .model
+            .as_deref()
+            .filter(|model| self.supports_model(model))
+        {
+            self.append_model(command, model);
+        }
+
         if !self.supports_reasoning_effort(effort) {
-            return prefix.to_owned();
+            return;
         }
 
         if matches!(
             (self, effort),
             (CLIAgent::Claude, AgentReasoningEffort::Ultracode)
         ) {
-            return format!("{prefix} --settings '{{\"ultracode\":true}}'");
+            append_arg(command, "--settings");
+            append_arg(command, shell_quote("{\"ultracode\":true}"));
+            return;
         }
 
         let Some(effort) = effort.command_value() else {
-            return prefix.to_owned();
+            return;
         };
 
         match self {
-            CLIAgent::Claude => format!("{prefix} --effort {effort}"),
-            CLIAgent::Codex => format!("{prefix} -c model_reasoning_effort={effort}"),
-            CLIAgent::Droid => format!("{prefix} --reasoning-effort {effort}"),
-            _ => prefix.to_owned(),
+            CLIAgent::Claude => {
+                append_arg(command, "--effort");
+                append_arg(command, effort);
+            }
+            CLIAgent::Codex => {
+                append_arg(command, "-c");
+                append_arg(command, format!("model_reasoning_effort={effort}"));
+            }
+            CLIAgent::Droid => {
+                append_arg(command, "--reasoning-effort");
+                append_arg(command, effort);
+            }
+            _ => {}
+        }
+    }
+
+    fn append_model(&self, command: &mut String, model: &str) {
+        match self {
+            CLIAgent::Codex => {
+                append_arg(command, "-m");
+                append_arg(command, shell_quote(model));
+            }
+            CLIAgent::Claude | CLIAgent::Gemini | CLIAgent::OpenCode => {
+                append_arg(command, "--model");
+                append_arg(command, shell_quote(model));
+            }
+            _ => {}
+        }
+    }
+
+    fn append_permission_mode(&self, command: &mut String, permission_mode: AgentPermissionMode) {
+        match self {
+            CLIAgent::Codex => match permission_mode {
+                AgentPermissionMode::AskForApproval => {
+                    append_arg(command, "--sandbox");
+                    append_arg(command, "read-only");
+                    append_arg(command, "--ask-for-approval");
+                    append_arg(command, "untrusted");
+                }
+                AgentPermissionMode::ApproveForMe => {
+                    append_arg(command, "--sandbox");
+                    append_arg(command, "workspace-write");
+                    append_arg(command, "--ask-for-approval");
+                    append_arg(command, "on-request");
+                }
+                AgentPermissionMode::FullAccess => {
+                    append_arg(command, "--dangerously-bypass-approvals-and-sandbox");
+                }
+            },
+            CLIAgent::Claude => match permission_mode {
+                AgentPermissionMode::AskForApproval => {
+                    append_arg(command, "--allow-dangerously-skip-permissions");
+                    append_arg(command, "--permission-mode");
+                    append_arg(command, "default");
+                }
+                AgentPermissionMode::ApproveForMe => {
+                    append_arg(command, "--allow-dangerously-skip-permissions");
+                    append_arg(command, "--permission-mode");
+                    append_arg(command, "acceptEdits");
+                }
+                AgentPermissionMode::FullAccess => {
+                    append_arg(command, "--allow-dangerously-skip-permissions");
+                    append_arg(command, "--permission-mode");
+                    append_arg(command, "bypassPermissions");
+                }
+            },
+            CLIAgent::Gemini => match permission_mode {
+                AgentPermissionMode::AskForApproval => {
+                    append_arg(command, "--approval-mode");
+                    append_arg(command, "default");
+                }
+                AgentPermissionMode::ApproveForMe => {
+                    append_arg(command, "--approval-mode");
+                    append_arg(command, "auto_edit");
+                }
+                AgentPermissionMode::FullAccess => {
+                    append_arg(command, "--approval-mode");
+                    append_arg(command, "yolo");
+                }
+            },
+            CLIAgent::OpenCode => {
+                let permission_config = match permission_mode {
+                    AgentPermissionMode::AskForApproval => "{\"*\":\"ask\"}",
+                    AgentPermissionMode::ApproveForMe => {
+                        "{\"read\":\"allow\",\"glob\":\"allow\",\"grep\":\"allow\",\"list\":\"allow\",\"lsp\":\"allow\",\"bash\":\"ask\",\"edit\":\"ask\",\"webfetch\":\"ask\",\"websearch\":\"ask\",\"external_directory\":\"ask\"}"
+                    }
+                    AgentPermissionMode::FullAccess => "\"allow\"",
+                };
+                *command = format!(
+                    "OPENCODE_PERMISSION={} {command}",
+                    shell_quote(permission_config)
+                );
+            }
+            _ => {}
         }
     }
 
@@ -328,42 +915,9 @@ impl CLIAgent {
         }
     }
 
-    pub fn in_session_reasoning_effort_command(
-        &self,
-        effort: AgentReasoningEffort,
-        current_effort: Option<AgentReasoningEffort>,
-    ) -> Option<String> {
-        match self {
-            CLIAgent::Claude => Some(format!("/effort {}\n", effort.command_value()?)),
-            CLIAgent::Codex => self.codex_reasoning_effort_shortcut_input(effort, current_effort?),
-            _ => None,
-        }
-    }
-
-    fn codex_reasoning_effort_shortcut_input(
-        &self,
-        effort: AgentReasoningEffort,
-        current_effort: AgentReasoningEffort,
-    ) -> Option<String> {
-        const CODEX_REASONING_ORDER: &[AgentReasoningEffort] = &[
-            AgentReasoningEffort::Low,
-            AgentReasoningEffort::Medium,
-            AgentReasoningEffort::High,
-            AgentReasoningEffort::ExtraHigh,
-        ];
-
-        let current_index = CODEX_REASONING_ORDER
-            .iter()
-            .position(|candidate| *candidate == current_effort)?;
-        let target_index = CODEX_REASONING_ORDER
-            .iter()
-            .position(|candidate| *candidate == effort)?;
-
-        match target_index.cmp(&current_index) {
-            std::cmp::Ordering::Less => Some("\x1b,".repeat(current_index - target_index)),
-            std::cmp::Ordering::Greater => Some("\x1b.".repeat(target_index - current_index)),
-            std::cmp::Ordering::Equal => None,
-        }
+    /// Whether this agent supports resuming a prior local CLI-agent session by id.
+    pub fn supports_resume(&self) -> bool {
+        matches!(self, CLIAgent::Claude | CLIAgent::Codex)
     }
 
     /// Returns the command used to resume a prior local CLI-agent session when the agent supports

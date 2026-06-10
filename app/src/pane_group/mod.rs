@@ -578,6 +578,9 @@ pub enum Event {
     TerminalPaneClosed {
         terminal_view_id: EntityId,
     },
+    RestartCliAgentSession {
+        terminal_view_id: EntityId,
+    },
     /// Dirty the workspace so the tab indicator shows.
     MaximizePaneToggled,
     /// A remote server resolved the repo root for a session in this pane group.
@@ -5903,6 +5906,50 @@ impl PaneGroup {
         ctx.notify();
         ctx.emit(Event::AppStateChanged);
         success
+    }
+
+    /// Replaces the terminal pane that owns `terminal_view_id` with a fresh
+    /// terminal session. The old pane is permanently closed, which drops its
+    /// terminal manager and force-shuts down the PTY process.
+    pub fn replace_terminal_session_with_options(
+        &mut self,
+        terminal_view_id: EntityId,
+        options: NewTerminalOptions,
+        ctx: &mut ViewContext<Self>,
+    ) -> Option<ViewHandle<TerminalView>> {
+        let original_pane_id = self.find_pane_id_for_terminal_view(terminal_view_id, ctx)?;
+        let NewTerminalOptions {
+            shell,
+            initial_directory,
+            env_vars,
+            hide_homepage: _,
+            is_shared_session_creator,
+            conversation_restoration,
+            ssh_remote_host_id,
+        } = options;
+
+        let (replacement_pane, replacement_view) = self.create_terminal_pane_data(
+            initial_directory,
+            env_vars,
+            is_shared_session_creator,
+            shell,
+            conversation_restoration,
+            ctx,
+        );
+        let replacement_view_id = replacement_view.id();
+
+        if !self.replace_pane(original_pane_id, replacement_pane, false, ctx) {
+            return None;
+        }
+
+        SshRemoteModel::handle(ctx).update(ctx, |model, ctx| {
+            model.unregister_terminal_host(terminal_view_id, ctx);
+            if let Some(host_id) = ssh_remote_host_id {
+                model.register_terminal_host(replacement_view_id, host_id, ctx);
+            }
+        });
+
+        Some(replacement_view)
     }
 
     fn close_temporary_replacement_pane(

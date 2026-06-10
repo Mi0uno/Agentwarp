@@ -549,6 +549,38 @@ pub fn test_restore_blocks_with_local_status() {
 }
 
 #[test]
+pub fn restored_blocks_do_not_restore_process_local_session_ids() {
+    let (events_tx, events_rx) = async_channel::unbounded();
+    let channel_event_proxy = ChannelEventListener::builder_for_test()
+        .with_terminal_events_tx(events_tx)
+        .build();
+
+    let mut block = SerializedBlock::new_for_test("i am".into(), "restored".into());
+    block.session_id = Some(123.into());
+    let restored_blocks = [SerializedBlockListItem::Command {
+        block: Box::new(block),
+    }];
+
+    let _block_list = TestBlockListBuilder::new()
+        .with_channel_event_proxy(channel_event_proxy)
+        .with_restored_blocks(&restored_blocks)
+        .build();
+
+    let mut restored_metadata_events =
+        drain_terminal_events(&events_rx)
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::BlockMetadataReceived(event) if !event.is_done_bootstrapping => Some(event),
+                _ => None,
+            });
+
+    let metadata_event = restored_metadata_events
+        .next()
+        .expect("restoring a completed block should emit restored block metadata");
+    assert_eq!(metadata_event.block_metadata.session_id(), None);
+}
+
+#[test]
 pub fn test_restore_block_that_wasnt_started() {
     let (events_tx, events_rx) = async_channel::unbounded();
     let channel_event_proxy = ChannelEventListener::builder_for_test()

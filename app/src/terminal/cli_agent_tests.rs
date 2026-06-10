@@ -8,8 +8,9 @@ use warp_util::path::EscapeChar;
 use warpui::App;
 
 use super::{
-    build_diff_hunk_prompt, build_review_prompt, build_selection_line_range_prompt,
-    build_selection_substring_prompt, AgentReasoningEffort, CLIAgent, UBER_TEAM_UID,
+    AgentControlWrite, AgentPermissionMode, AgentReasoningEffort, AgentRuntimeOptions, CLIAgent,
+    UBER_TEAM_UID, build_diff_hunk_prompt, build_review_prompt, build_selection_line_range_prompt,
+    build_selection_substring_prompt,
 };
 use crate::ai::agent::{AgentReviewCommentBatch, DiffSetHunk};
 use crate::code::buffer_location::LocalOrRemotePath;
@@ -148,6 +149,246 @@ fn in_session_reasoning_effort_command_maps_supported_agents() {
     );
     assert_eq!(
         CLIAgent::Codex.in_session_reasoning_effort_command(AgentReasoningEffort::Low, None),
+        None
+    );
+}
+
+#[test]
+fn in_session_model_control_sequence_maps_supported_agents() {
+    assert_eq!(
+        CLIAgent::Claude.in_session_model_control_sequence("sonnet"),
+        Some(vec![AgentControlWrite::immediate("/model sonnet\n")])
+    );
+    assert_eq!(
+        CLIAgent::Claude.in_session_model_control_sequence("Default"),
+        Some(vec![AgentControlWrite::immediate("/model default\n")])
+    );
+    assert_eq!(
+        CLIAgent::Codex.in_session_model_control_sequence("gpt-5.4"),
+        Some(vec![
+            AgentControlWrite::immediate("/model\n"),
+            AgentControlWrite::delayed(180, "gpt-5.4"),
+            AgentControlWrite::delayed(360, "\n"),
+        ])
+    );
+    assert_eq!(
+        CLIAgent::Gemini.in_session_model_control_sequence("gemini"),
+        None
+    );
+    assert_eq!(
+        CLIAgent::Claude.in_session_model_control_sequence("bad\nmodel"),
+        None
+    );
+}
+
+#[test]
+fn in_session_permission_mode_control_sequence_maps_supported_agents() {
+    assert_eq!(
+        CLIAgent::Codex
+            .in_session_permission_mode_control_sequence(AgentPermissionMode::FullAccess, None,),
+        Some(vec![
+            AgentControlWrite::immediate("/permissions\n"),
+            AgentControlWrite::delayed(180, "Full Access"),
+            AgentControlWrite::delayed(360, "\n"),
+        ])
+    );
+    assert_eq!(
+        CLIAgent::Claude.in_session_permission_mode_control_sequence(
+            AgentPermissionMode::FullAccess,
+            Some(AgentPermissionMode::AskForApproval),
+        ),
+        Some(vec![AgentControlWrite::immediate("\x1b[Z")])
+    );
+    assert_eq!(
+        CLIAgent::Claude.in_session_permission_mode_control_sequence(
+            AgentPermissionMode::FullAccess,
+            Some(AgentPermissionMode::ApproveForMe),
+        ),
+        Some(vec![AgentControlWrite::immediate("\x1bm\x1bm")])
+    );
+    assert_eq!(
+        CLIAgent::Claude.in_session_permission_mode_control_sequence(
+            AgentPermissionMode::ApproveForMe,
+            Some(AgentPermissionMode::ApproveForMe),
+        ),
+        None
+    );
+    assert_eq!(
+        CLIAgent::Claude
+            .in_session_permission_mode_control_sequence(AgentPermissionMode::FullAccess, None,),
+        None
+    );
+    assert_eq!(
+        CLIAgent::OpenCode.in_session_permission_mode_control_sequence(
+            AgentPermissionMode::FullAccess,
+            Some(AgentPermissionMode::ApproveForMe),
+        ),
+        None
+    );
+}
+
+#[test]
+fn command_with_runtime_options_adds_model_flags_for_supported_agents() {
+    let options = AgentRuntimeOptions {
+        model: Some("gpt-5.5".to_owned()),
+        permission_mode: None,
+    };
+    assert_eq!(
+        CLIAgent::Codex.command_with_runtime_options(AgentReasoningEffort::High, &options),
+        "codex -m gpt-5.5 -c model_reasoning_effort=high"
+    );
+
+    let options = AgentRuntimeOptions {
+        model: Some("sonnet".to_owned()),
+        permission_mode: None,
+    };
+    assert_eq!(
+        CLIAgent::Claude.command_with_runtime_options(AgentReasoningEffort::Auto, &options),
+        "claude --model sonnet"
+    );
+
+    let options = AgentRuntimeOptions {
+        model: Some("gemini-2.5-pro".to_owned()),
+        permission_mode: None,
+    };
+    assert_eq!(
+        CLIAgent::Gemini.command_with_runtime_options(AgentReasoningEffort::Auto, &options),
+        "gemini --model gemini-2.5-pro"
+    );
+
+    let options = AgentRuntimeOptions {
+        model: Some("openai/gpt-5.5".to_owned()),
+        permission_mode: None,
+    };
+    assert_eq!(
+        CLIAgent::OpenCode.command_with_runtime_options(AgentReasoningEffort::Auto, &options),
+        "opencode --model openai/gpt-5.5"
+    );
+}
+
+#[test]
+fn command_with_runtime_options_maps_permission_modes_by_agent() {
+    let ask = AgentRuntimeOptions {
+        model: None,
+        permission_mode: Some(AgentPermissionMode::AskForApproval),
+    };
+    assert_eq!(
+        CLIAgent::Codex.command_with_runtime_options(AgentReasoningEffort::Auto, &ask),
+        "codex --sandbox read-only --ask-for-approval untrusted"
+    );
+    assert_eq!(
+        CLIAgent::Claude.command_with_runtime_options(AgentReasoningEffort::Auto, &ask),
+        "claude --allow-dangerously-skip-permissions --permission-mode default"
+    );
+    assert_eq!(
+        CLIAgent::Gemini.command_with_runtime_options(AgentReasoningEffort::Auto, &ask),
+        "gemini --approval-mode default"
+    );
+    assert_eq!(
+        CLIAgent::OpenCode.command_with_runtime_options(AgentReasoningEffort::Auto, &ask),
+        "OPENCODE_PERMISSION='{\"*\":\"ask\"}' opencode"
+    );
+
+    let approve = AgentRuntimeOptions {
+        model: None,
+        permission_mode: Some(AgentPermissionMode::ApproveForMe),
+    };
+    assert_eq!(
+        CLIAgent::Codex.command_with_runtime_options(AgentReasoningEffort::Auto, &approve),
+        "codex --sandbox workspace-write --ask-for-approval on-request"
+    );
+    assert_eq!(
+        CLIAgent::Claude.command_with_runtime_options(AgentReasoningEffort::Auto, &approve),
+        "claude --allow-dangerously-skip-permissions --permission-mode acceptEdits"
+    );
+    assert_eq!(
+        CLIAgent::Gemini.command_with_runtime_options(AgentReasoningEffort::Auto, &approve),
+        "gemini --approval-mode auto_edit"
+    );
+    assert_eq!(
+        CLIAgent::OpenCode.command_with_runtime_options(AgentReasoningEffort::Auto, &approve),
+        "OPENCODE_PERMISSION='{\"read\":\"allow\",\"glob\":\"allow\",\"grep\":\"allow\",\"list\":\"allow\",\"lsp\":\"allow\",\"bash\":\"ask\",\"edit\":\"ask\",\"webfetch\":\"ask\",\"websearch\":\"ask\",\"external_directory\":\"ask\"}' opencode"
+    );
+
+    let full = AgentRuntimeOptions {
+        model: None,
+        permission_mode: Some(AgentPermissionMode::FullAccess),
+    };
+    assert_eq!(
+        CLIAgent::Codex.command_with_runtime_options(AgentReasoningEffort::Auto, &full),
+        "codex --dangerously-bypass-approvals-and-sandbox"
+    );
+    assert_eq!(
+        CLIAgent::Claude.command_with_runtime_options(AgentReasoningEffort::Auto, &full),
+        "claude --allow-dangerously-skip-permissions --permission-mode bypassPermissions"
+    );
+    assert_eq!(
+        CLIAgent::Gemini.command_with_runtime_options(AgentReasoningEffort::Auto, &full),
+        "gemini --approval-mode yolo"
+    );
+    assert_eq!(
+        CLIAgent::OpenCode.command_with_runtime_options(AgentReasoningEffort::Auto, &full),
+        "OPENCODE_PERMISSION='\"allow\"' opencode"
+    );
+}
+
+#[test]
+fn resume_command_with_runtime_options_maps_supported_agents() {
+    let codex_options = AgentRuntimeOptions {
+        model: Some("gpt-5.4".to_owned()),
+        permission_mode: Some(AgentPermissionMode::FullAccess),
+    };
+    assert_eq!(
+        CLIAgent::Codex.resume_command_with_runtime_options(
+            "codex-session",
+            AgentReasoningEffort::ExtraHigh,
+            &codex_options,
+        ),
+        Some(
+            "codex resume --dangerously-bypass-approvals-and-sandbox -m gpt-5.4 -c model_reasoning_effort=xhigh codex-session"
+                .to_owned()
+        )
+    );
+
+    let claude_options = AgentRuntimeOptions {
+        model: Some("sonnet".to_owned()),
+        permission_mode: Some(AgentPermissionMode::ApproveForMe),
+    };
+    assert_eq!(
+        CLIAgent::Claude.resume_command_with_runtime_options(
+            "claude session",
+            AgentReasoningEffort::High,
+            &claude_options,
+        ),
+        Some(
+            "claude --allow-dangerously-skip-permissions --permission-mode acceptEdits --model sonnet --effort high --resume 'claude session'"
+                .to_owned()
+        )
+    );
+}
+
+#[test]
+fn resume_last_command_with_runtime_options_maps_codex() {
+    let options = AgentRuntimeOptions {
+        model: Some("gpt-5.4".to_owned()),
+        permission_mode: Some(AgentPermissionMode::ApproveForMe),
+    };
+
+    assert_eq!(
+        CLIAgent::Codex.resume_last_command_with_runtime_options(
+            AgentReasoningEffort::High,
+            &options,
+        ),
+        Some(
+            "codex resume --sandbox workspace-write --ask-for-approval on-request -m gpt-5.4 -c model_reasoning_effort=high --last"
+                .to_owned()
+        )
+    );
+    assert_eq!(
+        CLIAgent::Claude.resume_last_command_with_runtime_options(
+            AgentReasoningEffort::High,
+            &options,
+        ),
         None
     );
 }

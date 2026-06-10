@@ -5,7 +5,8 @@ use pathfinder_color::ColorU;
 use warpui::elements::{
     Border, ChildAnchor, ChildView, ConstrainedBox, Container, CornerRadius, Element, Fill,
     Icon as WarpUiIcon, MainAxisAlignment, MainAxisSize, MouseStateHandle, OffsetPositioning,
-    ParentElement, PositionedElementAnchor, PositionedElementOffsetBounds, SavePosition, Stack,
+    ParentElement, PositionedElementAnchor, PositionedElementOffsetBounds, Radius, SavePosition,
+    Stack,
 };
 use warpui::fonts::FamilyId;
 use warpui::geometry::vector::vec2f;
@@ -21,10 +22,13 @@ use warpui::{
 use crate::appearance::Appearance;
 use crate::menu::{Event as MenuEvent, Menu, MenuItem, MenuItemFields, MenuVariant};
 use crate::ui_components::icons::Icon as UiIcon;
+use warp_core::ui::theme::color::internal_colors;
 
 pub const TOP_MENU_BAR_HEIGHT: f32 = 30.;
 pub const TOP_MENU_BAR_MAX_WIDTH: f32 = 190.;
 pub const DROPDOWN_PADDING: f32 = 6.;
+const AGENT_INPUT_ICON_BUTTON_SIZE: f32 = 24.;
+const AGENT_INPUT_ICON_BUTTON_PADDING: f32 = 4.;
 
 pub type MenuHeaderTextFormatter = Box<dyn Fn(&str) -> String>;
 pub trait DropdownItemAction: Action {
@@ -71,6 +75,8 @@ pub enum DropdownStyle {
     /// background fill on hover instead of border color change.
     /// TODO this should probably replace the default `Secondary` theme
     ActionButtonSecondary,
+    /// Icon-only dropdown trigger matching AgentInputButton chrome.
+    AgentInputIconButton,
 }
 
 impl DropdownStyle {
@@ -85,6 +91,7 @@ impl DropdownStyle {
                 }),
                 ..Default::default()
             },
+            DropdownStyle::AgentInputIconButton => Default::default(),
             DropdownStyle::Naked => UiComponentStyles {
                 ..Default::default()
             },
@@ -583,6 +590,47 @@ where
         ctx.notify();
     }
 
+    fn agent_input_icon_button_styles(appearance: &Appearance, hovered: bool) -> UiComponentStyles {
+        let theme = appearance.theme();
+        let background = if hovered {
+            theme.surface_2()
+        } else {
+            theme.surface_1()
+        };
+
+        UiComponentStyles {
+            width: Some(AGENT_INPUT_ICON_BUTTON_SIZE),
+            height: Some(AGENT_INPUT_ICON_BUTTON_SIZE),
+            padding: Some(Coords::uniform(AGENT_INPUT_ICON_BUTTON_PADDING)),
+            border_width: Some(1.),
+            border_radius: Some(CornerRadius::with_all(Radius::Pixels(4.))),
+            background: Some(background.into()),
+            border_color: Some(internal_colors::neutral_3(theme).into()),
+            font_family_id: Some(appearance.ui_font_family()),
+            font_size: Some(appearance.ui_font_size()),
+            font_color: Some(theme.sub_text_color(background).into_solid()),
+            ..Default::default()
+        }
+    }
+
+    fn agent_input_icon_button_disabled_styles(appearance: &Appearance) -> UiComponentStyles {
+        let theme = appearance.theme();
+
+        UiComponentStyles {
+            width: Some(AGENT_INPUT_ICON_BUTTON_SIZE),
+            height: Some(AGENT_INPUT_ICON_BUTTON_SIZE),
+            padding: Some(Coords::uniform(AGENT_INPUT_ICON_BUTTON_PADDING)),
+            border_width: Some(1.),
+            border_radius: Some(CornerRadius::with_all(Radius::Pixels(4.))),
+            background: Some(internal_colors::neutral_4(theme).into()),
+            border_color: Some(internal_colors::neutral_3(theme).into()),
+            font_family_id: Some(appearance.ui_font_family()),
+            font_size: Some(appearance.ui_font_size()),
+            font_color: Some(internal_colors::neutral_5(theme)),
+            ..Default::default()
+        }
+    }
+
     fn render_top_bar(&self, appearance: &Appearance) -> Box<dyn Element> {
         let (selected_item_text, font_family_id) = match self.selected_item.clone() {
             Some(MenuItem::Item(fields)) => {
@@ -608,17 +656,35 @@ where
             .top_bar_icon
             .map(|icon| WarpUiIcon::new(icon.into(), icon_color))
             .unwrap_or_else(|| WarpUiIcon::new("bundled/svg/chevron-down.svg", icon_color));
-        let mut top_bar = appearance
-            .ui_builder()
-            .button(
+
+        let mut top_bar = match self.style {
+            DropdownStyle::AgentInputIconButton => {
+                appearance.ui_builder().button_with_custom_styles(
+                    ButtonVariant::Secondary,
+                    self.top_bar_mouse_state.clone(),
+                    Self::agent_input_icon_button_styles(appearance, false),
+                    Some(Self::agent_input_icon_button_styles(appearance, true)),
+                    Some(Self::agent_input_icon_button_styles(appearance, true)),
+                    Some(Self::agent_input_icon_button_disabled_styles(appearance)),
+                )
+            }
+            DropdownStyle::Secondary
+            | DropdownStyle::Naked
+            | DropdownStyle::ActionButtonSecondary => appearance.ui_builder().button(
                 match self.style {
                     DropdownStyle::Secondary => ButtonVariant::Outlined,
                     DropdownStyle::Naked => ButtonVariant::Text,
                     DropdownStyle::ActionButtonSecondary => ButtonVariant::Secondary,
+                    DropdownStyle::AgentInputIconButton => unreachable!(),
                 },
                 self.top_bar_mouse_state.clone(),
-            )
-            .with_text_and_icon_label(
+            ),
+        };
+
+        top_bar = if self.top_bar_icon_only {
+            top_bar.with_icon_label(icon)
+        } else {
+            top_bar.with_text_and_icon_label(
                 TextAndIcon::new(
                     TextAndIconAlignment::TextFirst,
                     selected_item_text,
@@ -632,14 +698,17 @@ where
                     vec2f(15., 15.),
                 )
                 .with_inner_padding(if self.top_bar_icon_only {
-                    6.
+                    0.
                 } else {
                     match self.style {
                         DropdownStyle::Secondary | DropdownStyle::ActionButtonSecondary => 10.,
-                        DropdownStyle::Naked => 6.,
+                        DropdownStyle::Naked | DropdownStyle::AgentInputIconButton => 6.,
                     }
                 }),
             )
+        };
+
+        top_bar = top_bar
             .with_style(self.style.ui_component_styles())
             .with_style(UiComponentStyles {
                 font_color: self.font_color,
@@ -650,8 +719,11 @@ where
                 border_width: self.border_width,
                 border_radius: self.border_radius,
                 ..Default::default()
-            })
-            .set_clicked_styles(None);
+            });
+
+        if !matches!(self.style, DropdownStyle::AgentInputIconButton) {
+            top_bar = top_bar.set_clicked_styles(None);
+        }
 
         if self.disabled {
             top_bar = top_bar.disabled();

@@ -11,6 +11,7 @@ fn ai_subpages_are_identified() {
     assert!(SettingsSection::AgentMCPServers.is_ai_subpage());
     assert!(SettingsSection::Knowledge.is_ai_subpage());
     assert!(SettingsSection::ThirdPartyCLIAgents.is_ai_subpage());
+    assert!(SettingsSection::AgentSessionIds.is_ai_subpage());
 
     assert!(!SettingsSection::AI.is_ai_subpage());
     assert!(!SettingsSection::Account.is_ai_subpage());
@@ -71,6 +72,10 @@ fn ai_subpages_map_to_ai_backing_page() {
     );
     assert_eq!(
         SettingsSection::ThirdPartyCLIAgents.parent_page_section(),
+        SettingsSection::AI
+    );
+    assert_eq!(
+        SettingsSection::AgentSessionIds.parent_page_section(),
         SettingsSection::AI
     );
 }
@@ -134,6 +139,7 @@ fn ai_subpages_list_contains_all_ai_subpage_variants() {
     assert!(subpages.contains(&SettingsSection::AgentMCPServers));
     assert!(subpages.contains(&SettingsSection::Knowledge));
     assert!(subpages.contains(&SettingsSection::ThirdPartyCLIAgents));
+    assert!(subpages.contains(&SettingsSection::AgentSessionIds));
 }
 
 #[test]
@@ -179,6 +185,7 @@ fn subpage_display_names_are_correct() {
         SettingsSection::ThirdPartyCLIAgents.to_string(),
         "Third party CLI agents"
     );
+    assert_eq!(SettingsSection::AgentSessionIds.to_string(), "Session IDs");
     assert_eq!(
         SettingsSection::CodeIndexing.to_string(),
         "Indexing and projects"
@@ -218,6 +225,10 @@ fn subpage_from_str_parses_display_names() {
     assert_eq!(
         SettingsSection::from_str("Knowledge"),
         Ok(SettingsSection::Knowledge)
+    );
+    assert_eq!(
+        SettingsSection::from_str("Session IDs"),
+        Ok(SettingsSection::AgentSessionIds)
     );
     assert_eq!(
         SettingsSection::from_str("Indexing and projects"),
@@ -266,6 +277,7 @@ fn search_knowledge_shows_only_knowledge_subpage() {
         SettingsSection::ThirdPartyCLIAgents,
         MatchData::Countable(0),
     );
+    filter.insert(SettingsSection::AgentSessionIds, MatchData::Countable(0));
 
     let visible = visible_subpages(&filter, SettingsSection::ai_subpages());
 
@@ -283,11 +295,13 @@ fn search_agent_shows_profiles_and_cli_agents() {
         SettingsSection::ThirdPartyCLIAgents,
         MatchData::Countable(1),
     );
+    filter.insert(SettingsSection::AgentSessionIds, MatchData::Countable(1));
 
     let visible = visible_subpages(&filter, SettingsSection::ai_subpages());
 
     assert!(visible.contains(&SettingsSection::AgentProfiles));
     assert!(visible.contains(&SettingsSection::ThirdPartyCLIAgents));
+    assert!(visible.contains(&SettingsSection::AgentSessionIds));
     assert!(!visible.contains(&SettingsSection::WarpAgent));
     assert!(!visible.contains(&SettingsSection::Knowledge));
 }
@@ -316,6 +330,7 @@ fn search_with_no_matches_hides_all_subpages() {
         SettingsSection::ThirdPartyCLIAgents,
         MatchData::Countable(0),
     );
+    filter.insert(SettingsSection::AgentSessionIds, MatchData::Countable(0));
 
     let visible = visible_subpages(&filter, SettingsSection::ai_subpages());
 

@@ -37,6 +37,12 @@ fn add_ai_enablement_dependencies_for_test(app: &mut App) {
     app.add_singleton_model(UserWorkspaces::default_mock);
 }
 
+fn enable_cli_agent_api_takeover_for_test(app: &mut App) {
+    AISettings::handle(app).update(app, |settings, ctx| {
+        report_if_error!(settings.cli_agent_api_takeover_enabled.set_value(true, ctx));
+    });
+}
+
 // FocusedTerminalInfo Tests
 
 #[test]
@@ -698,9 +704,42 @@ fn test_cli_agent_api_usage_summary_reads_token_usage() {
 }
 
 #[test]
+fn test_cli_agent_api_environment_vars_empty_when_takeover_disabled() {
+    App::test((), |mut app| async move {
+        initialize_settings_for_tests(&mut app);
+
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings.add_cli_agent_api_profile(
+                CLIAgentApiProfile::new(
+                    CLIAgent::Claude,
+                    CLI_AGENT_API_LOCAL_ENVIRONMENT_ID.to_owned(),
+                    "Claude relay".to_owned(),
+                    "https://claude.example.com/".to_owned(),
+                    "claude-key".to_owned(),
+                    "claude-sonnet".to_owned(),
+                ),
+                true,
+                ctx,
+            );
+        });
+
+        AISettings::handle(&app).read(&app, |settings, _ctx| {
+            assert!(!settings.is_cli_agent_api_takeover_enabled());
+            assert!(settings
+                .cli_agent_api_environment_vars(
+                    CLIAgent::Claude,
+                    CLI_AGENT_API_LOCAL_ENVIRONMENT_ID
+                )
+                .is_empty());
+        });
+    });
+}
+
+#[test]
 fn test_cli_agent_api_environment_vars_use_agent_native_names() {
     App::test((), |mut app| async move {
         initialize_settings_for_tests(&mut app);
+        enable_cli_agent_api_takeover_for_test(&mut app);
 
         AISettings::handle(&app).update(&mut app, |settings, ctx| {
             settings.add_cli_agent_api_profile(
@@ -789,6 +828,7 @@ fn test_cli_agent_api_environment_vars_use_agent_native_names() {
 fn test_cli_agent_api_environment_vars_include_claude_model_mappings() {
     App::test((), |mut app| async move {
         initialize_settings_for_tests(&mut app);
+        enable_cli_agent_api_takeover_for_test(&mut app);
 
         let mut profile = CLIAgentApiProfile::new(
             CLIAgent::Claude,
@@ -863,6 +903,7 @@ fn test_cli_agent_api_environment_vars_include_claude_model_mappings() {
 fn test_cli_agent_api_environment_vars_include_failover_chain() {
     App::test((), |mut app| async move {
         initialize_settings_for_tests(&mut app);
+        enable_cli_agent_api_takeover_for_test(&mut app);
 
         let mut primary = CLIAgentApiProfile::new(
             CLIAgent::Codex,

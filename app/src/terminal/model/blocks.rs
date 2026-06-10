@@ -2903,6 +2903,13 @@ impl BlockList {
         bootstrap_stage: BootstrapStage,
         processor: &mut Processor,
     ) {
+        let restored_session_id = match bootstrap_stage {
+            // Session IDs are process-local. Persisted command blocks come from a previous
+            // process, so keeping their old IDs makes the restored pane point at sessions
+            // that cannot exist in this launch.
+            BootstrapStage::RestoreBlocks => None,
+            _ => block.session_id.map(|id| id.as_u64()),
+        };
         let precmd_value = PrecmdValue {
             pwd: block.pwd.clone(),
             git_head: block.git_head.clone(),
@@ -2910,7 +2917,7 @@ impl BlockList {
             virtual_env: block.virtual_env.clone(),
             conda_env: block.conda_env.clone(),
             node_version: block.node_version.clone(),
-            session_id: block.session_id.map(|id| id.as_u64()),
+            session_id: restored_session_id,
             ps1: block.ps1.clone(),
             honor_ps1: Some(block.honor_ps1),
             kube_config: None,

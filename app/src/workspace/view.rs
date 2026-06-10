@@ -324,12 +324,13 @@ use crate::server::telemetry::{
 use crate::session_management::{SessionNavigationData, SessionSource, TabNavigationData};
 use crate::settings::cloud_preferences::CloudPreferencesSettings;
 use crate::settings::{
-    active_theme_kind, cli_agent_api_usage_log_path, respect_system_theme, AISettings,
-    AISettingsChangedEvent, AccessibilitySettings, AliasExpansionSettings, AppEditorSettings,
-    BlockVisibilitySettings, ChangelogSettings, CodeSettings, CodeSettingsChangedEvent,
-    CtrlTabBehavior, CursorBlink, DebugSettings, DefaultSessionMode, FontSettings, GPUSettings,
-    InputModeSettings, InputSettings, MonospaceFontSize, PaneSettings, PrivacySettings,
-    SelectionSettings, Settings, SshSettings, ThemeSettings,
+    active_theme_kind, cli_agent_api_usage_log_path, respect_system_theme,
+    write_cli_agent_api_live_profiles_file, AISettings, AISettingsChangedEvent,
+    AccessibilitySettings, AliasExpansionSettings, AppEditorSettings, BlockVisibilitySettings,
+    ChangelogSettings, CodeSettings, CodeSettingsChangedEvent, CtrlTabBehavior, CursorBlink,
+    DebugSettings, DefaultSessionMode, FontSettings, GPUSettings, InputModeSettings, InputSettings,
+    MonospaceFontSize, PaneSettings, PrivacySettings, SelectionSettings, Settings, SshSettings,
+    ThemeSettings,
 };
 use crate::settings_view::environments_page::EnvironmentsPage;
 use crate::settings_view::handoff_environment_creation_modal::{
@@ -364,6 +365,7 @@ use crate::terminal::available_shells::AvailableShell;
 #[cfg(target_os = "windows")]
 use crate::terminal::available_shells::AvailableShells;
 use crate::terminal::block_list_viewport::InputMode;
+use crate::terminal::cli_agent::{AgentReasoningEffortModel, AgentRuntimeSettingsModel};
 #[cfg(not(target_family = "wasm"))]
 use crate::terminal::cli_agent_sessions::plugin_manager::{plugin_manager_for, PluginModalKind};
 use crate::terminal::cli_agent_sessions::{
@@ -1147,12 +1149,103 @@ pub struct Workspace {
     create_auth_secret_modal: Option<ViewHandle<Modal<AuthSecretFtuxView>>>,
 }
 
+#[cfg(test)]
 fn agent_session_base_command(record: &AgentSessionRecord) -> String {
     record
         .agent_session_id
         .as_deref()
         .and_then(|session_id| record.agent.resume_command(session_id))
         .unwrap_or_else(|| record.agent.command_prefix().to_owned())
+}
+
+fn agent_session_runtime_command<V: View>(
+    record: &AgentSessionRecord,
+    ctx: &mut ViewContext<V>,
+) -> String {
+    let reasoning_effort = AgentReasoningEffortModel::as_ref(ctx).effort();
+    let cli_options = AgentRuntimeSettingsModel::as_ref(ctx).launch_options_for(record.agent);
+    agent_session_runtime_command_with_options(record, reasoning_effort, &cli_options)
+}
+
+fn agent_session_runtime_command_with_options(
+    record: &AgentSessionRecord,
+    reasoning_effort: crate::terminal::cli_agent::AgentReasoningEffort,
+    cli_options: &crate::terminal::cli_agent::AgentRuntimeOptions,
+) -> String {
+    cli_agent_runtime_command_with_options(
+        record.agent,
+        record.agent_session_id.as_deref(),
+        reasoning_effort,
+        cli_options,
+    )
+}
+
+fn cli_agent_runtime_command_with_options(
+    agent: CLIAgent,
+    agent_session_id: Option<&str>,
+    reasoning_effort: crate::terminal::cli_agent::AgentReasoningEffort,
+    cli_options: &crate::terminal::cli_agent::AgentRuntimeOptions,
+) -> String {
+    agent_session_id
+        .and_then(|session_id| {
+            agent.resume_command_with_runtime_options(session_id, reasoning_effort, cli_options)
+        })
+        .unwrap_or_else(|| agent.command_with_runtime_options(reasoning_effort, cli_options))
+}
+
+fn agent_session_restart_runtime_command_with_options(
+    record: &AgentSessionRecord,
+    reasoning_effort: crate::terminal::cli_agent::AgentReasoningEffort,
+    cli_options: &crate::terminal::cli_agent::AgentRuntimeOptions,
+) -> Option<String> {
+    cli_agent_restart_runtime_command_with_options(
+        record.agent,
+        record.agent_session_id.as_deref(),
+        reasoning_effort,
+        cli_options,
+    )
+}
+
+fn agent_session_restart_runtime_command<V: View>(
+    record: &AgentSessionRecord,
+    ctx: &mut ViewContext<V>,
+) -> Option<String> {
+    let reasoning_effort = AgentReasoningEffortModel::as_ref(ctx).effort();
+    let cli_options = AgentRuntimeSettingsModel::as_ref(ctx).launch_options_for(record.agent);
+    agent_session_restart_runtime_command_with_options(record, reasoning_effort, &cli_options)
+}
+
+fn cli_agent_restart_runtime_command_with_options(
+    agent: CLIAgent,
+    agent_session_id: Option<&str>,
+    reasoning_effort: crate::terminal::cli_agent::AgentReasoningEffort,
+    cli_options: &crate::terminal::cli_agent::AgentRuntimeOptions,
+) -> Option<String> {
+    if agent.supports_resume() {
+        return agent_session_id
+            .and_then(|session_id| {
+                agent.resume_command_with_runtime_options(session_id, reasoning_effort, cli_options)
+            })
+            .or_else(|| agent.resume_last_command_with_runtime_options(reasoning_effort, cli_options));
+    }
+
+    let command = agent.command_with_runtime_options(reasoning_effort, cli_options);
+    (!command.trim().is_empty()).then_some(command)
+}
+
+fn cli_agent_restart_runtime_command<V: View>(
+    agent: CLIAgent,
+    agent_session_id: Option<&str>,
+    ctx: &mut ViewContext<V>,
+) -> Option<String> {
+    let reasoning_effort = AgentReasoningEffortModel::as_ref(ctx).effort();
+    let cli_options = AgentRuntimeSettingsModel::as_ref(ctx).launch_options_for(agent);
+    cli_agent_restart_runtime_command_with_options(
+        agent,
+        agent_session_id,
+        reasoning_effort,
+        &cli_options,
+    )
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -1167,8 +1260,11 @@ fn embedded_agent_api_proxy_executable() -> Option<PathBuf> {
     helper.exists().then_some(helper)
 }
 
-fn agent_session_restore_command(record: &AgentSessionRecord) -> String {
-    agent_session_base_command(record)
+fn agent_session_restore_command<V: View>(
+    record: &AgentSessionRecord,
+    ctx: &mut ViewContext<V>,
+) -> String {
+    agent_session_runtime_command(record, ctx)
 }
 
 fn agent_session_group_title(parent: &AgentSessionRecord) -> String {
@@ -1250,8 +1346,16 @@ mod agent_session_hosted_transcript_tests {
     #[test]
     fn agent_session_restore_command_does_not_shell_inject_hosted_transcript() {
         let record = record_with_hosted_transcript(Some("User:\nhello"));
+        let options = crate::terminal::cli_agent::AgentRuntimeOptions {
+            model: None,
+            permission_mode: None,
+        };
 
-        let command = agent_session_restore_command(&record);
+        let command = agent_session_runtime_command_with_options(
+            &record,
+            crate::terminal::cli_agent::AgentReasoningEffort::Auto,
+            &options,
+        );
 
         assert_eq!(command, "codex resume agent-session");
         assert!(!command.contains("printf"));
@@ -1262,10 +1366,93 @@ mod agent_session_hosted_transcript_tests {
     #[test]
     fn agent_session_restore_command_uses_base_command_without_hosted_transcript() {
         let record = record_with_hosted_transcript(None);
+        let options = crate::terminal::cli_agent::AgentRuntimeOptions {
+            model: None,
+            permission_mode: None,
+        };
 
         assert_eq!(
-            agent_session_restore_command(&record),
+            agent_session_runtime_command_with_options(
+                &record,
+                crate::terminal::cli_agent::AgentReasoningEffort::Auto,
+                &options,
+            ),
             "codex resume agent-session"
+        );
+    }
+
+    #[test]
+    fn agent_session_restore_command_applies_runtime_options() {
+        let record = record_with_hosted_transcript(None);
+        let options = crate::terminal::cli_agent::AgentRuntimeOptions {
+            model: Some("gpt-5.4".to_owned()),
+            permission_mode: Some(crate::terminal::cli_agent::AgentPermissionMode::FullAccess),
+        };
+
+        assert_eq!(
+            agent_session_runtime_command_with_options(
+                &record,
+                crate::terminal::cli_agent::AgentReasoningEffort::High,
+                &options,
+            ),
+            "codex resume --dangerously-bypass-approvals-and-sandbox -m gpt-5.4 -c model_reasoning_effort=high agent-session"
+        );
+    }
+
+    #[test]
+    fn cli_agent_runtime_command_applies_runtime_options_without_record() {
+        let options = crate::terminal::cli_agent::AgentRuntimeOptions {
+            model: Some("gpt-5.4".to_owned()),
+            permission_mode: Some(crate::terminal::cli_agent::AgentPermissionMode::FullAccess),
+        };
+
+        assert_eq!(
+            cli_agent_runtime_command_with_options(
+                CLIAgent::Codex,
+                Some("agent-session"),
+                crate::terminal::cli_agent::AgentReasoningEffort::High,
+                &options,
+            ),
+            "codex resume --dangerously-bypass-approvals-and-sandbox -m gpt-5.4 -c model_reasoning_effort=high agent-session"
+        );
+    }
+
+    #[test]
+    fn cli_agent_restart_runtime_command_applies_runtime_options_with_session_id() {
+        let options = crate::terminal::cli_agent::AgentRuntimeOptions {
+            model: Some("gpt-5.4".to_owned()),
+            permission_mode: Some(crate::terminal::cli_agent::AgentPermissionMode::FullAccess),
+        };
+
+        assert_eq!(
+            cli_agent_restart_runtime_command_with_options(
+                CLIAgent::Codex,
+                Some("agent-session"),
+                crate::terminal::cli_agent::AgentReasoningEffort::High,
+                &options,
+            ),
+            Some(
+                "codex resume --dangerously-bypass-approvals-and-sandbox -m gpt-5.4 -c model_reasoning_effort=high agent-session"
+                    .to_owned(),
+            )
+        );
+    }
+
+    #[test]
+    fn cli_agent_restart_runtime_command_uses_codex_last_without_session_id() {
+        let options = crate::terminal::cli_agent::AgentRuntimeOptions {
+            model: None,
+            permission_mode: Some(crate::terminal::cli_agent::AgentPermissionMode::FullAccess),
+        };
+
+        assert_eq!(
+            cli_agent_restart_runtime_command_with_options(
+                CLIAgent::Codex,
+                None,
+                crate::terminal::cli_agent::AgentReasoningEffort::Auto,
+                &options,
+            ),
+            Some("codex resume --dangerously-bypass-approvals-and-sandbox --last".to_owned())
         );
     }
 
@@ -12978,6 +13165,47 @@ impl Workspace {
         );
     }
 
+    fn add_local_cli_agent_api_live_profiles_file_env_var<V: View>(
+        record: &AgentSessionRecord,
+        env_vars: &mut HashMap<OsString, OsString>,
+        ctx: &mut ViewContext<V>,
+    ) {
+        let settings = AISettings::as_ref(ctx);
+        if !settings.is_cli_agent_api_takeover_enabled() {
+            return;
+        }
+
+        let mut profiles =
+            settings.cli_agent_api_fallback_profiles(record.agent, &record.environment_id);
+        if profiles.is_empty() {
+            return;
+        }
+
+        if let Some(model) = AgentRuntimeSettingsModel::as_ref(ctx)
+            .launch_options_for(record.agent)
+            .model
+            .filter(|model| !model.trim().is_empty())
+        {
+            profiles[0].model = model;
+        }
+
+        match write_cli_agent_api_live_profiles_file(
+            record.agent,
+            &record.environment_id,
+            &profiles,
+        ) {
+            Ok(path) => {
+                env_vars.insert(
+                    OsString::from("AGENTWARP_AGENT_API_FALLBACKS_FILE"),
+                    path.into_os_string(),
+                );
+            }
+            Err(error) => {
+                log::warn!("Failed to write Agent API live profiles file: {error}");
+            }
+        }
+    }
+
     fn should_forward_ssh_remote_agent_api_env_var(key: &str) -> bool {
         if key.starts_with("AGENTWARP_SSH_") || key.is_empty() {
             return false;
@@ -13047,20 +13275,38 @@ impl Workspace {
         launch_command: &str,
         ctx: &mut ViewContext<V>,
     ) -> String {
-        if record.environment_id != SSH_REMOTE_LOCAL_ENVIRONMENT_ID {
+        Self::maybe_wrap_agent_api_proxy_command_for_agent(
+            record.agent,
+            &record.environment_id,
+            launch_command,
+            ctx,
+        )
+    }
+
+    fn maybe_wrap_agent_api_proxy_command_for_agent<V: View>(
+        agent: CLIAgent,
+        environment_id: &str,
+        launch_command: &str,
+        ctx: &mut ViewContext<V>,
+    ) -> String {
+        if !AISettings::as_ref(ctx).is_cli_agent_api_takeover_enabled() {
+            return launch_command.to_owned();
+        }
+
+        if environment_id != SSH_REMOTE_LOCAL_ENVIRONMENT_ID {
             let fallback_profile_count = AISettings::as_ref(ctx)
-                .cli_agent_api_fallback_profiles(record.agent, &record.environment_id)
+                .cli_agent_api_fallback_profiles(agent, environment_id)
                 .len();
-            if fallback_profile_count < 2 {
+            if fallback_profile_count == 0 {
                 return launch_command.to_owned();
             }
             return format!("agentwarp-agent-api-proxy -- {launch_command}");
         }
 
         let fallback_profile_count = AISettings::as_ref(ctx)
-            .cli_agent_api_fallback_profiles(record.agent, &record.environment_id)
+            .cli_agent_api_fallback_profiles(agent, environment_id)
             .len();
-        if fallback_profile_count < 2 {
+        if fallback_profile_count == 0 {
             return launch_command.to_owned();
         }
 
@@ -13099,6 +13345,7 @@ impl Workspace {
         } else {
             let mut env_vars = Self::cli_agent_api_env_vars_for_record(record, ctx);
             Self::add_local_cli_agent_api_usage_log_env_var(&mut env_vars);
+            Self::add_local_cli_agent_api_live_profiles_file_env_var(record, &mut env_vars, ctx);
             Ok((
                 NewTerminalOptions {
                     initial_directory: Some(record.project_path.clone()),
@@ -13108,6 +13355,55 @@ impl Workspace {
                 },
                 None,
             ))
+        }
+    }
+
+    fn terminal_options_for_cli_agent_restart<V: View>(
+        cli_session: &CLIAgentSession,
+        environment_id: &str,
+        fallback_directory: Option<PathBuf>,
+        ctx: &mut ViewContext<V>,
+    ) -> Result<NewTerminalOptions, String> {
+        if let Some(host) = Self::ssh_remote_host_for_environment_id(environment_id, ctx) {
+            let remote_cwd = cli_session.session_context.cwd.as_deref().map(Path::new);
+            let (shell, mut env_vars) = ssh_remote_terminal_launch(&host, remote_cwd)?;
+            Self::add_cli_agent_api_env_vars_for_ssh_remote_shell(&host, &mut env_vars, ctx);
+            return Ok(NewTerminalOptions {
+                shell: Some(shell),
+                initial_directory: None,
+                env_vars,
+                hide_homepage: true,
+                ssh_remote_host_id: Some(host.id.clone()),
+                ..Default::default()
+            });
+        }
+
+        let initial_directory = cli_session
+            .session_context
+            .cwd
+            .as_deref()
+            .map(PathBuf::from)
+            .filter(|path| path.is_dir())
+            .or(fallback_directory);
+        let mut env_vars = Self::cli_agent_api_shell_env_vars_for_environment(environment_id, ctx);
+        Self::add_local_cli_agent_api_usage_log_env_var(&mut env_vars);
+
+        Ok(NewTerminalOptions {
+            initial_directory,
+            env_vars,
+            hide_homepage: true,
+            ..Default::default()
+        })
+    }
+
+    fn restarted_cli_agent_session(cli_session: &CLIAgentSession) -> CLIAgentSession {
+        CLIAgentSession {
+            status: CLIAgentSessionStatus::InProgress,
+            input_state: CLIAgentInputState::Closed,
+            listener: None,
+            plugin_version: None,
+            received_rich_notification: false,
+            ..cli_session.clone()
         }
     }
 
@@ -13233,7 +13529,7 @@ impl Workspace {
         ctx: &mut ViewContext<PaneGroup>,
     ) {
         let terminal_view_id = terminal_view.id();
-        let launch_command = agent_session_restore_command(record);
+        let launch_command = agent_session_restore_command(record, ctx);
         let launch_command = Self::maybe_wrap_agent_api_proxy_command(record, &launch_command, ctx);
         Self::seed_cli_agent_session_for_record(terminal_view_id, record, ctx);
         AgentSessionsModel::handle(ctx).update(ctx, |model, ctx| {
@@ -13581,7 +13877,7 @@ impl Workspace {
             }
         }
 
-        let launch_command = agent_session_restore_command(&record);
+        let launch_command = agent_session_restore_command(&record, ctx);
         self.start_agent_session(
             record.project_path,
             record.agent,
@@ -13603,7 +13899,7 @@ impl Workspace {
 
         self.capture_agent_session_transcript(terminal_view_id, ctx);
 
-        let launch_command = agent_session_restore_command(record);
+        let launch_command = agent_session_restore_command(record, ctx);
         let Some(terminal_view) =
             ctx.view_with_id::<TerminalView>(ctx.window_id(), terminal_view_id)
         else {
@@ -13625,6 +13921,218 @@ impl Workspace {
             );
         });
         true
+    }
+
+    fn show_cli_agent_restart_error_toast(&self, message: &str, ctx: &mut ViewContext<Self>) {
+        self.toast_stack.update(ctx, |toast_stack, ctx| {
+            toast_stack.add_ephemeral_toast(DismissibleToast::error(message.to_owned()), ctx);
+        });
+    }
+
+    fn restart_agent_session_for_terminal_view(
+        &mut self,
+        terminal_view_id: EntityId,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        self.capture_agent_session_transcript(terminal_view_id, ctx);
+        let cli_session = CLIAgentSessionsModel::as_ref(ctx)
+            .session(terminal_view_id)
+            .cloned();
+        let fallback_directory = self.terminal_view(terminal_view_id, ctx).and_then(
+            |terminal_view| {
+                let terminal_view = terminal_view.as_ref(ctx);
+                terminal_view
+                    .active_session_path_if_local(ctx)
+                    .or_else(|| terminal_view.pwd_if_local(ctx).map(PathBuf::from))
+                    .or_else(|| {
+                        terminal_view
+                            .pwd()
+                            .map(PathBuf::from)
+                            .filter(|path| path.is_dir())
+                    })
+            },
+        );
+
+        AgentSessionsModel::handle(ctx).update(ctx, |model, ctx| {
+            model.sync_agent_session_id_for_terminal(
+                terminal_view_id,
+                cli_session
+                    .as_ref()
+                    .map(|session| &session.session_context),
+                ctx,
+            );
+        });
+
+        let record = AgentSessionsModel::as_ref(ctx)
+            .records()
+            .iter()
+            .find(|record| {
+                record.terminal_view_id == Some(terminal_view_id)
+                    || record.group_terminal_view_id == Some(terminal_view_id)
+            })
+            .cloned();
+
+        let (terminal_options, launch_command, replacement_cli_session) = if let Some(record) =
+            record.as_ref()
+        {
+            let (terminal_options, _custom_tab_title) =
+                match Self::terminal_options_for_agent_session(record, ctx) {
+                    Ok(options) => options,
+                    Err(error) => {
+                        log::error!("Failed to prepare CLI agent restart terminal: {error}");
+                        return;
+                    }
+                };
+            let Some(launch_command) = agent_session_restart_runtime_command(record, ctx) else {
+                self.show_cli_agent_restart_error_toast(
+                    "Cannot restart this agent without a resumable session id.",
+                    ctx,
+                );
+                log::warn!(
+                    "Refusing to restart CLI agent session for terminal view {terminal_view_id:?}: missing resumable session id"
+                );
+                return;
+            };
+            (
+                terminal_options,
+                Self::maybe_wrap_agent_api_proxy_command(record, &launch_command, ctx),
+                None,
+            )
+        } else {
+            let Some(cli_session) = cli_session else {
+                log::warn!(
+                    "Requested CLI agent session restart for untracked terminal view {terminal_view_id:?}"
+                );
+                return;
+            };
+            let environment_id = SshRemoteModel::as_ref(ctx)
+                .terminal_environment_id(terminal_view_id)
+                .unwrap_or_else(|| SSH_REMOTE_LOCAL_ENVIRONMENT_ID.to_owned());
+            let terminal_options = match Self::terminal_options_for_cli_agent_restart(
+                &cli_session,
+                &environment_id,
+                fallback_directory.clone(),
+                ctx,
+            ) {
+                Ok(options) => options,
+                Err(error) => {
+                    log::error!("Failed to prepare CLI agent restart terminal: {error}");
+                    return;
+                }
+            };
+            let resolved_agent_session_id = cli_session
+                .session_context
+                .session_id
+                .clone()
+                .or_else(|| {
+                    cli_session
+                        .session_context
+                        .cwd
+                        .as_deref()
+                        .map(Path::new)
+                        .and_then(|project_path| {
+                            AgentSessionsModel::latest_agent_session_id_for_project(
+                                cli_session.agent,
+                                project_path,
+                            )
+                        })
+                })
+                .or_else(|| {
+                    fallback_directory.as_deref().and_then(|project_path| {
+                        AgentSessionsModel::latest_agent_session_id_for_project(
+                            cli_session.agent,
+                            project_path,
+                        )
+                    })
+                });
+            let Some(launch_command) = cli_agent_restart_runtime_command(
+                cli_session.agent,
+                resolved_agent_session_id.as_deref(),
+                ctx,
+            ) else {
+                self.show_cli_agent_restart_error_toast(
+                    "Cannot restart this agent without a resumable session id.",
+                    ctx,
+                );
+                log::warn!(
+                    "Refusing to restart CLI agent session for terminal view {terminal_view_id:?}: missing resumable session id"
+                );
+                return;
+            };
+            let mut replacement_cli_session = Self::restarted_cli_agent_session(&cli_session);
+            replacement_cli_session.session_context.session_id =
+                resolved_agent_session_id.or(replacement_cli_session.session_context.session_id);
+            (
+                terminal_options,
+                Self::maybe_wrap_agent_api_proxy_command_for_agent(
+                    cli_session.agent,
+                    &environment_id,
+                    &launch_command,
+                    ctx,
+                ),
+                Some(replacement_cli_session),
+            )
+        };
+
+        let Some(pane_group) = self.tabs.iter().find_map(|tab| {
+            tab.pane_group
+                .as_ref(ctx)
+                .find_pane_id_for_terminal_view(terminal_view_id, ctx)
+                .map(|_| tab.pane_group.clone())
+        }) else {
+            log::warn!(
+                "Requested CLI agent session restart for terminal view {terminal_view_id:?}, but no pane group owns it"
+            );
+            return;
+        };
+
+        let Some(replacement_terminal_view) = pane_group.update(ctx, |pane_group, ctx| {
+            pane_group.replace_terminal_session_with_options(
+                terminal_view_id,
+                terminal_options,
+                ctx,
+            )
+        }) else {
+            log::warn!(
+                "Failed to replace terminal view {terminal_view_id:?} for CLI agent restart"
+            );
+            return;
+        };
+        let replacement_terminal_view_id = replacement_terminal_view.id();
+
+        Self::copy_model_and_profile_to_terminal_view(
+            terminal_view_id,
+            replacement_terminal_view_id,
+            ctx,
+        );
+
+        if let Some(record) = record.as_ref() {
+            AgentSessionsModel::handle(ctx).update(ctx, |model, ctx| {
+                if record.group_terminal_view_id == Some(terminal_view_id) {
+                    model.attach_group_terminal(&record.id, replacement_terminal_view_id, ctx);
+                }
+                if record.terminal_view_id == Some(terminal_view_id) {
+                    model.attach_terminal(&record.id, replacement_terminal_view_id, ctx);
+                }
+            });
+            Self::seed_cli_agent_session_for_record(replacement_terminal_view_id, record, ctx);
+        } else if let Some(cli_session) = replacement_cli_session {
+            CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions_model, ctx| {
+                sessions_model.set_session(replacement_terminal_view_id, cli_session, ctx);
+            });
+        }
+
+        replacement_terminal_view.update(ctx, |terminal, ctx| {
+            terminal.execute_command_or_set_pending(&launch_command, ctx);
+            terminal.apply_cli_agent_footer_visibility(true, ctx);
+            ctx.spawn(
+                Timer::after(Duration::from_millis(1_200)),
+                |terminal, _, ctx| {
+                    terminal.apply_cli_agent_footer_visibility(true, ctx);
+                },
+            );
+        });
+        ctx.notify();
     }
 
     /// Navigate to an existing AI conversation, focusing on its terminal view, if it's open anywhere.
@@ -16529,6 +17037,9 @@ impl Workspace {
                     model.unregister_terminal_host(*terminal_view_id, ctx);
                 });
                 ctx.notify();
+            }
+            pane_group::Event::RestartCliAgentSession { terminal_view_id } => {
+                self.restart_agent_session_for_terminal_view(*terminal_view_id, ctx);
             }
             pane_group::Event::OnboardingTutorialCompleted => {
                 self.pending_session_config_tab_config_chip = false;
@@ -25399,10 +25910,12 @@ impl TypedActionView for Workspace {
                 agent,
                 reasoning_effort,
             } => {
+                let runtime_options =
+                    AgentRuntimeSettingsModel::as_ref(ctx).launch_options_for(*agent);
                 let launch_command = AISettings::as_ref(ctx)
                     .apply_cli_agent_builtin_prompt_to_launch_command(
                         *agent,
-                        agent.command_with_reasoning_effort(*reasoning_effort),
+                        agent.command_with_runtime_options(*reasoning_effort, &runtime_options),
                     );
                 self.start_agent_session(
                     project_path.clone(),

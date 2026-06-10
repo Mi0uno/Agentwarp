@@ -397,7 +397,12 @@ impl BlockFilterEditor {
         ctx: &mut ViewContext<Self>,
     ) {
         match event {
-            EditorEvent::Edited(_) => self.update_query(ctx),
+            EditorEvent::Edited(edit_origin) => {
+                if matches!(edit_origin, EditOrigin::SystemEdit) {
+                    return;
+                }
+                self.update_query(ctx)
+            }
             EditorEvent::Navigate(NavigationKey::Up) => self.increase_context_line_count(ctx),
             EditorEvent::Navigate(NavigationKey::Down) => self.decrease_context_line_count(ctx),
             EditorEvent::Navigate(NavigationKey::Tab) => self.focus_other_editor(ctx),

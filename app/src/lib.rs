@@ -291,7 +291,7 @@ use crate::settings_view::keybindings::KeybindingChangedNotifier;
 use crate::settings_view::DisplayCount;
 use crate::suggestions::ignored_suggestions_model::IgnoredSuggestionsModel;
 use crate::system::SystemStats;
-use crate::terminal::cli_agent::AgentReasoningEffortModel;
+use crate::terminal::cli_agent::{AgentReasoningEffortModel, AgentRuntimeSettingsModel};
 use crate::terminal::cli_agent_sessions::CLIAgentSessionsModel;
 use crate::terminal::keys::TerminalKeybindings;
 use crate::terminal::resizable_data::ResizableData;
@@ -578,6 +578,45 @@ fn apply_scroll_multiplier(event: &mut Event, app: &AppContext) {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn configure_linux_vmware_rendering_backend_for_gui() {
+    const LAVAPIPE_ICD_PATH: &str = "/usr/share/vulkan/icd.d/lvp_icd.json";
+
+    if std::env::var_os("AGENTWARP_DISABLE_VMWARE_RENDERING_FALLBACK").is_some()
+        || !is_linux_vmware_guest()
+        || !std::path::Path::new(LAVAPIPE_ICD_PATH).is_file()
+    {
+        return;
+    }
+
+    // VMware SVGA's OpenGL path can render glyphs as blank rectangles. Prefer
+    // Lavapipe Vulkan for a readable UI when the user has not chosen a backend.
+    if std::env::var_os("WGPU_BACKEND").is_none() {
+        std::env::set_var("WGPU_BACKEND", "vulkan");
+    }
+    if std::env::var_os("VK_ICD_FILENAMES").is_none() {
+        std::env::set_var("VK_ICD_FILENAMES", LAVAPIPE_ICD_PATH);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn is_linux_vmware_guest() -> bool {
+    [
+        "/sys/class/dmi/id/product_name",
+        "/sys/class/dmi/id/sys_vendor",
+        "/sys/class/dmi/id/board_vendor",
+    ]
+    .into_iter()
+    .any(|path| {
+        std::fs::read_to_string(path)
+            .map(|value| value.to_ascii_lowercase().contains("vmware"))
+            .unwrap_or(false)
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn configure_linux_vmware_rendering_backend_for_gui() {}
+
 /// Runs the app. If a subcommand was requested, it'll be run instead of the main application.
 pub fn run() -> Result<()> {
     // Perform any necessary platform-specific initialization.
@@ -739,6 +778,7 @@ pub fn run() -> Result<()> {
     }
 
     let api_key = args.api_key().cloned();
+    configure_linux_vmware_rendering_backend_for_gui();
     run_internal(LaunchMode::App {
         args: args.into_app_args(),
         api_key,
@@ -1773,6 +1813,7 @@ pub(crate) fn initialize_app(
     });
     ctx.add_singleton_model(move |_| RestoredAgentConversations::new(multi_agent_conversations));
     ctx.add_singleton_model(AgentReasoningEffortModel::new);
+    ctx.add_singleton_model(AgentRuntimeSettingsModel::new);
     ctx.add_singleton_model(|_| CLIAgentSessionsModel::new());
     ctx.add_singleton_model(AgentSessionsModel::new);
     // ActiveAgentViewsModel is used to track active agent conversations and notify listeners when they change.

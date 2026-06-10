@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use ai::document::{AIDocumentId, AIDocumentVersion};
 use parking_lot::FairMutex;
 use pathfinder_color::ColorU;
-use pathfinder_geometry::vector::{vec2f, Vector2F};
+use pathfinder_geometry::vector::{Vector2F, vec2f};
 use settings::{Setting, ToggleableSetting};
 #[cfg(not(target_family = "wasm"))]
 use tokio::fs;
@@ -23,23 +23,24 @@ use voice_input::{StartListeningError, VoiceSessionResult};
 use warp_cli::agent::Harness;
 use warp_core::context_flag::ContextFlag;
 use warp_core::report_if_error;
+use warp_core::ui::color::ContrastingColor;
 use warp_core::ui::color::blend::Blend;
 use warp_core::ui::color::contrast::MinimumAllowedContrast;
-use warp_core::ui::color::ContrastingColor;
 use warp_core::ui::theme::color::internal_colors;
 use warp_core::ui::theme::{AnsiColorIdentifier, Fill};
-use warpui::elements::{
-    Border, ChildAnchor, ChildView, Clipped, ConstrainedBox, Container, CornerRadius,
-    CrossAxisAlignment, DispatchEventResult, Element, Empty, EventHandler, Expanded, Flex,
-    MainAxisAlignment, MainAxisSize, OffsetPositioning, ParentElement, PositionedElementAnchor,
-    PositionedElementOffsetBounds, Radius, Shrinkable, Stack, Text, Wrap, WrapFill,
-    DEFAULT_UI_LINE_HEIGHT_RATIO,
-};
 #[cfg(feature = "voice_input")]
 use warpui::r#async::SpawnedFutureHandle;
 #[cfg(not(target_family = "wasm"))]
 use warpui::r#async::Timer;
-use warpui::ui_components::components::Coords;
+use warpui::elements::{
+    Border, ChildAnchor, ChildView, Clipped, ConstrainedBox, Container, CornerRadius,
+    CrossAxisAlignment, DEFAULT_UI_LINE_HEIGHT_RATIO, DispatchEventResult, Element, Empty,
+    EventHandler, Expanded, Flex, MainAxisAlignment, MainAxisSize, OffsetPositioning,
+    ParentElement, PositionedElementAnchor, PositionedElementOffsetBounds, Radius, Shrinkable,
+    Stack, Text, Wrap, WrapFill,
+};
+use warpui::ui_components::button::ButtonVariant;
+use warpui::ui_components::components::{Coords, UiComponentStyles};
 use warpui::{
     AppContext, Entity, EntityId, ModelHandle, SingletonEntity, TypedActionView, View, ViewContext,
     ViewHandle,
@@ -50,14 +51,14 @@ pub(crate) use self::environment_selector::sort_environments_by_recency;
 pub(crate) use self::environment_selector::{
     EnvironmentSelector, EnvironmentSelectorEvent, EnvironmentSelectorTarget,
 };
+use crate::ai::AIRequestUsageModel;
+use crate::ai::blocklist::BlocklistAIInputModel;
 use crate::ai::blocklist::agent_view::is_in_cloud_context;
 use crate::ai::blocklist::history_model::{BlocklistAIHistoryEvent, BlocklistAIHistoryModel};
 use crate::ai::blocklist::prompt::prompt_alert::{PromptAlertEvent, PromptAlertView};
 use crate::ai::blocklist::usage::icon_for_context_window_usage;
-use crate::ai::blocklist::BlocklistAIInputModel;
 use crate::ai::execution_profiles::profiles::AIExecutionProfilesModel;
 use crate::ai::harness_availability::HarnessAvailabilityModel;
-use crate::ai::AIRequestUsageModel;
 use crate::appearance::Appearance;
 use crate::auth::{AuthManager, AuthStateProvider};
 use crate::completer::SessionContext;
@@ -74,14 +75,20 @@ use crate::server::server_api::TranscribeError;
 use crate::server::telemetry::PluginChipTelemetryAction;
 use crate::server::telemetry::{PluginChipTelemetryKind, TelemetryEvent};
 use crate::settings::{
-    AISettings, AISettingsChangedEvent, PrivacySettings, PrivacySettingsChangedEvent,
+    AISettings, AISettingsChangedEvent, CLIAgentApiProfile, PrivacySettings,
+    PrivacySettingsChangedEvent, write_cli_agent_api_live_profiles_file,
 };
 use crate::settings_view::SettingsSection;
-use crate::terminal::cli_agent::{AgentReasoningEffort, AgentReasoningEffortModel};
+#[cfg(not(target_family = "wasm"))]
+use crate::terminal::ShellLaunchData;
+use crate::terminal::cli_agent::{
+    AgentControlWrite, AgentPermissionMode, AgentReasoningEffort, AgentReasoningEffortModel,
+    AgentRuntimeSettingsModel, DEFAULT_CLI_AGENT_MODEL_LABEL,
+};
 #[cfg(not(target_family = "wasm"))]
 use crate::terminal::cli_agent_sessions::plugin_manager::{
-    compare_versions, plugin_manager_for, plugin_manager_for_with_shell, CliAgentPluginManager,
-    PluginInstallError, PluginModalKind,
+    CliAgentPluginManager, PluginInstallError, PluginModalKind, compare_versions,
+    plugin_manager_for, plugin_manager_for_with_shell,
 };
 use crate::terminal::cli_agent_sessions::{
     CLIAgentInputState, CLIAgentSessionsModel, CLIAgentSessionsModelEvent,
@@ -99,28 +106,29 @@ use crate::terminal::session_settings::{
     SessionSettings, SessionSettingsChangedEvent, ToolbarChipSelection,
 };
 use crate::terminal::shared_session::SharedSessionStatus;
+use crate::terminal::view::TerminalAction;
 use crate::terminal::view::ambient_agent::{
     AmbientAgentViewModel, ModelSelector, ModelSelectorEvent,
 };
 use crate::terminal::view::init::OPEN_CLI_AGENT_RICH_INPUT_KEYBINDING;
-use crate::terminal::view::TerminalAction;
-#[cfg(not(target_family = "wasm"))]
-use crate::terminal::ShellLaunchData;
 use crate::terminal::{CLIAgent, TerminalModel};
 use crate::ui_components::icons::Icon;
+#[cfg(not(target_family = "wasm"))]
+use crate::view_components::ToastLink;
 use crate::view_components::action_button::{
     ActionButton, ActionButtonTheme, AdjoinedSide, ButtonSize, KeystrokeSource, NakedTheme,
     TooltipAlignment,
 };
 use crate::view_components::dropdown::DropdownStyle;
-#[cfg(not(target_family = "wasm"))]
-use crate::view_components::ToastLink;
-use crate::view_components::{DismissibleToast, Dropdown, DropdownAction, DropdownEvent};
-use crate::workspace::view::ssh_remote::SshRemoteModel;
-use crate::workspace::view::TOGGLE_PROJECT_EXPLORER_BINDING_NAME;
+use crate::view_components::{
+    DismissibleToast, Dropdown, DropdownAction, DropdownEvent, FilterableDropdown,
+    FilterableDropdownEvent,
+};
 use crate::workspace::ToastStack;
 #[cfg(not(target_family = "wasm"))]
 use crate::workspace::WorkspaceAction;
+use crate::workspace::view::TOGGLE_PROJECT_EXPLORER_BINDING_NAME;
+use crate::workspace::view::ssh_remote::{SSH_REMOTE_LOCAL_ENVIRONMENT_ID, SshRemoteModel};
 use crate::workspaces::user_workspaces::UserWorkspaces;
 
 const ENABLE_NLD_TOOLTIP: &str = "Enable terminal command autodetection";
@@ -152,7 +160,7 @@ enum CLIVoiceInputState {
 /// Gives the plugin time to connect and send its `SessionStart` event.
 #[cfg(not(target_family = "wasm"))]
 const PLUGIN_CHIP_DEBOUNCE: Duration = Duration::from_secs(3);
-const REASONING_EFFORT_PENDING_TIMEOUT: Duration = Duration::from_millis(1200);
+const REASONING_EFFORT_PENDING_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[cfg_attr(target_family = "wasm", allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -258,7 +266,9 @@ pub struct AgentInputFooter {
     // CLI agent-specific buttons (rendered when a CLI agent session is active).
     file_explorer_button: ViewHandle<ActionButton>,
     rich_input_button: ViewHandle<ActionButton>,
+    cli_model_dropdown: ViewHandle<FilterableDropdown<AgentInputFooterAction>>,
     reasoning_effort_dropdown: ViewHandle<Dropdown<AgentInputFooterAction>>,
+    cli_permission_dropdown: ViewHandle<Dropdown<AgentInputFooterAction>>,
     pending_reasoning_effort: Option<PendingReasoningEffort>,
     last_known_reasoning_effort: Option<AgentReasoningEffort>,
     settings_button: ViewHandle<ActionButton>,
@@ -294,6 +304,52 @@ pub struct AgentInputFooter {
 struct PendingReasoningEffort {
     effort: AgentReasoningEffort,
     set_at: Instant,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CliAgentModelMenuOption {
+    profile_id: Option<String>,
+    environment_id: String,
+    provider_name: String,
+    display_model: String,
+    command_model: String,
+}
+
+fn cli_footer_icon_dropdown_style(appearance: &Appearance, hovered: bool) -> UiComponentStyles {
+    let theme = appearance.theme();
+    let background = if hovered {
+        theme.surface_2()
+    } else {
+        theme.surface_1()
+    };
+
+    UiComponentStyles {
+        width: Some(24.),
+        height: Some(24.),
+        padding: Some(Coords::uniform(4.)),
+        border_width: Some(1.),
+        border_radius: Some(CornerRadius::with_all(Radius::Pixels(4.))),
+        background: Some(background.into()),
+        border_color: Some(internal_colors::neutral_3(theme).into()),
+        font_family_id: Some(appearance.ui_font_family()),
+        font_size: Some(appearance.ui_font_size()),
+        font_color: Some(theme.sub_text_color(background).into_solid()),
+        ..Default::default()
+    }
+}
+
+impl CliAgentModelMenuOption {
+    fn action(&self, agent: CLIAgent) -> AgentInputFooterAction {
+        AgentInputFooterAction::SetCliAgentModel {
+            agent,
+            model: self.command_model.clone(),
+            profile_id: self.profile_id.clone(),
+            environment_id: self
+                .profile_id
+                .as_ref()
+                .map(|_| self.environment_id.clone()),
+        }
+    }
 }
 
 impl AgentInputFooter {
@@ -457,16 +513,48 @@ impl AgentInputFooter {
                     ctx.dispatch_typed_action(AgentInputFooterAction::ToggleRichInput);
                 })
         });
+        let cli_model_dropdown = ctx.add_typed_action_view(|ctx| {
+            let (default_style, hovered_style) = {
+                let appearance = Appearance::as_ref(ctx);
+                (
+                    cli_footer_icon_dropdown_style(appearance, false),
+                    cli_footer_icon_dropdown_style(appearance, true),
+                )
+            };
+            let mut dropdown = FilterableDropdown::new(ctx);
+            dropdown.set_top_bar_max_width(24.);
+            dropdown.set_expanded_top_bar_width(276., ctx);
+            dropdown.set_menu_width(276., ctx);
+            dropdown.set_main_axis_size(MainAxisSize::Min, ctx);
+            dropdown.set_button_variant(ButtonVariant::Secondary);
+            dropdown.set_style(default_style);
+            dropdown.set_hovered_style(hovered_style);
+            dropdown.set_top_bar_icon(Icon::Grid, ctx);
+            dropdown.set_top_bar_icon_only(true, ctx);
+            dropdown.set_menu_header_text_override(|label| label.to_string());
+            dropdown.set_orientation(crate::view_components::FilterableDropdownOrientation::Up);
+            dropdown.set_top_bar_height(24., ctx);
+            dropdown
+        });
+        ctx.subscribe_to_view(&cli_model_dropdown, |me, _, event, ctx| match event {
+            FilterableDropdownEvent::ToggleExpanded => {
+                me.sync_cli_model_dropdown(ctx);
+                ctx.emit(AgentInputFooterEvent::ToggledChipMenu { open: true });
+            }
+            FilterableDropdownEvent::Close => {
+                ctx.emit(AgentInputFooterEvent::ToggledChipMenu { open: false });
+            }
+        });
         let reasoning_effort_dropdown = ctx.add_typed_action_view(|ctx| {
             let mut dropdown = Dropdown::new(ctx).with_drop_shadow();
-            dropdown.set_top_bar_max_width(30.);
+            dropdown.set_top_bar_max_width(24.);
             dropdown.set_menu_width(158., ctx);
             dropdown.set_menu_max_height(220., ctx);
             dropdown.set_main_axis_size(MainAxisSize::Min, ctx);
-            dropdown.set_style(DropdownStyle::ActionButtonSecondary, ctx);
-            dropdown.set_top_bar_icon(Icon::Psychology, ctx);
+            dropdown.set_style(DropdownStyle::AgentInputIconButton, ctx);
+            dropdown.set_top_bar_icon(Icon::Cognition, ctx);
             dropdown.set_top_bar_icon_only(true, ctx);
-            dropdown.set_menu_header_text_override(|label| format!("Reasoning: {label}"));
+            dropdown.set_menu_header_text_override(|label| label.to_string());
             dropdown.set_menu_position(
                 PositionedElementAnchor::TopLeft,
                 ChildAnchor::BottomLeft,
@@ -474,15 +562,6 @@ impl AgentInputFooter {
             );
             dropdown.set_top_bar_height(24., ctx);
             dropdown.set_vertical_margin(0., ctx);
-            dropdown.set_padding(
-                Coords {
-                    top: 4.,
-                    bottom: 4.,
-                    left: 6.,
-                    right: 6.,
-                },
-                ctx,
-            );
             dropdown.set_font_size(12., ctx);
             dropdown
         });
@@ -498,6 +577,35 @@ impl AgentInputFooter {
                 }
             },
         );
+        let cli_permission_dropdown = ctx.add_typed_action_view(|ctx| {
+            let mut dropdown = Dropdown::new(ctx).with_drop_shadow();
+            dropdown.set_top_bar_max_width(24.);
+            dropdown.set_menu_width(260., ctx);
+            dropdown.set_menu_max_height(240., ctx);
+            dropdown.set_main_axis_size(MainAxisSize::Min, ctx);
+            dropdown.set_style(DropdownStyle::AgentInputIconButton, ctx);
+            dropdown.set_top_bar_icon(Icon::Sliders, ctx);
+            dropdown.set_top_bar_icon_only(true, ctx);
+            dropdown.set_menu_header_text_override(|label| label.to_string());
+            dropdown.set_menu_position(
+                PositionedElementAnchor::TopLeft,
+                ChildAnchor::BottomLeft,
+                ctx,
+            );
+            dropdown.set_top_bar_height(24., ctx);
+            dropdown.set_vertical_margin(0., ctx);
+            dropdown.set_font_size(12., ctx);
+            dropdown
+        });
+        ctx.subscribe_to_view(&cli_permission_dropdown, |me, _, event, ctx| match event {
+            DropdownEvent::ToggleExpanded => {
+                me.sync_cli_permission_dropdown(ctx);
+                ctx.emit(AgentInputFooterEvent::ToggledChipMenu { open: true });
+            }
+            DropdownEvent::Close => {
+                ctx.emit(AgentInputFooterEvent::ToggledChipMenu { open: false });
+            }
+        });
         let settings_button = ctx.add_typed_action_view(|_ctx| {
             ActionButton::new("", AgentInputButtonTheme)
                 .with_icon(Icon::Settings)
@@ -630,7 +738,9 @@ impl AgentInputFooter {
                     }
                 }
 
+                me.sync_cli_model_dropdown(ctx);
                 me.sync_reasoning_effort_dropdown(ctx);
+                me.sync_cli_permission_dropdown(ctx);
                 me.schedule_reasoning_effort_dropdown_sync(ctx);
                 let CLIAgentSessionsModelEvent::InputSessionChanged {
                     new_input_state, ..
@@ -797,17 +907,42 @@ impl AgentInputFooter {
         ctx.subscribe_to_model(&AIRequestUsageModel::handle(ctx), |_, _, _, ctx| {
             ctx.notify()
         });
-        ctx.subscribe_to_model(&AISettings::handle(ctx), |_, _, event, ctx| {
+        ctx.subscribe_to_model(&AISettings::handle(ctx), |me, _, event, ctx| {
             if matches!(
                 event,
                 AISettingsChangedEvent::AIAutoDetectionEnabled { .. }
                     | AISettingsChangedEvent::ShouldForceDisableCloudHandoff { .. }
+                    | AISettingsChangedEvent::CLIAgentApiTakeoverEnabled { .. }
+                    | AISettingsChangedEvent::CLIAgentApiProfiles { .. }
             ) {
+                if matches!(
+                    event,
+                    AISettingsChangedEvent::CLIAgentApiProfiles { .. }
+                        | AISettingsChangedEvent::CLIAgentApiTakeoverEnabled { .. }
+                ) {
+                    me.sync_cli_model_dropdown(ctx);
+                    #[cfg(not(target_family = "wasm"))]
+                    if let Some(agent) = me.cli_agent(ctx) {
+                        let selected_model = AgentRuntimeSettingsModel::as_ref(ctx)
+                            .launch_options_for(agent)
+                            .model;
+                        me.sync_cli_agent_api_live_profiles_file(
+                            agent,
+                            selected_model.as_deref(),
+                            ctx,
+                        );
+                    }
+                }
                 ctx.notify()
             }
         });
         ctx.subscribe_to_model(&AgentReasoningEffortModel::handle(ctx), |me, _, _, ctx| {
             me.schedule_reasoning_effort_dropdown_sync(ctx);
+            ctx.notify();
+        });
+        ctx.subscribe_to_model(&AgentRuntimeSettingsModel::handle(ctx), |me, _, _, ctx| {
+            me.sync_cli_model_dropdown(ctx);
+            me.sync_cli_permission_dropdown(ctx);
             ctx.notify();
         });
         ctx.subscribe_to_model(&PrivacySettings::handle(ctx), |_, _, event, ctx| {
@@ -930,7 +1065,9 @@ impl AgentInputFooter {
             file_button,
             file_explorer_button,
             rich_input_button,
+            cli_model_dropdown,
             reasoning_effort_dropdown,
+            cli_permission_dropdown,
             pending_reasoning_effort: None,
             last_known_reasoning_effort: None,
             settings_button,
@@ -976,7 +1113,9 @@ impl AgentInputFooter {
         me.sync_remote_control_button(ctx);
         me.update_context_window_button(ctx);
         me.update_display_chips(&prompt, ctx);
+        me.sync_cli_model_dropdown(ctx);
         me.sync_reasoning_effort_dropdown(ctx);
+        me.sync_cli_permission_dropdown(ctx);
         me.schedule_reasoning_effort_dropdown_sync(ctx);
         me.update_ftu_callout_render_state(ctx);
         me
@@ -1632,15 +1771,6 @@ impl AgentInputFooter {
         }
     }
 
-    fn schedule_reasoning_effort_reconciliation(&mut self, ctx: &mut ViewContext<Self>) {
-        self.schedule_reasoning_effort_dropdown_sync_after(Duration::from_millis(50), ctx);
-        self.schedule_reasoning_effort_dropdown_sync_after(Duration::from_millis(300), ctx);
-        self.schedule_reasoning_effort_dropdown_sync_after(
-            REASONING_EFFORT_PENDING_TIMEOUT + Duration::from_millis(100),
-            ctx,
-        );
-    }
-
     fn current_terminal_reasoning_effort(&self, agent: CLIAgent) -> Option<AgentReasoningEffort> {
         if agent != CLIAgent::Codex {
             return None;
@@ -1670,8 +1800,9 @@ impl AgentInputFooter {
         let lines = output.lines().collect::<Vec<_>>();
         lines
             .iter()
-            .take(12)
-            .chain(lines.iter().rev().take(12))
+            .rev()
+            .take(24)
+            .chain(lines.iter().take(12))
             .find_map(|line| Self::parse_codex_reasoning_effort_status_line(line))
     }
 
@@ -1706,18 +1837,20 @@ impl AgentInputFooter {
             return Some(pending_effort);
         }
 
+        let configured_effort = AgentReasoningEffortModel::as_ref(app).effort();
+        if configured_effort != AgentReasoningEffort::Auto
+            && agent.supports_reasoning_effort(configured_effort)
+        {
+            return Some(configured_effort);
+        }
+
         if let Some(live_effort) =
             live_effort.filter(|effort| agent.supports_reasoning_effort(*effort))
         {
             return Some(live_effort);
         }
 
-        let effort = AgentReasoningEffortModel::as_ref(app).effort();
-        if effort != AgentReasoningEffort::Auto && agent.supports_reasoning_effort(effort) {
-            Some(effort)
-        } else {
-            agent.default_reasoning_effort()
-        }
+        agent.default_reasoning_effort()
     }
 
     fn reconcile_pending_reasoning_effort(
@@ -1744,17 +1877,313 @@ impl AgentInputFooter {
             .map(|pending| pending.effort)
     }
 
-    fn fallback_reasoning_effort_for_command(
+    #[cfg(not(target_family = "wasm"))]
+    fn sync_cli_agent_api_live_profiles_file(
         &self,
         agent: CLIAgent,
-        app: &AppContext,
-    ) -> Option<AgentReasoningEffort> {
-        self.last_known_reasoning_effort
-            .or_else(|| {
-                let effort = AgentReasoningEffortModel::as_ref(app).effort();
-                (effort != AgentReasoningEffort::Auto).then_some(effort)
+        selected_model: Option<&str>,
+        ctx: &mut ViewContext<Self>,
+    ) -> bool {
+        if SshRemoteModel::as_ref(ctx).active_environment_id() != SSH_REMOTE_LOCAL_ENVIRONMENT_ID {
+            return false;
+        }
+        if !AISettings::as_ref(ctx).is_cli_agent_api_takeover_enabled() {
+            return false;
+        }
+
+        let environment_id = self.active_cli_agent_api_environment_id(ctx);
+        let mut profiles =
+            AISettings::as_ref(ctx).cli_agent_api_fallback_profiles(agent, &environment_id);
+        if profiles.is_empty() {
+            return false;
+        }
+
+        if let Some(model) = selected_model
+            .map(str::trim)
+            .filter(|model| !model.is_empty() && *model != DEFAULT_CLI_AGENT_MODEL_LABEL)
+        {
+            profiles[0].model = model.to_owned();
+        }
+
+        if let Err(error) =
+            write_cli_agent_api_live_profiles_file(agent, &environment_id, &profiles)
+        {
+            log::warn!("Failed to update Agent API live profiles file: {error}");
+            return false;
+        }
+
+        true
+    }
+
+    fn active_cli_agent_api_environment_id(&self, ctx: &AppContext) -> String {
+        SshRemoteModel::as_ref(ctx).active_environment_id()
+    }
+
+    fn model_display_with_context_badge(
+        label: impl AsRef<str>,
+        supports_one_million_context: bool,
+        context_window_tokens: u32,
+    ) -> String {
+        let mut label = label.as_ref().trim().to_owned();
+        if label.is_empty() {
+            return label;
+        }
+
+        if (supports_one_million_context || context_window_tokens >= 1_000_000)
+            && !label.contains("[1M]")
+        {
+            label.push_str("[1M]");
+        }
+        label
+    }
+
+    fn push_cli_agent_api_model_option(
+        options: &mut Vec<CliAgentModelMenuOption>,
+        profile: &CLIAgentApiProfile,
+        display_model: impl AsRef<str>,
+        command_model: impl AsRef<str>,
+    ) {
+        let command_model = command_model.as_ref().trim();
+        let display_model = display_model.as_ref().trim();
+        let command_model = if command_model.is_empty() {
+            display_model
+        } else {
+            command_model
+        };
+        if command_model.is_empty() {
+            return;
+        }
+
+        let display_model = if display_model.is_empty() {
+            command_model
+        } else {
+            display_model
+        };
+        if options.iter().any(|option| {
+            option.profile_id.as_deref() == Some(profile.id.as_str())
+                && option.command_model == command_model
+                && option.display_model == display_model
+        }) {
+            return;
+        }
+
+        options.push(CliAgentModelMenuOption {
+            profile_id: Some(profile.id.clone()),
+            environment_id: profile.environment_id.clone(),
+            provider_name: profile.name.clone(),
+            display_model: display_model.to_owned(),
+            command_model: command_model.to_owned(),
+        });
+    }
+
+    fn cli_agent_api_model_options(
+        &self,
+        agent: CLIAgent,
+        ctx: &AppContext,
+    ) -> Vec<CliAgentModelMenuOption> {
+        let environment_id = self.active_cli_agent_api_environment_id(ctx);
+        let profiles =
+            AISettings::as_ref(ctx).cli_agent_api_fallback_profiles(agent, &environment_id);
+        let mut options = Vec::new();
+
+        for profile in profiles {
+            let preferred_model = profile.preferred_model();
+            if !preferred_model.trim().is_empty() {
+                Self::push_cli_agent_api_model_option(
+                    &mut options,
+                    &profile,
+                    preferred_model.as_str(),
+                    preferred_model.as_str(),
+                );
+            }
+
+            for model in &profile.model_catalog {
+                Self::push_cli_agent_api_model_option(&mut options, &profile, model, model);
+            }
+
+            for mapping in &profile.model_mappings {
+                let command_model = if mapping.model.trim().is_empty() {
+                    mapping
+                        .display_name
+                        .trim()
+                        .is_empty()
+                        .then(|| mapping.role.trim())
+                        .unwrap_or_else(|| mapping.display_name.trim())
+                } else {
+                    mapping.model.trim()
+                };
+                let display_source = if !mapping.display_name.trim().is_empty() {
+                    mapping.display_name.trim()
+                } else if !mapping.role.trim().is_empty() {
+                    mapping.role.trim()
+                } else {
+                    command_model
+                };
+                let display_model = Self::model_display_with_context_badge(
+                    display_source,
+                    mapping.supports_one_million_context,
+                    mapping.context_window_tokens,
+                );
+                Self::push_cli_agent_api_model_option(
+                    &mut options,
+                    &profile,
+                    display_model,
+                    command_model,
+                );
+            }
+        }
+
+        options
+    }
+
+    fn static_cli_agent_model_options(&self, agent: CLIAgent) -> Vec<CliAgentModelMenuOption> {
+        agent
+            .model_options()
+            .iter()
+            .map(|model| CliAgentModelMenuOption {
+                profile_id: None,
+                environment_id: String::new(),
+                provider_name: "CLI 默认".to_string(),
+                display_model: (*model).to_owned(),
+                command_model: (*model).to_owned(),
             })
-            .filter(|effort| agent.supports_reasoning_effort(*effort))
+            .collect()
+    }
+
+    fn sync_cli_model_dropdown(&mut self, ctx: &mut ViewContext<Self>) {
+        let Some(agent) = self
+            .cli_agent(ctx)
+            .filter(CLIAgent::supports_model_selection)
+        else {
+            self.cli_model_dropdown.update(ctx, |dropdown, ctx| {
+                dropdown.set_rich_items(Vec::<MenuItem<DropdownAction>>::new(), ctx);
+                dropdown.set_selected_to_none(ctx);
+            });
+            ctx.notify();
+            return;
+        };
+
+        let environment_id = self.active_cli_agent_api_environment_id(ctx);
+        let takeover_enabled = AISettings::as_ref(ctx).is_cli_agent_api_takeover_enabled();
+        let selected_model = AgentRuntimeSettingsModel::as_ref(ctx)
+            .model_label_for_with_custom_models(agent, takeover_enabled)
+            .to_owned();
+        let active_profile_id = if takeover_enabled {
+            AISettings::as_ref(ctx)
+                .active_cli_agent_api_profile(agent, &environment_id)
+                .map(|profile| profile.id)
+        } else {
+            None
+        };
+        let api_options = if takeover_enabled {
+            self.cli_agent_api_model_options(agent, ctx)
+        } else {
+            Vec::new()
+        };
+        let static_options = if takeover_enabled {
+            Vec::new()
+        } else {
+            self.static_cli_agent_model_options(agent)
+        };
+        let appearance = Appearance::as_ref(ctx);
+        let header_color = appearance
+            .theme()
+            .sub_text_color(appearance.theme().background())
+            .into_solid();
+
+        let selected_action = api_options
+            .iter()
+            .find(|option| {
+                option.command_model == selected_model
+                    && active_profile_id
+                        .as_deref()
+                        .is_some_and(|profile_id| option.profile_id.as_deref() == Some(profile_id))
+            })
+            .or_else(|| {
+                api_options
+                    .iter()
+                    .find(|option| option.command_model == selected_model)
+            })
+            .or_else(|| {
+                static_options
+                    .iter()
+                    .find(|option| option.command_model == selected_model)
+            })
+            .map(|option| option.action(agent))
+            .unwrap_or_else(|| AgentInputFooterAction::SetCliAgentModel {
+                agent,
+                model: DEFAULT_CLI_AGENT_MODEL_LABEL.to_owned(),
+                profile_id: None,
+                environment_id: None,
+            });
+
+        let mut items = Vec::new();
+        if takeover_enabled && !api_options.is_empty() {
+            items.push(MenuItem::Header {
+                fields: MenuItemFields::new_with_stacked_label(
+                    "Agent API 模型",
+                    "显示设置中匹配当前 agent 和环境的自定义模型",
+                )
+                .with_override_text_color(header_color),
+                clickable: false,
+                right_side_fields: None,
+            });
+            items.push(MenuItem::Separator);
+
+            let mut current_profile_id: Option<&str> = None;
+            for option in &api_options {
+                if current_profile_id != option.profile_id.as_deref() {
+                    current_profile_id = option.profile_id.as_deref();
+                    items.push(MenuItem::Header {
+                        fields: MenuItemFields::new(option.provider_name.clone())
+                            .with_override_text_color(header_color),
+                        clickable: false,
+                        right_side_fields: None,
+                    });
+                }
+
+                let action = option.action(agent);
+                let mut fields = MenuItemFields::new(option.display_model.clone())
+                    .with_on_select_action(DropdownAction::select_action_and_close(action.clone()));
+                if action == selected_action {
+                    fields = fields.with_icon(Icon::Check);
+                } else {
+                    fields = fields.with_indent();
+                }
+                items.push(MenuItem::Item(fields));
+            }
+            items.push(MenuItem::Separator);
+        }
+
+        if !static_options.is_empty() {
+            items.extend([
+                MenuItem::Header {
+                    fields: MenuItemFields::new("CLI 原生模型")
+                        .with_override_text_color(header_color),
+                    clickable: false,
+                    right_side_fields: None,
+                },
+                MenuItem::Separator,
+            ]);
+        }
+
+        for option in &static_options {
+            let action = option.action(agent);
+            let mut fields = MenuItemFields::new(option.display_model.clone())
+                .with_on_select_action(DropdownAction::select_action_and_close(action.clone()));
+            if action == selected_action {
+                fields = fields.with_icon(Icon::Check);
+            } else {
+                fields = fields.with_indent();
+            }
+            items.push(MenuItem::Item(fields));
+        }
+
+        self.cli_model_dropdown.update(ctx, |dropdown, ctx| {
+            dropdown.set_rich_items(items, ctx);
+            dropdown.set_selected_by_action(selected_action, ctx);
+        });
+        ctx.notify();
     }
 
     fn sync_reasoning_effort_dropdown(&mut self, ctx: &mut ViewContext<Self>) {
@@ -1782,16 +2211,6 @@ impl AgentInputFooter {
             ctx.notify();
             return;
         };
-        let current_effort = AgentReasoningEffortModel::as_ref(ctx).effort();
-        if self.pending_reasoning_effort.is_none()
-            && live_effort.is_some()
-            && current_effort != selected_effort
-        {
-            AgentReasoningEffortModel::handle(ctx).update(ctx, |model, ctx| {
-                model.set_effort(selected_effort, ctx);
-            });
-        }
-
         let appearance = Appearance::as_ref(ctx);
         let header_color = appearance
             .theme()
@@ -1828,12 +2247,82 @@ impl AgentInputFooter {
         ctx.notify();
     }
 
+    fn sync_cli_permission_dropdown(&mut self, ctx: &mut ViewContext<Self>) {
+        let Some(agent) = self
+            .cli_agent(ctx)
+            .filter(|agent| !agent.permission_mode_options().is_empty())
+        else {
+            self.cli_permission_dropdown.update(ctx, |dropdown, ctx| {
+                dropdown.set_rich_items(Vec::<MenuItem<DropdownAction>>::new(), ctx);
+                dropdown.set_selected_to_none(ctx);
+            });
+            ctx.notify();
+            return;
+        };
+        let Some(selected_mode) = AgentRuntimeSettingsModel::as_ref(ctx).permission_mode_for(agent)
+        else {
+            self.cli_permission_dropdown.update(ctx, |dropdown, ctx| {
+                dropdown.set_rich_items(Vec::<MenuItem<DropdownAction>>::new(), ctx);
+                dropdown.set_selected_to_none(ctx);
+            });
+            ctx.notify();
+            return;
+        };
+
+        let appearance = Appearance::as_ref(ctx);
+        let header_color = appearance
+            .theme()
+            .sub_text_color(appearance.theme().background())
+            .into_solid();
+        let mut items = vec![
+            MenuItem::Header {
+                fields: MenuItemFields::new("Permission").with_override_text_color(header_color),
+                clickable: false,
+                right_side_fields: None,
+            },
+            MenuItem::Separator,
+        ];
+
+        for mode in agent.permission_mode_options() {
+            let action = AgentInputFooterAction::SetCliAgentPermission(agent, *mode);
+            let mut fields =
+                MenuItemFields::new_with_stacked_label(mode.label(), mode.description())
+                    .with_on_select_action(DropdownAction::select_action_and_close(action));
+            if *mode == selected_mode {
+                fields = fields.with_icon(Icon::Check);
+            } else {
+                fields = fields.with_indent();
+            }
+            items.push(MenuItem::Item(fields));
+        }
+
+        self.cli_permission_dropdown.update(ctx, |dropdown, ctx| {
+            dropdown.set_rich_items(items, ctx);
+            dropdown.set_selected_by_action(
+                AgentInputFooterAction::SetCliAgentPermission(agent, selected_mode),
+                ctx,
+            );
+        });
+        ctx.notify();
+    }
+
+    fn render_cli_model_selector(&self, agent: CLIAgent) -> Option<Box<dyn Element>> {
+        agent
+            .supports_model_selection()
+            .then(|| ChildView::new(&self.cli_model_dropdown).finish())
+    }
+
     fn render_cli_reasoning_effort_selector(&self, agent: CLIAgent) -> Option<Box<dyn Element>> {
         if agent.reasoning_effort_options().is_empty() {
             return None;
         }
 
         Some(ChildView::new(&self.reasoning_effort_dropdown).finish())
+    }
+
+    fn render_cli_permission_selector(&self, agent: CLIAgent) -> Option<Box<dyn Element>> {
+        (!agent.permission_mode_options().is_empty())
+            .then(|| ChildView::new(&self.cli_permission_dropdown).finish())
     }
 
     fn render_cli_toolbar_item(
@@ -1995,7 +2484,13 @@ impl AgentInputFooter {
         }
 
         if let Some(agent) = self.cli_agent(app) {
+            if let Some(element) = self.render_cli_model_selector(agent) {
+                left_buttons.add_child(element);
+            }
             if let Some(element) = self.render_cli_reasoning_effort_selector(agent) {
+                left_buttons.add_child(element);
+            }
+            if let Some(element) = self.render_cli_permission_selector(agent) {
                 left_buttons.add_child(element);
             }
         }
@@ -2350,6 +2845,21 @@ impl AgentInputFooter {
         ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
             let toast = DismissibleToast::error(message.to_string());
             toast_stack.add_ephemeral_toast(toast, window_id, ctx);
+        });
+    }
+
+    fn show_cli_agent_control_toast(
+        &self,
+        message: impl Into<String>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let window_id = ctx.window_id();
+        ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
+            toast_stack.add_ephemeral_toast(
+                DismissibleToast::default(message.into()),
+                window_id,
+                ctx,
+            );
         });
     }
 
@@ -2820,7 +3330,14 @@ pub enum AgentInputFooterAction {
     ToggleCodeReview,
     ToggleFileExplorer,
     ToggleRichInput,
+    SetCliAgentModel {
+        agent: CLIAgent,
+        model: String,
+        profile_id: Option<String>,
+        environment_id: Option<String>,
+    },
     SetReasoningEffort(AgentReasoningEffort),
+    SetCliAgentPermission(CLIAgent, AgentPermissionMode),
     ToggleAutodetectionSetting,
     DismissFtuModelCallout,
     InstallPlugin,
@@ -2908,6 +3425,71 @@ impl TypedActionView for AgentInputFooter {
                     ctx.emit(AgentInputFooterEvent::OpenRichInput);
                 }
             }
+            AgentInputFooterAction::SetCliAgentModel {
+                agent,
+                model,
+                profile_id,
+                environment_id,
+            } => {
+                let is_default_model = model == DEFAULT_CLI_AGENT_MODEL_LABEL;
+                let takeover_enabled = AISettings::as_ref(ctx).is_cli_agent_api_takeover_enabled();
+                let is_native_model = agent.model_options().contains(&model.as_str());
+                if self.cli_agent(ctx) != Some(*agent) {
+                    return;
+                }
+                if !takeover_enabled && !is_default_model && !is_native_model {
+                    return;
+                }
+                if takeover_enabled && !is_default_model && !agent.supports_model(model) {
+                    return;
+                }
+
+                let previous_model = AgentRuntimeSettingsModel::as_ref(ctx)
+                    .model_label_for_with_custom_models(*agent, takeover_enabled)
+                    .to_owned();
+                if previous_model == *model {
+                    return;
+                }
+
+                if takeover_enabled {
+                    if let Some(profile_id) = profile_id {
+                        let environment_id = environment_id
+                            .clone()
+                            .unwrap_or_else(|| self.active_cli_agent_api_environment_id(ctx));
+                        AISettings::handle(ctx).update(ctx, |settings, ctx| {
+                            settings.set_active_cli_agent_api_profile(
+                                *agent,
+                                &environment_id,
+                                profile_id,
+                                ctx,
+                            );
+                        });
+                    }
+                }
+
+                AgentRuntimeSettingsModel::handle(ctx).update(ctx, |settings, ctx| {
+                    settings.set_model(*agent, model.clone(), ctx)
+                });
+                let live_profiles_synced = {
+                    #[cfg(not(target_family = "wasm"))]
+                    {
+                        self.sync_cli_agent_api_live_profiles_file(*agent, Some(model), ctx)
+                    }
+                    #[cfg(target_family = "wasm")]
+                    {
+                        false
+                    }
+                };
+
+                if takeover_enabled && !live_profiles_synced {
+                    self.show_cli_agent_control_toast(
+                        "Agent API profile was updated, but the live profile file could not be written.",
+                        ctx,
+                    );
+                }
+
+                ctx.emit(AgentInputFooterEvent::RestartCliAgentSession);
+            }
             AgentInputFooterAction::SetReasoningEffort(effort) => {
                 let Some(agent) = self.cli_agent(ctx) else {
                     return;
@@ -2916,29 +3498,39 @@ impl TypedActionView for AgentInputFooter {
                     return;
                 }
 
-                let current_effort = self
-                    .current_terminal_reasoning_effort(agent)
-                    .or_else(|| self.fallback_reasoning_effort_for_command(agent, ctx));
-                let command = agent.in_session_reasoning_effort_command(*effort, current_effort);
-                self.pending_reasoning_effort = command.as_ref().map(|_| PendingReasoningEffort {
-                    effort: *effort,
-                    set_at: Instant::now(),
-                });
                 AgentReasoningEffortModel::handle(ctx).update(ctx, |model, ctx| {
                     model.set_effort(*effort, ctx);
                 });
 
-                if let Some(command) = command {
-                    ctx.emit(AgentInputFooterEvent::WriteToPty(command));
+                ctx.emit(AgentInputFooterEvent::RestartCliAgentSession);
+            }
+            AgentInputFooterAction::SetCliAgentPermission(agent, permission_mode) => {
+                if self.cli_agent(ctx) != Some(*agent)
+                    || !agent.supports_permission_mode(*permission_mode)
+                {
+                    return;
                 }
-                self.schedule_reasoning_effort_reconciliation(ctx);
+
+                let previous_permission_mode =
+                    AgentRuntimeSettingsModel::as_ref(ctx).permission_mode_for(*agent);
+                if previous_permission_mode == Some(*permission_mode) {
+                    return;
+                }
+
+                AgentRuntimeSettingsModel::handle(ctx).update(ctx, |settings, ctx| {
+                    settings.set_permission_mode(*agent, *permission_mode, ctx)
+                });
+
+                ctx.emit(AgentInputFooterEvent::RestartCliAgentSession);
             }
             AgentInputFooterAction::ToggleAutodetectionSetting => {
                 let ai_settings = AISettings::handle(ctx);
                 ai_settings.update(ctx, |settings, ctx| {
-                    report_if_error!(settings
-                        .ai_autodetection_enabled_internal
-                        .toggle_and_save_value(ctx));
+                    report_if_error!(
+                        settings
+                            .ai_autodetection_enabled_internal
+                            .toggle_and_save_value(ctx)
+                    );
                 });
             }
             AgentInputFooterAction::DismissFtuModelCallout => {
@@ -3088,6 +3680,8 @@ pub enum AgentInputFooterEvent {
     ToggleVoiceInput(voice_input::VoiceInputToggledFrom),
     SelectFile,
     WriteToPty(String),
+    WriteAgentControlSequence(Vec<AgentControlWrite>),
+    RestartCliAgentSession,
     /// Insert text into the CLI agent rich input.
     InsertIntoCLIRichInput(String),
     UploadLocalFilesToSshRemote(Vec<String>),
@@ -3406,6 +4000,18 @@ mod reasoning_effort_tests {
             AgentInputFooter::parse_codex_reasoning_effort_status_line(
                 "Reasoning is already at the lowest level (low).",
             ),
+            Some(AgentReasoningEffort::Low)
+        );
+    }
+
+    #[test]
+    fn parses_latest_codex_status_line_before_stale_startup_line() {
+        let output = "gpt-5.5 xhigh · ~/Desktop/src\n\
+            old transcript line\n\
+            gpt-5.5 low · ~/Desktop/src";
+
+        assert_eq!(
+            AgentInputFooter::parse_codex_reasoning_effort_from_output(output),
             Some(AgentReasoningEffort::Low)
         );
     }

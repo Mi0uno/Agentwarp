@@ -66,6 +66,77 @@ const DELETE_CONFIRMATION_PROMPT_WIDTH: f32 = 260.;
 const DELETE_CONFIRMATION_PROMPT_OFFSET: f32 = 10.;
 pub const SSH_REMOTE_LOCAL_ENVIRONMENT_ID: &str = "local";
 
+#[cfg(not(target_family = "wasm"))]
+const SSH_PREFERRED_KEX_ALGORITHMS: &[&str] = &[
+    "curve25519-sha256",
+    "curve25519-sha256@libssh.org",
+    "ecdh-sha2-nistp256",
+    "ecdh-sha2-nistp384",
+    "ecdh-sha2-nistp521",
+    "diffie-hellman-group-exchange-sha256",
+    "diffie-hellman-group16-sha512",
+    "diffie-hellman-group18-sha512",
+    "diffie-hellman-group14-sha256",
+    "diffie-hellman-group14-sha1",
+    "diffie-hellman-group-exchange-sha1",
+    "diffie-hellman-group1-sha1",
+    "ext-info-c",
+    "kex-strict-c-v00@openssh.com",
+];
+
+#[cfg(not(target_family = "wasm"))]
+const SSH_PREFERRED_HOST_KEY_ALGORITHMS: &[&str] = &[
+    "ssh-ed25519",
+    "ssh-ed25519-cert-v01@openssh.com",
+    "ecdsa-sha2-nistp256",
+    "ecdsa-sha2-nistp384",
+    "ecdsa-sha2-nistp521",
+    "ecdsa-sha2-nistp256-cert-v01@openssh.com",
+    "ecdsa-sha2-nistp384-cert-v01@openssh.com",
+    "ecdsa-sha2-nistp521-cert-v01@openssh.com",
+    "rsa-sha2-512",
+    "rsa-sha2-256",
+    "rsa-sha2-512-cert-v01@openssh.com",
+    "rsa-sha2-256-cert-v01@openssh.com",
+    "ssh-rsa",
+    "ssh-rsa-cert-v01@openssh.com",
+    "ssh-dss",
+];
+
+#[cfg(not(target_family = "wasm"))]
+const SSH_PREFERRED_CIPHER_ALGORITHMS: &[&str] = &[
+    "chacha20-poly1305@openssh.com",
+    "aes256-gcm@openssh.com",
+    "aes128-gcm@openssh.com",
+    "aes256-ctr",
+    "aes192-ctr",
+    "aes128-ctr",
+    "aes256-cbc",
+    "rijndael-cbc@lysator.liu.se",
+    "aes192-cbc",
+    "aes128-cbc",
+    "blowfish-cbc",
+    "cast128-cbc",
+    "3des-cbc",
+    "arcfour128",
+    "arcfour",
+];
+
+#[cfg(not(target_family = "wasm"))]
+const SSH_PREFERRED_MAC_ALGORITHMS: &[&str] = &[
+    "hmac-sha2-512-etm@openssh.com",
+    "hmac-sha2-256-etm@openssh.com",
+    "hmac-sha2-512",
+    "hmac-sha2-256",
+    "hmac-sha1-etm@openssh.com",
+    "hmac-sha1",
+    "hmac-sha1-96",
+    "hmac-ripemd160@openssh.com",
+    "hmac-ripemd160",
+    "hmac-md5",
+    "hmac-md5-96",
+];
+
 #[derive(Clone, Debug)]
 pub enum SshRemoteModelEvent {
     HostsChanged,
@@ -890,6 +961,90 @@ fn emit_install_chunk_blocking(
 }
 
 #[cfg(not(target_family = "wasm"))]
+fn apply_embedded_ssh_algorithm_preferences(session: &ssh2::Session) {
+    set_preferred_ssh_algorithms(
+        session,
+        ssh2::MethodType::Kex,
+        SSH_PREFERRED_KEX_ALGORITHMS,
+        "kex",
+    );
+    set_preferred_ssh_algorithms(
+        session,
+        ssh2::MethodType::HostKey,
+        SSH_PREFERRED_HOST_KEY_ALGORITHMS,
+        "host key",
+    );
+    set_preferred_ssh_algorithms(
+        session,
+        ssh2::MethodType::CryptCs,
+        SSH_PREFERRED_CIPHER_ALGORITHMS,
+        "client cipher",
+    );
+    set_preferred_ssh_algorithms(
+        session,
+        ssh2::MethodType::CryptSc,
+        SSH_PREFERRED_CIPHER_ALGORITHMS,
+        "server cipher",
+    );
+    set_preferred_ssh_algorithms(
+        session,
+        ssh2::MethodType::MacCs,
+        SSH_PREFERRED_MAC_ALGORITHMS,
+        "client mac",
+    );
+    set_preferred_ssh_algorithms(
+        session,
+        ssh2::MethodType::MacSc,
+        SSH_PREFERRED_MAC_ALGORITHMS,
+        "server mac",
+    );
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn set_preferred_ssh_algorithms(
+    session: &ssh2::Session,
+    method_type: ssh2::MethodType,
+    preferred_algorithms: &[&str],
+    label: &str,
+) {
+    let algorithms = match session.supported_algs(method_type) {
+        Ok(supported_algorithms) => preferred_algorithms
+            .iter()
+            .copied()
+            .filter(|algorithm| {
+                supported_algorithms
+                    .iter()
+                    .any(|supported| supported == algorithm)
+            })
+            .collect::<Vec<_>>(),
+        Err(err) => {
+            log::debug!("Embedded SSH could not inspect supported {label} algorithms: {err}");
+            preferred_algorithms.to_vec()
+        }
+    };
+
+    if algorithms.is_empty() {
+        return;
+    }
+
+    let preferences = algorithms.join(",");
+    if let Err(err) = session.method_pref(method_type, &preferences) {
+        log::debug!("Embedded SSH could not set {label} algorithm preferences: {err}");
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn embedded_ssh_handshake_error(error: ssh2::Error) -> EmbeddedSshSetupFailure {
+    let error = error.to_string();
+    let hint = if error.contains("Unable to exchange encryption keys") {
+        " The SSH server and embedded client could not agree on key exchange, host key, cipher, or MAC algorithms."
+    } else {
+        ""
+    };
+    EmbeddedSshSetupFailure::Failed(format!("Embedded SSH handshake failed: {error}.{hint}"))
+}
+
+#[cfg(not(target_family = "wasm"))]
 fn connect_embedded_ssh_session(
     target: &SshRemoteResolvedTarget,
 ) -> Result<ssh2::Session, EmbeddedSshSetupFailure> {
@@ -919,9 +1074,9 @@ fn connect_embedded_ssh_session(
         EmbeddedSshSetupFailure::Failed(format!("Embedded SSH session init failed: {err}"))
     })?;
     session.set_tcp_stream(tcp);
-    session.handshake().map_err(|err| {
-        EmbeddedSshSetupFailure::Failed(format!("Embedded SSH handshake failed: {err}"))
-    })?;
+    session.set_blocking(true);
+    apply_embedded_ssh_algorithm_preferences(&session);
+    session.handshake().map_err(embedded_ssh_handshake_error)?;
 
     match &target.auth {
         SshRemoteResolvedAuth::Password(password) => {

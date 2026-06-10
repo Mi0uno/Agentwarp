@@ -254,7 +254,7 @@ pub enum SettingsSection {
     WarpDrive,
     Warpify,
     /// Internal backing-page identifier for AISettingsPageView. Multiple subpages
-    /// (WarpAgent, AgentProfiles, Knowledge, AgentBuiltinPrompts, ThirdPartyCLIAgents, AgentApiProfiles) share this single
+    /// (WarpAgent, AgentProfiles, Knowledge, AgentBuiltinPrompts, ThirdPartyCLIAgents, AgentApiProfiles, AgentSessionIds) share this single
     /// backing page, so this variant is needed as the key in `settings_pages`.
     /// External callers should navigate to a specific subpage (e.g. `WarpAgent`) instead.
     AI,
@@ -266,6 +266,7 @@ pub enum SettingsSection {
     AgentBuiltinPrompts,
     ThirdPartyCLIAgents,
     AgentApiProfiles,
+    AgentSessionIds,
     /// Internal backing-page identifier for CodeSettingsPageView. Multiple subpages
     /// (CodeIndexing, EditorAndCodeReview) share this single backing page,
     /// so this variant is needed as the key in `settings_pages`.
@@ -298,6 +299,7 @@ impl Display for SettingsSection {
             SettingsSection::AgentBuiltinPrompts => write!(f, "System prompts"),
             SettingsSection::ThirdPartyCLIAgents => write!(f, "Third party CLI agents"),
             SettingsSection::AgentApiProfiles => write!(f, "Agent API"),
+            SettingsSection::AgentSessionIds => write!(f, "Session IDs"),
             SettingsSection::CodeIndexing => write!(f, "Indexing and projects"),
             SettingsSection::EditorAndCodeReview => write!(f, "Editor and Code Review"),
             SettingsSection::CloudEnvironments => write!(f, "Environments"),
@@ -331,6 +333,7 @@ impl SettingsSection {
                 | Self::AgentBuiltinPrompts
                 | Self::ThirdPartyCLIAgents
                 | Self::AgentApiProfiles
+                | Self::AgentSessionIds
         )
     }
 
@@ -370,6 +373,7 @@ impl SettingsSection {
             Self::AgentBuiltinPrompts,
             Self::ThirdPartyCLIAgents,
             Self::AgentApiProfiles,
+            Self::AgentSessionIds,
         ]
     }
 
@@ -414,6 +418,7 @@ impl FromStr for SettingsSection {
             }
             "Third party CLI agents" | "ThirdPartyCLIAgents" => Ok(Self::ThirdPartyCLIAgents),
             "Agent API" | "AgentApiProfiles" => Ok(Self::AgentApiProfiles),
+            "Session IDs" | "AgentSessionIds" => Ok(Self::AgentSessionIds),
             "Indexing and projects" | "CodeIndexing" => Ok(Self::CodeIndexing),
             "Editor and Code Review" | "EditorAndCodeReview" => Ok(Self::EditorAndCodeReview),
             "CloudEnvironments" => Ok(Self::CloudEnvironments),

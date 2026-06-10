@@ -44,6 +44,36 @@ pub fn cli_agent_api_usage_log_path() -> PathBuf {
         .join("usage.ndjson")
 }
 
+fn cli_agent_api_path_component(value: &str) -> String {
+    let component = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let component = component.trim_matches('_');
+    if component.is_empty() {
+        "default".to_owned()
+    } else {
+        component.to_owned()
+    }
+}
+
+pub fn cli_agent_api_live_profiles_path(agent: CLIAgent, environment_id: &str) -> PathBuf {
+    warp_core::paths::data_dir()
+        .join("agent-api")
+        .join("profiles")
+        .join(format!(
+            "{}-{}.json",
+            cli_agent_api_path_component(&agent.to_serialized_name()),
+            cli_agent_api_path_component(environment_id)
+        ))
+}
+
 pub enum FocusedTerminalInfoEvent {
     TerminalInfoUpdated,
 }
@@ -1138,6 +1168,28 @@ impl CLIAgentApiModelMapping {
         (!self.role.is_empty() || !self.display_name.is_empty() || !self.model.is_empty())
             .then_some(self)
     }
+}
+
+pub fn write_cli_agent_api_live_profiles_file(
+    agent: CLIAgent,
+    environment_id: &str,
+    profiles: &[CLIAgentApiProfile],
+) -> Result<PathBuf, String> {
+    let path = cli_agent_api_live_profiles_path(agent, environment_id);
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("Invalid Agent API profiles path {}", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("Could not create Agent API profiles directory: {error}"))?;
+
+    let json = serde_json::to_vec(profiles)
+        .map_err(|error| format!("Could not serialize Agent API profiles: {error}"))?;
+    let temp_path = path.with_extension("json.tmp");
+    std::fs::write(&temp_path, json)
+        .map_err(|error| format!("Could not write Agent API profiles file: {error}"))?;
+    std::fs::rename(&temp_path, &path)
+        .map_err(|error| format!("Could not replace Agent API profiles file: {error}"))?;
+    Ok(path)
 }
 
 fn default_cli_agent_api_format(agent: CLIAgent) -> &'static str {
@@ -2287,6 +2339,19 @@ define_settings_group!(AISettings, settings: [
         description: "Local API profiles for third-party CLI agents.",
     }
 
+    // Local-only switch controlling whether Agent API profiles take over
+    // third-party CLI agents. When disabled, Warp leaves the agent's native
+    // API/model configuration untouched.
+    cli_agent_api_takeover_enabled: CLIAgentApiTakeoverEnabled {
+        type: bool,
+        default: false,
+        supported_platforms: SupportedPlatforms::DESKTOP,
+        sync_to_cloud: SyncToCloud::Never,
+        private: true,
+        toml_path: "agents.third_party.api_profiles.takeover_enabled",
+        description: "Controls whether Agent API profiles are injected into third-party CLI agents.",
+    }
+
     // Maps custom toolbar command regex patterns to specific CLI agents.
     // Keys are regex patterns matched against the full command string.
     // Values are serialized CLIAgent names (empty string = any agent).
@@ -2636,6 +2701,10 @@ impl AISettings {
         self.cli_agent_api_profiles.value().clone().normalized()
     }
 
+    pub fn is_cli_agent_api_takeover_enabled(&self) -> bool {
+        *self.cli_agent_api_takeover_enabled
+    }
+
     pub fn cli_agent_api_profiles_export_json(&self) -> Result<String, String> {
         serde_json::to_string_pretty(&self.cli_agent_api_profiles())
             .map_err(|error| format!("Could not serialize Agent API profiles: {error}"))
@@ -2756,6 +2825,10 @@ impl AISettings {
         agent: CLIAgent,
         environment_id: &str,
     ) -> HashMap<String, String> {
+        if !self.is_cli_agent_api_takeover_enabled() {
+            return HashMap::default();
+        }
+
         let Some(profile) = self.active_cli_agent_api_profile(agent, environment_id) else {
             return HashMap::default();
         };

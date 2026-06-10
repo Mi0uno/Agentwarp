@@ -104,7 +104,7 @@ pub enum AgentSessionStatus {
 }
 
 impl AgentSessionStatus {
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Self::Starting => "Starting",
             Self::InProgress => "Running",
@@ -679,6 +679,57 @@ impl AgentSessionsModel {
         self.session(session_id)?.agent_session_id.clone()
     }
 
+    pub fn sync_agent_session_id_for_terminal(
+        &mut self,
+        terminal_view_id: EntityId,
+        session_context: Option<&CLIAgentSessionContext>,
+        ctx: &mut ModelContext<Self>,
+    ) -> Option<String> {
+        let record_id = self
+            .records
+            .iter()
+            .find(|record| {
+                record.terminal_view_id == Some(terminal_view_id)
+                    || record.group_terminal_view_id == Some(terminal_view_id)
+            })?
+            .id
+            .clone();
+
+        let mut changed = false;
+        if let Some(session_id) = session_context
+            .and_then(|context| context.session_id.as_deref())
+            .map(str::trim)
+            .filter(|session_id| !session_id.is_empty())
+        {
+            let session_id = session_id.to_owned();
+            if let Some(record) = self.record_mut(&record_id) {
+                if record.agent_session_id.as_deref() != Some(session_id.as_str()) {
+                    record.agent_session_id = Some(session_id);
+                    record.updated_at_ms = now_ms();
+                    changed = true;
+                }
+            }
+        } else {
+            changed |= self.resolve_missing_agent_session_id_inner(&record_id);
+        }
+
+        if changed {
+            self.persist_and_emit(ctx);
+        }
+
+        self.session(&record_id)?.agent_session_id.clone()
+    }
+
+    pub fn latest_agent_session_id_for_project(
+        agent: CLIAgent,
+        project_path: &Path,
+    ) -> Option<String> {
+        match agent {
+            CLIAgent::Codex => latest_codex_session_id_for_project(project_path),
+            _ => None,
+        }
+    }
+
     fn resolve_missing_agent_session_id_inner(&mut self, session_id: &str) -> bool {
         let Some(record) = self.session(session_id) else {
             return false;
@@ -872,6 +923,87 @@ impl AgentSessionsModel {
         if self.records.len() != original_len {
             self.persist_and_emit(ctx);
         }
+    }
+
+    pub fn save_session_id_record(
+        &mut self,
+        record_id: Option<&str>,
+        agent: CLIAgent,
+        project_path: PathBuf,
+        agent_session_id: String,
+        title: String,
+        ctx: &mut ModelContext<Self>,
+    ) -> Result<String, String> {
+        let agent_session_id = agent_session_id.trim().to_owned();
+        if agent_session_id.is_empty() {
+            return Err("Session ID is required".to_owned());
+        }
+        if project_path.as_os_str().is_empty() {
+            return Err("Project path is required".to_owned());
+        }
+
+        let title = title.trim().to_owned();
+        let title = if title.is_empty() {
+            new_session_title(agent)
+        } else {
+            title
+        };
+        let now = now_ms();
+
+        if let Some(record_id) = record_id {
+            let Some(record) = self.record_mut(record_id) else {
+                return Err("Session record not found".to_owned());
+            };
+            record.agent = agent;
+            record.project_path = project_path;
+            record.title = title;
+            record.agent_session_id = Some(agent_session_id);
+            record.updated_at_ms = now;
+            self.persist_and_emit(ctx);
+            return Ok(record_id.to_owned());
+        }
+
+        if let Some(record) = self.records.iter_mut().find(|record| {
+            record.agent == agent
+                && record.environment_id == default_agent_session_environment_id()
+                && record.project_path == project_path
+                && record.agent_session_id.as_deref() == Some(agent_session_id.as_str())
+        }) {
+            record.title = title;
+            record.updated_at_ms = now;
+            let id = record.id.clone();
+            self.persist_and_emit(ctx);
+            return Ok(id);
+        }
+
+        let id = Uuid::new_v4().to_string();
+        self.records.push(AgentSessionRecord {
+            id: id.clone(),
+            environment_id: default_agent_session_environment_id(),
+            project_path,
+            agent,
+            title,
+            status: AgentSessionStatus::Unknown,
+            agent_session_id: Some(agent_session_id),
+            parent_session_id: None,
+            parent_agent_session_id: None,
+            updated_at_ms: now,
+            sort_order: now,
+            is_pinned: false,
+            archived_at_ms: None,
+            title_overridden: true,
+            auto_title_fingerprint: None,
+            auto_title_summarized_at_ms: None,
+            auto_title_source_chars: 0,
+            hosted_transcript: None,
+            hosted_transcript_updated_at_ms: None,
+            terminal_view_id: None,
+            group_terminal_view_id: None,
+        });
+        sort_sessions(&mut self.records);
+        self.trim_records();
+        self.persist_and_emit(ctx);
+        Ok(id)
     }
 
     pub fn disband_group(&mut self, parent_session_id: &str, ctx: &mut ModelContext<Self>) {
@@ -5252,10 +5384,10 @@ fn latest_codex_session_id_for_project_in_home(
 ) -> Option<String> {
     let sessions_dir = codex_home.join("sessions");
     let project_path = normalized_path_key(project_path);
-    let mut best: Option<(SystemTime, String)> = None;
+    let mut best: Option<(u8, SystemTime, String)> = None;
 
     visit_codex_session_files(&sessions_dir, &project_path, &mut best);
-    best.map(|(_, session_id)| session_id)
+    best.map(|(_, _, session_id)| session_id)
 }
 
 #[derive(Debug, Clone)]
@@ -5309,7 +5441,7 @@ fn codex_child_sessions_for_project_in_home(
 fn visit_codex_session_files(
     dir: &Path,
     project_path: &Path,
-    best: &mut Option<(SystemTime, String)>,
+    best: &mut Option<(u8, SystemTime, String)>,
 ) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
@@ -5329,9 +5461,11 @@ fn visit_codex_session_files(
         let Some(meta) = read_codex_session_meta(&path) else {
             continue;
         };
-        if normalized_path_key(&meta.cwd) != project_path {
+        let session_cwd = normalized_path_key(&meta.cwd);
+        let Some(match_score) = codex_session_project_match_score(&session_cwd, project_path)
+        else {
             continue;
-        }
+        };
 
         let modified_at = path
             .metadata()
@@ -5339,12 +5473,28 @@ fn visit_codex_session_files(
             .and_then(|metadata| metadata.modified().ok())
             .unwrap_or(SystemTime::UNIX_EPOCH);
 
-        let should_replace = best
-            .as_ref()
-            .is_none_or(|(best_modified_at, _)| modified_at > *best_modified_at);
+        let should_replace = best.as_ref().is_none_or(
+            |(best_match_score, best_modified_at, _)| {
+                match_score > *best_match_score
+                    || (match_score == *best_match_score && modified_at > *best_modified_at)
+            },
+        );
         if should_replace {
-            *best = Some((modified_at, meta.id));
+            *best = Some((match_score, modified_at, meta.id));
         }
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn codex_session_project_match_score(session_cwd: &Path, project_path: &Path) -> Option<u8> {
+    if session_cwd == project_path {
+        Some(3)
+    } else if project_path.starts_with(session_cwd) {
+        Some(2)
+    } else if session_cwd.starts_with(project_path) {
+        Some(1)
+    } else {
+        None
     }
 }
 
@@ -6127,6 +6277,32 @@ mod tests {
         assert_eq!(
             latest_codex_session_id_for_project_in_home(temp_dir.path(), &project_dir).as_deref(),
             Some("new-session")
+        );
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn finds_parent_codex_session_id_for_project_subdirectory() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let project_dir = temp_dir.path().join("project");
+        let nested_dir = project_dir.join("nested");
+        std::fs::create_dir_all(&nested_dir).unwrap();
+
+        let sessions_dir = temp_dir.path().join("sessions/2026/06/04");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        std::fs::write(
+            sessions_dir.join("parent.jsonl"),
+            format!(
+                r#"{{"type":"session_meta","payload":{{"id":"parent-session","cwd":{}}}}}"#,
+                serde_json::to_string(&project_dir).unwrap()
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            latest_codex_session_id_for_project_in_home(temp_dir.path(), &nested_dir).as_deref(),
+            Some("parent-session")
         );
     }
 

@@ -60,6 +60,7 @@ struct ModelMapping {
 struct ProxyState {
     client: reqwest::Client,
     profiles: Arc<Vec<ApiProfile>>,
+    profiles_file_path: Option<Arc<String>>,
     usage_log_path: Option<Arc<String>>,
 }
 
@@ -114,6 +115,35 @@ fn fallback_profiles_from_env() -> Vec<ApiProfile> {
         .into_iter()
         .filter(|profile| profile.enabled && !profile.base_url.trim().is_empty())
         .collect()
+}
+
+fn profiles_file_path_from_env() -> Option<Arc<String>> {
+    env::var("AGENTWARP_AGENT_API_FALLBACKS_FILE")
+        .ok()
+        .map(|path| path.trim().to_owned())
+        .filter(|path| !path.is_empty())
+        .map(Arc::new)
+}
+
+fn profiles_from_file(path: &str) -> Option<Vec<ApiProfile>> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|value| serde_json::from_str::<Vec<ApiProfile>>(&value).ok())
+        .map(|profiles| {
+            profiles
+                .into_iter()
+                .filter(|profile| profile.enabled && !profile.base_url.trim().is_empty())
+                .collect()
+        })
+}
+
+fn current_profiles(state: &ProxyState) -> Vec<ApiProfile> {
+    if let Some(path) = &state.profiles_file_path {
+        if let Some(profiles) = profiles_from_file(path.as_str()) {
+            return profiles;
+        }
+    }
+    (*state.profiles).clone()
 }
 
 fn usage_log_path_from_env() -> Option<Arc<String>> {
@@ -327,7 +357,10 @@ fn rewrite_request_body(profile: &ApiProfile, body: &Bytes) -> Bytes {
         .get("model")
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
-    let next_model = if current_model.trim().is_empty() {
+    let explicit_profile_model = profile.model.trim();
+    let next_model = if !explicit_profile_model.is_empty() {
+        Some(explicit_profile_model.to_owned())
+    } else if current_model.trim().is_empty() {
         preferred_model(profile)
     } else {
         mapped_model(profile, current_model)
@@ -386,9 +419,10 @@ async fn proxy_request(
         .path_and_query()
         .map(|value| value.as_str().to_owned())
         .unwrap_or_else(|| "/".to_owned());
-    let profile_count = state.profiles.len();
+    let profiles = current_profiles(&state);
+    let profile_count = profiles.len();
 
-    for (attempt_index, profile) in state.profiles.iter().enumerate() {
+    for (attempt_index, profile) in profiles.iter().enumerate() {
         let attempt = attempt_index + 1;
         let final_attempt = attempt == profile_count;
         let request_started = Instant::now();
@@ -614,6 +648,7 @@ async fn main() -> ExitCode {
     let state = ProxyState {
         client: reqwest::Client::new(),
         profiles: Arc::new(profiles),
+        profiles_file_path: profiles_file_path_from_env(),
         usage_log_path: usage_log_path_from_env(),
     };
     let router = Router::new().fallback(any(proxy_request)).with_state(state);

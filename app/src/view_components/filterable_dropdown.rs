@@ -47,6 +47,7 @@ pub struct FilterableDropdown<A: DropdownItemAction = ()> {
     disabled: bool,
     top_bar_mouse_state: MouseStateHandle,
     top_bar_max_width: f32,
+    expanded_top_bar_width: Option<f32>,
     main_axis_size: MainAxisSize,
     dropdown: ViewHandle<Menu<DropdownAction>>,
     filter_editor: ViewHandle<EditorView>,
@@ -59,6 +60,8 @@ pub struct FilterableDropdown<A: DropdownItemAction = ()> {
     style_override: Option<UiComponentStyles>,
     hovered_style_override: Option<UiComponentStyles>,
     menu_header_text_override: Option<MenuHeaderTextFormatter>,
+    top_bar_icon: Option<icons::Icon>,
+    top_bar_icon_only: bool,
     /// True when a pinned footer has been registered via `set_footer`.
     /// When true, the footer lives inside the `Menu`'s own `Dismiss` (via
     /// `Menu::set_pinned_footer_builder`), so clicks on it never trigger the
@@ -121,6 +124,7 @@ where
             self_handle: ctx.handle(),
             top_bar_mouse_state: Default::default(),
             top_bar_max_width: TOP_MENU_BAR_MAX_WIDTH,
+            expanded_top_bar_width: None,
             main_axis_size: MainAxisSize::Max,
             selected_item: None,
             items: Default::default(),
@@ -130,6 +134,8 @@ where
             style_override: None,
             hovered_style_override: None,
             menu_header_text_override: None,
+            top_bar_icon: None,
+            top_bar_icon_only: false,
             has_pinned_footer: false,
             menu_width: None,
             vertical_margin: DROPDOWN_PADDING,
@@ -152,6 +158,11 @@ where
     /// identically.
     pub fn set_top_bar_height(&mut self, height: f32, ctx: &mut ViewContext<Self>) {
         self.top_bar_height = height;
+        ctx.notify();
+    }
+
+    pub fn set_expanded_top_bar_width(&mut self, width: f32, ctx: &mut ViewContext<Self>) {
+        self.expanded_top_bar_width = Some(width);
         ctx.notify();
     }
 
@@ -199,8 +210,22 @@ where
         self.style_override = Some(style);
     }
 
+    pub fn set_hovered_style(&mut self, style: UiComponentStyles) {
+        self.hovered_style_override = Some(style);
+    }
+
     pub fn set_button_variant(&mut self, button_variant: ButtonVariant) {
         self.button_variant = button_variant;
+    }
+
+    pub fn set_top_bar_icon(&mut self, icon: icons::Icon, ctx: &mut ViewContext<Self>) {
+        self.top_bar_icon = Some(icon);
+        ctx.notify();
+    }
+
+    pub fn set_top_bar_icon_only(&mut self, icon_only: bool, ctx: &mut ViewContext<Self>) {
+        self.top_bar_icon_only = icon_only;
+        ctx.notify();
     }
 
     pub fn set_orientation(&mut self, orientation: FilterableDropdownOrientation) {
@@ -306,6 +331,11 @@ where
             dropdown.set_selected_by_action(&action, ctx);
         });
         self.selected_item = self.selected_item_in_dropdown(ctx);
+        ctx.notify();
+    }
+
+    pub fn set_selected_to_none(&mut self, ctx: &mut ViewContext<Self>) {
+        self.selected_item = None;
         ctx.notify();
     }
 
@@ -443,21 +473,31 @@ where
             },
         };
 
+        let icon = self
+            .top_bar_icon
+            .unwrap_or(icons::Icon::ChevronDown)
+            .to_warpui_icon(appearance.theme().active_ui_text_color());
         let mut top_bar = appearance
             .ui_builder()
-            .button(self.button_variant, self.top_bar_mouse_state.clone())
-            .with_text_and_icon_label(
+            .button(self.button_variant, self.top_bar_mouse_state.clone());
+
+        top_bar = if self.top_bar_icon_only {
+            top_bar.with_icon_label(icon)
+        } else {
+            top_bar.with_text_and_icon_label(
                 TextAndIcon::new(
                     TextAndIconAlignment::TextFirst,
                     selected_item_text,
-                    icons::Icon::ChevronDown
-                        .to_warpui_icon(appearance.theme().active_ui_text_color()),
+                    icon,
                     self.main_axis_size,
                     MainAxisAlignment::SpaceBetween,
                     vec2f(15., 15.),
                 )
                 .with_inner_padding(10.),
             )
+        };
+
+        top_bar = top_bar
             .with_style(self.style_override.unwrap_or(UiComponentStyles {
                 padding: Some(Coords {
                     top: 5.,
@@ -557,15 +597,20 @@ where
         } else {
             self.render_closed_top_bar(appearance)
         };
+        let top_bar_width = self
+            .is_expanded
+            .then_some(self.expanded_top_bar_width)
+            .flatten();
+        let top_bar_max_width = top_bar_width.unwrap_or(self.top_bar_max_width);
+        let mut top_bar_box = ConstrainedBox::new(top_bar_element)
+            .with_max_width(top_bar_max_width)
+            .with_height(self.top_bar_height);
+        if let Some(width) = top_bar_width {
+            top_bar_box = top_bar_box.with_width(width);
+        }
 
         SavePosition::new(
-            Container::new(
-                ConstrainedBox::new(top_bar_element)
-                    .with_max_width(self.top_bar_max_width)
-                    .with_height(self.top_bar_height)
-                    .finish(),
-            )
-            .finish(),
+            Container::new(top_bar_box.finish()).finish(),
             &self.top_bar_label(),
         )
         .finish()

@@ -15,7 +15,7 @@ use crate::terminal::cli_agent_sessions::{CLIAgentInputEntrypoint, CLIAgentSessi
 use crate::terminal::shared_session::{
     SharedSessionActionSource, SharedSessionScrollbackType, SharedSessionSource,
 };
-use crate::util::image::{infer_mime_type, MAX_IMAGE_SIZE_BYTES_FOR_CLI_AGENT, MIME_SNIFF_BYTES};
+use crate::util::image::{MAX_IMAGE_SIZE_BYTES_FOR_CLI_AGENT, MIME_SNIFF_BYTES, infer_mime_type};
 mod warpify_footer;
 
 use std::path::Path;
@@ -30,18 +30,18 @@ use warp_core::features::FeatureFlag;
 use warp_core::settings::Setting;
 use warp_core::ui::appearance::Appearance;
 use warp_core::ui::color::contrast::{
-    high_enough_contrast, pick_best_foreground_color, MinimumAllowedContrast,
+    MinimumAllowedContrast, high_enough_contrast, pick_best_foreground_color,
 };
-use warp_core::ui::theme::color::internal_colors;
 use warp_core::ui::theme::Fill as ThemeFill;
+use warp_core::ui::theme::color::internal_colors;
 use warp_core::{report_error, send_telemetry_from_ctx};
 use warp_terminal::model::escape_sequences::{BRACKETED_PASTE_END, BRACKETED_PASTE_START};
 use warpify_footer::{WarpifyFooterView, WarpifyFooterViewEvent};
+use warpui::r#async::Timer;
 use warpui::elements::{
     ChildView, Container, CrossAxisAlignment, Empty, Expanded, Flex, MainAxisSize, ParentElement,
 };
 use warpui::keymap::Keystroke;
-use warpui::r#async::Timer;
 use warpui::{
     AppContext, Element, Entity, EntityId, ModelHandle, SingletonEntity, TypedActionView, View,
     ViewContext, ViewHandle,
@@ -59,17 +59,17 @@ use crate::server::telemetry::{CLIAgentType, CLISubagentControlState, TelemetryE
 use crate::settings::{
     AISettings, AISettingsChangedEvent, CompiledCommandsForCodingAgentToolbar, InputModeSettings,
 };
+pub use crate::terminal::CLIAgent;
+use crate::terminal::TerminalModel;
 use crate::terminal::cli_agent_sessions::CLIAgentRichInputCloseReason;
 use crate::terminal::model_events::{ModelEvent, ModelEventDispatcher};
 use crate::terminal::view::block_banner::WarpificationMode;
-pub use crate::terminal::CLIAgent;
-use crate::terminal::TerminalModel;
 use crate::ui_components::blended_colors;
 use crate::ui_components::icons::Icon;
 use crate::view_components::action_button::{
     ActionButton, ActionButtonTheme, ButtonSize, KeystrokeSource, TooltipAlignment,
 };
-use crate::workspace::view::ssh_remote::{upload_local_files_to_remote_temp, SshRemoteModel};
+use crate::workspace::view::ssh_remote::{SshRemoteModel, upload_local_files_to_remote_temp};
 
 /// Small delay inserted between separate PTY writes to CLI agents.
 /// (Used both for the mode-switch prefix split and for the `DelayedEnter`
@@ -225,6 +225,9 @@ impl TerminalView {
                 // forward the write request to the sharer instead of only
                 // emitting a local PTY write event.
                 self.write_user_bytes_to_pty(text.as_bytes().to_vec(), ctx);
+            }
+            UseAgentToolbarEvent::RestartCliAgentSession => {
+                ctx.emit(TerminalViewEvent::RestartCliAgentSession);
             }
             UseAgentToolbarEvent::InsertIntoRichInput(text) => {
                 self.input.update(ctx, |input, ctx| {
@@ -1349,8 +1352,11 @@ impl UseAgentToolbar {
     ) {
         // Forward CLI-relevant events from the shared agent input footer.
         match event {
-            AgentInputFooterEvent::WriteToPty(text) => {
-                ctx.emit(UseAgentToolbarEvent::WriteToPty(text.clone()));
+            AgentInputFooterEvent::WriteToPty(_)
+            | AgentInputFooterEvent::WriteAgentControlSequence(_)
+            | AgentInputFooterEvent::RestartCliAgentSession => {
+                // Routed through Input -> TerminalView so the shared footer does not duplicate
+                // PTY writes or restart requests when both subscribers are active.
             }
             AgentInputFooterEvent::InsertIntoCLIRichInput(text) => {
                 ctx.emit(UseAgentToolbarEvent::InsertIntoRichInput(text.clone()));
@@ -1468,6 +1474,8 @@ pub enum UseAgentToolbarEvent {
     Dismiss,
     /// Write text to the PTY (from CLI agent view).
     WriteToPty(String),
+    /// Restart the current CLI agent process using the latest runtime settings.
+    RestartCliAgentSession,
     /// Insert text into CLI agent rich input.
     InsertIntoRichInput(String),
     UploadLocalFilesToSshRemote(Vec<String>),
@@ -1599,8 +1607,10 @@ impl TypedActionView for UseAgentToolbar {
                     .should_render_use_agent_footer_for_user_commands
                     .set_value(false, ctx)
                 {
-                    report_error!(anyhow!("{e:?}")
-                        .context("Failed to set `ShouldRenderUseAgentToolbarForUserCommands`"));
+                    report_error!(
+                        anyhow!("{e:?}")
+                            .context("Failed to set `ShouldRenderUseAgentToolbarForUserCommands`")
+                    );
                 }
             });
         }
