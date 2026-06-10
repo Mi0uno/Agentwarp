@@ -122,19 +122,42 @@ jobs:
         run: |
           choco install innosetup -y --no-progress
           "C:\Program Files (x86)\Inno Setup 6" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          Get-ChildItem "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" | Select-Object -ExpandProperty FullName
 
       - name: Verify OSS icon
         shell: pwsh
         run: |
           if (-not (Test-Path "app\channels\oss\icon\no-padding\icon.ico")) {
-            throw "Missing OSS Windows icon"
+              throw "Missing OSS Windows icon"
           }
 
       - name: Build installer
-        shell: bash
-        run: script/bundle --channel "$RELEASE_CHANNEL" --release-tag "$RELEASE_TAG" --arch "${{ matrix.arch }}"
+        shell: pwsh
+        run: |
+          $env:PATH += ";C:\Program Files (x86)\Inno Setup 6"
+          $log = "windows-${{ matrix.arch }}-bundle.log"
+          & .\script\windows\bundle.ps1 `
+            -CHANNEL "$env:RELEASE_CHANNEL" `
+            -RELEASE_TAG "$env:RELEASE_TAG" `
+            -ARCH "${{ matrix.arch }}" 2>&1 | Tee-Object -FilePath $log
+          $status = $LASTEXITCODE
+
+          if ($status -ne 0) {
+            $tail = Get-Content $log -Tail 80 | Out-String
+            $escaped = $tail.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Output "::error title=Windows ${{ matrix.arch }} bundle failed::$escaped"
+            exit $status
+          }
         env:
           RELEASE_TAG: ${{ needs.create_release.outputs.release_tag }}
+
+      - name: Upload Windows build log
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: windows-bundle-log-${{ matrix.arch }}
+          path: windows-${{ matrix.arch }}-bundle.log
+          if-no-files-found: ignore
 
       - name: Upload installer
         uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631 # v2.2.2
