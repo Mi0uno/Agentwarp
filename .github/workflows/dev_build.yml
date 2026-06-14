@@ -1,13 +1,14 @@
 name: Dev Build (Linux x64 GUI)
 
-# Local dev helper: build target/release/warp-oss on a beefy Linux runner
-# and upload it as an artifact that developers download with
+# Local dev helper: build target/release/warp-oss on a GitHub-hosted Linux
+# runner and upload it as an artifact that developers download with
 # `gh run download` and run directly. No cross-platform builds, no installer
 # packaging, no release publishing.
 #
-# This workflow does NOT touch beta_release.yml / ci.yml; it is intentionally
-# independent so that pushing a feature branch never pollutes the master
-# beta pipeline.
+# This workflow is intentionally independent of beta_release.yml / ci.yml /
+# the shared .github/actions/prepare_environment composite — those reuse
+# private action SHAs from warpdotdev/warp-internal that are not resolvable
+# from forks (Mi0uno/Agentwarp). We pin only public actions here.
 
 on:
   push:
@@ -27,34 +28,55 @@ permissions:
 
 concurrency:
   # When a developer pushes new commits to the same branch, cancel any
-  # in-flight run and start fresh — keeps the actions minutes bill low
-  # and avoids the user downloading a stale artifact.
+  # in-flight run and start fresh — keeps Actions minutes low and avoids
+  # the user downloading a stale artifact.
   group: dev-build-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   linux_gui:
     name: Build Linux x64 warp-oss
-    runs-on: ubuntu-latest  # GitHub-hosted public runner; warp-internal's `ubuntu-latest-large` is not available to forks
+    runs-on: ubuntu-latest  # 4 cores / 16 GiB public runner
     timeout-minutes: 90
     steps:
       - name: Checkout sources
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ffe5f5447ce83dd # v6.0.2
-
-      # Reuse the shared environment bootstrap so the cache key, LFS pull,
-      # and toolchain install all match what beta_release.yml and ci.yml do.
-      - uses: ./.github/actions/prepare_environment
+        uses: actions/checkout@v4
         with:
-          target_os: linux
-          is_self_hosted: false
+          lfs: true
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      # Cache ~/.cargo and target/ between runs, keyed on Cargo.lock.
+      # Task branches read the master cache but do not write back
+      # (save-if: master) to avoid polluting the shared cache.
+      - name: Cache cargo registry, index, and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: Verify OSS icon
         shell: bash
         run: test -f app/channels/oss/icon/no-padding/icon.ico
 
+      - name: Show environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Runner: $(uname -a)"
+          echo "nproc: $(nproc)"
+          echo "free -h:"
+          free -h
+          echo "df -h /:"
+          df -h /
+          echo "rustc: $(rustc --version)"
+
       - name: Build warp-oss (release)
-        # Public `ubuntu-latest` runner is 4 cores / 16 GiB. Keep -j explicit
-        # so we don't get throttled by GitHub's per-job CPU caps.
+        # Public `ubuntu-latest` runner is 4 cores / 16 GiB. Cap at -j 4.
         shell: bash
         run: |
           set -euo pipefail
@@ -66,9 +88,9 @@ jobs:
           set -euo pipefail
           test -x "target/release/${WARP_BIN_NAME}"
           file "target/release/${WARP_BIN_NAME}"
-          "target/release/${WARP_BIN_NAME}" --help || true
+          "./target/release/${WARP_BIN_NAME}" --version || true
 
-      - name: Bundle artifact (warp-oss + .cargo-linked .so hint)
+      - name: Bundle artifact (warp-oss + build markers)
         shell: bash
         run: |
           set -euo pipefail
@@ -78,11 +100,13 @@ jobs:
           # artifact back to a git ref without guessing.
           printf '%s\n' "${{ github.sha }}" > dist/BUILD_SHA
           printf '%s\n' "${{ github.ref_name }}" > dist/BUILD_REF
+          printf '%s\n' "${{ github.run_id }}" > dist/BUILD_RUN_ID
+          printf '%s\n' "${{ github.run_number }}" > dist/BUILD_RUN_NUMBER
           tar -C dist -czf "warp-oss-linux-x64.tar.gz" .
           ls -lh "warp-oss-linux-x64.tar.gz"
 
       - name: Upload Linux GUI artifact
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        uses: actions/upload-artifact@v4
         with:
           name: warp-oss-linux-x64
           path: warp-oss-linux-x64.tar.gz
