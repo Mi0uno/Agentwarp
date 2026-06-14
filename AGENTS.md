@@ -29,10 +29,10 @@
 ## 跨平台构建与缓存要求
 
 - **本地不构建**：本机不再跑 `cargo build` / `cargo run` / `cargo test --no-run` / `cargo install`，详见下方"本地编译全面交给 GitHub Actions"小节。所有编译产物一律来自 GitHub Actions。
-- **Linux GUI 编译入口**：任务分支 push 后由 `.github/workflows/dev_build.yml` 自动跑（`ubuntu-latest-large`，16C/64G），产出 `warp-oss-linux-x64` artifact，本地 `gh run download` 拉取。
+- **Linux 编译入口**：任务分支 push 后由 `.github/workflows/dev_build.yml` 自动跑（`ubuntu-latest`，4 核 16G 公共 runner），产出 `warp-oss-linux-x64` artifact，本地 `gh run download` 拉取。
 - **Windows 编译入口**：`.github/workflows/beta_release.yml` 的 `windows_installer` job（x64 + arm64 矩阵）。**每个涉及平台相关改动的功能点合并回 `master` 之前**必须至少触发一次 Windows 编译验证：push 一个临时 `v*-beta*` 标签或在 Actions 页面用 `workflow_dispatch` 手动运行 `beta_release.yml`，等待两个 `windows_installer` job 全部成功，再继续合并流程；不得仅凭 Linux artifact 合并涉及平台相关改动的功能点。
 - **CI 编译入口**：`.github/workflows/ci.yml`（PR 触发）和 `.github/workflows/populate_build_cache.yml`（master 缓存预热），跟本地开发无关，由 CI 自动跑。
-- **编译参数**：本地不适用；CI / Actions 端由 `ubuntu-latest-large` / `windows-latest-large` 默认并行 16 核，**不要**在 workflow 里手动加 `-j` 限制。
+- **编译参数**：本地不适用；Actions 端 `dev_build.yml` 显式写 `-j 4`（公共 runner 4 核限制），CI 端 `ci.yml` 用 `ubuntu-latest-large` / `windows-latest-large` 默认并行。
 
 ## 本地编译全面交给 GitHub Actions（硬性要求）
 
@@ -49,7 +49,7 @@
 ### 为什么要这样做
 
 - 本地编译 5-15 分钟才拿到一个跟 CI 等价的产物（同一份 `Cargo.lock` 哈希走 `Swatinem/rust-cache` 缓存），避免本地每次 `cargo clean` 之后再全量编一遍。
-- 大机器 `ubuntu-latest-large` 默认并行 16 个 rustc，编译时间通常是本机 4 核 `-j 4` 的 1/3 ~ 1/5，且不会卡死笔记本。
+- Actions 公共 `ubuntu-latest` runner 4C/16G、`-j 4`，编译时间通常是本机 4 核的 1/3 ~ 1/5，且不会卡死笔记本。
 - Actions 的 `Swatinem/rust-cache` 按 `Cargo.lock` + target 哈希分桶，只要不手动改 `Cargo.toml` 大版本，第一次跑会冷编译、之后命中 master 缓存。任务分支的缓存策略：只读 master 缓存（不覆写），不会污染 master cache storage。
 
 ### 任务分支 vs 主分支的纪律
@@ -78,12 +78,13 @@
 
 - **触发时机**：每次 push 到非 `master` 分支自动跑；用户也可以在 Actions 页面手动 `Run workflow`。
 - **不触发**的情况：push 到 `master`（master 走 `ci.yml` + `beta_release.yml`）、纯文档/`.toml`/`.yml` 改动（默认仍会跑，但只产空 artifact 视情况而定——如果纯文档改动，CI 跑通即可，**不必**下载 artifact）。
-- **Runner**：`ubuntu-latest-large`（GitHub 托管、16C/64G），**不再使用本机编译**。
-- **缓存**：复用 `.github/actions/prepare_environment` 里的 `Swatinem/rust-cache`，key 沿用 `linux`，**`save-if: github.ref == 'refs/heads/master'`**——任务分支只读 master 缓存、不写回，避免污染 master cache storage。
+- **Runner**：`ubuntu-latest`（GitHub 公共 4 核 16G runner；`ubuntu-latest-large` 是 warp-internal 自托管标签，**fork 仓库无权使用**）。
+- **缓存**：直接用 `Swatinem/rust-cache@v2`，key 默认（按 `Cargo.lock` + target 哈希），**`save-if: github.ref == 'refs/heads/master'`**——任务分支只读 master 缓存、不写回，避免污染 master cache storage。
 - **产物**：
-  - 单个 artifact：`warp-oss-linux-x64`（tar.gz，内含 `warp-oss` 二进制 + `BUILD_SHA` + `BUILD_REF` 两个标记文件，便于把下载下来的产物对应回 git 提交）。
+  - 单个 artifact：`warp-oss-linux-x64`（tar.gz，约 200 MB 压缩 / 700 MB 解压，内含 `warp-oss` 二进制 + `BUILD_SHA` + `BUILD_REF` + `BUILD_RUN_ID` + `BUILD_RUN_NUMBER` 四个标记文件）。
   - 保留期：14 天。
   - 不做 deb / rpm / AppImage 打包，保持"0 打包"——本地验证只需要一个能直接执行的二进制。
+  - **实际产物是 `Oz` CLI**（"orchestration platform for cloud agents"），不是 Warp 终端 GUI；带 `debug_info`、未 strip；首次冷编译 25-30 分钟，命中缓存后 5-8 分钟。
 - **何时需要下载 artifact**：
   - `.rs`、`.toml` 改动且需要看效果。
   - 涉及 UI、shader、字体、icon、warpui、CLI 子命令、agent 行为等任何需要肉眼验证的功能。
@@ -91,6 +92,27 @@
 - **何时不需要下载 artifact**：
   - 纯 `.md`、`.yml`、`.json`、注释改动。
   - 改动只影响 `cargo fmt` / `cargo clippy` / 纯逻辑的 Rust 模块——但仍需要 CI 跑通作为证据。
+
+### dev_build.yml 的 fork 特有 fix（必须保留，缺一不可）
+
+以下 4 个 fix 是 fork 仓库（`Mi0uno/Agentwarp`）相对上游 `beta_release.yml` / `ci.yml` **必须额外补上**的；不要照搬上游写法、不要简化掉：
+
+1. **Runner 用 `ubuntu-latest`，不要用 `ubuntu-latest-large`。** 后者是 `warpdotdev/warp-internal` 自托管 runner 标签，fork 无权使用，run 会无限 `queued`。
+2. **只能 pin 公开 action，不能复用 `prepare_environment` composite action。** 上游 `actions/checkout@de0fac2...`、`Swatinem/rust-cache@e18b4977...` 等都是内部 SHA，fork 解析不到（`Unable to resolve action ... unable to find version <sha>`）。dev_build.yml 里只用 `actions/checkout@v4`、`actions/upload-artifact@v4`、`dtolnay/rust-toolchain@stable`、`Swatinem/rust-cache@v2` 这种 tag-pin 的公开 action。
+3. **apt 同时装 `protobuf-compiler` 和 `libprotobuf-dev` 两个包。** Ubuntu 把 `protoc` 二进制和 WKT（well-known types）拆成两个包：只装 `protobuf-compiler` 时 `/usr/include/google/protobuf/descriptor.proto` 不存在，导致 `warp_multi_agent_api`（私有 git 依赖）的 `prost-build` 失败。完整依赖列表：`pkg-config build-essential protobuf-compiler libprotobuf-dev libssl-dev libasound2-dev libfreetype-dev libfontconfig1-dev libgit2-dev libclang-dev cmake`。
+4. **必须 wrap `protoc` 强制加 `-I /usr/include`。** 即使装了 `libprotobuf-dev`，私有 `warp_multi_agent_api` 的 build script 调 `prost-build` 时不会把 `/usr/include` 传给 `protoc`，依然 `google/protobuf/descriptor.proto: File not found`。wrapper 写法：
+
+   ```bash
+   sudo mv /usr/bin/protoc /usr/bin/protoc.real
+   sudo tee /usr/local/bin/protoc >/dev/null <<'EOF'
+   #!/usr/bin/env bash
+   exec /usr/bin/protoc.real -I /usr/include "$@"
+   EOF
+   sudo chmod +x /usr/local/bin/protoc
+   sudo ln -sf /usr/local/bin/protoc /usr/bin/protoc
+   ```
+
+   写入后必须用 `protoc --proto_path=/tmp --descriptor_set_out=/dev/null /tmp/empty.proto` 跑一次 sanity check，失败立即 fail fast。
 
 ### 本地拉取 artifact 的标准命令
 
@@ -112,7 +134,8 @@ gh run download \
 # 3. 解压并运行
 tar -xzf .dev-build/warp-oss-linux-x64.tar.gz -C .dev-build
 ./.dev-build/warp-oss --version       # 快速 sanity check
-./.dev-build/warp-oss                  # 启动 GUI（X11 / XWayland）
+./.dev-build/warp-oss --help          # 列出所有子命令
+./.dev-build/warp-oss <subcommand>    # 运行具体子命令
 
 # 4. 验证完按需清理
 rm -rf .dev-build
@@ -124,7 +147,8 @@ rm -rf .dev-build
 - `warp-oss` 是动态链接少数系统库的二进制，直接 `./.dev-build/warp-oss` 即可；少数情况下缺 `.so`，用 `ldd .dev-build/warp-oss` 查看并按需补包。
 - 如果下载失败，先 `gh auth status` 确认登录的是 fork 仓库（`Mi0uno/Agentwarp`）的 GitHub 账号；fork 仓库的 workflow artifact 默认只有 push 过该分支的成员能下载。
 - 也可以用 GitHub Web UI 打开 `Actions → Dev Build (Linux x64 GUI) → 选 run → 底部 Artifacts → 下载**整个 tar.gz**`，但 `gh` CLI 更适合反复迭代。
-- 任务分支 push 触发 workflow 的**冷启动耗时**（Actions queue + checkout + LFS pull）通常 1-3 分钟；首次冷编译 5-15 分钟；命中缓存后 2-5 分钟出 artifact。
+- 任务分支 push 触发 workflow 的**冷启动耗时**（Actions queue + checkout + LFS pull）通常 1-3 分钟；首次冷编译 25-30 分钟；命中缓存后 5-8 分钟出 artifact。
+- **BUILD_SHA 注意**：当 workflow 被 `pull_request` 触发时，`github.sha` 是 PR 的临时 merge commit（如 `667cfad5...`），`github.ref_name` 是 `<pr-number>/merge`，**不等于**任务分支的 HEAD SHA。要让 BUILD_SHA 等于分支 HEAD，需通过 push 触发（或在 `workflow_dispatch` 里指定 ref）。交付汇报里要同时记录**任务分支 HEAD SHA**和 **artifact 的 BUILD_SHA**——两者不同时必须解释（典型原因：PR merge commit）。
 
 ### 本地仍然允许的轻量检查
 
@@ -166,7 +190,7 @@ rm -rf .dev-build
 ### 清理与缓存策略
 
 - **本地**不再需要 `cargo clean`——因为本地不再编译，`target/` 永远不应该在本地出现。如果在 `target/` 看到任何文件，说明上一轮被 stash 的工作树或 rust-analyzer 残留，立即 `rm -rf target` 清理。
-- **Actions 端**：`Swatinem/rust-cache` 自动管理（key = `linux`），不需要手动干预。任务分支只读不写。
+- **Actions 端**：`Swatinem/rust-cache` 自动管理（key 默认按 `Cargo.lock` + target 哈希），不需要手动干预。任务分支只读不写。
 - **开发者下载的 artifact**：每次验证完用 `rm -rf .dev-build` 清理，不占用磁盘。
 
 ### 交付汇报要求
@@ -215,5 +239,6 @@ rm -rf .dev-build
 - 验证结束后已关闭 GUI，并确认无 `warp-oss` 残留进程。
 - 初始化验证后 `git status --short` 为空；`target` 构建目录约 `17G`。
 - 2026-06-14 复盘：再跑一次 `cargo check`（默认 -j16）把机器卡到无响应，意识到本机 16C/15G/93% 磁盘余量无法承受 cargo 全量并行；补"本地编译资源阈值"小节强制 `-j 2` + `cargo clean`。
-- 2026-06-14 复盘：用户进一步要求**所有本地编译交给 GitHub Actions**；本机完全不再 `cargo build`/`cargo run`，改由 `.github/workflows/dev_build.yml` 跑 `ubuntu-latest-large` 产出 `warp-oss-linux-x64` artifact，本地 `gh run download` 拉取直接运行；同步重写"本地编译"章节为"本地编译全面交给 GitHub Actions"，新增任务分支 vs 主分支纪律、`dev_build.yml` 触发/产物规范、本地 `gh` 拉取命令模板、清理策略与交付汇报模板。
+- 2026-06-14 复盘：用户进一步要求**所有本地编译交给 GitHub Actions**；本机完全不再 `cargo build`/`cargo run`，改由 `.github/workflows/dev_build.yml` 跑 `ubuntu-latest` 公共 runner（fork 仓库不能用 `ubuntu-latest-large`）产出 `warp-oss-linux-x64` artifact，本地 `gh run download` 拉取直接运行；同步重写"本地编译"章节为"本地编译全面交给 GitHub Actions"，新增任务分支 vs 主分支纪律、`dev_build.yml` 触发/产物规范、本地 `gh` 拉取命令模板、清理策略与交付汇报模板。
+- 2026-06-14 复盘：首次跑通端到端。`dev_build.yml` 在 fork 仓库上必须做 4 处 fix 才能跑通（runner 用 `ubuntu-latest`、只用公开 action、apt 同时装 `protobuf-compiler` + `libprotobuf-dev`、wrap `protoc` 强制 `-I /usr/include`）。第一次成功 run = `27501566674`、head `3559415a`、耗时 28 分钟、产物 696 MB。实际产物是 `Oz` CLI（"orchestration platform for cloud agents"），不是 Warp 终端 GUI；带 debug_info、未 strip；首次冷编译 25-30 分钟、命中缓存后 5-8 分钟。详细踩坑记录见 `[[agentwarp-dev-build-fork-fixes]]` 仓库内 .claude memory。
 - 不要在仓库文档、提交记录或脚本中记录 sudo 密码、token、SSH key 等敏感信息。
