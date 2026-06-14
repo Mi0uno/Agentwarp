@@ -23,10 +23,10 @@ use warp_core::user_preferences::GetUserPreferences as _;
 use warp_terminal::shell::ShellType;
 use warpui::elements::{
     Align, Border, ChildAnchor, ClippedScrollStateHandle, ClippedScrollable, ConstrainedBox,
-    Container, CornerRadius, CrossAxisAlignment, DispatchEventResult, DropShadow, Element, Empty,
-    EventHandler, Fill as ElementFill, Flex, Hoverable, MainAxisAlignment, MainAxisSize,
-    MouseStateHandle, OffsetPositioning, ParentAnchor, ParentElement, ParentOffsetBounds, Radius,
-    ScrollbarWidth, Shrinkable, Stack, Text,
+    Container, CornerRadius, CrossAxisAlignment, DropShadow, Element, Empty, Fill as ElementFill,
+    Flex, Hoverable, MainAxisAlignment, MainAxisSize, MouseStateHandle, OffsetPositioning,
+    ParentAnchor, ParentElement, ParentOffsetBounds, Radius, ScrollbarWidth, Shrinkable, Stack,
+    Text,
 };
 use warpui::fonts::{Properties, Weight};
 use warpui::platform::Cursor;
@@ -2672,9 +2672,6 @@ pub enum SshRemoteViewAction {
     ConfirmPendingDelete,
     ConnectHost(String),
     DisconnectHost(String),
-    StartWizardDrag(Vector2F),
-    DragWizard(Vector2F),
-    EndWizardDrag,
 }
 
 #[derive(Clone, Debug)]
@@ -3326,7 +3323,6 @@ struct SshRemoteMouseStates {
     next_button: MouseStateHandle,
     back_button: MouseStateHandle,
     save_button: MouseStateHandle,
-    wizard_drag_header: MouseStateHandle,
     row_states: RefCell<HashMap<String, MouseStateHandle>>,
     connect_states: RefCell<HashMap<String, MouseStateHandle>>,
     edit_states: RefCell<HashMap<String, MouseStateHandle>>,
@@ -3360,9 +3356,6 @@ pub struct SshRemoteView {
     pending_delete_confirmation: Option<PendingDeleteHost>,
     scroll_state: ClippedScrollStateHandle,
     wizard_body_scroll_state: ClippedScrollStateHandle,
-    wizard_offset: Vector2F,
-    wizard_drag_start_origin: Option<Vector2F>,
-    wizard_drag_start_offset: Vector2F,
     mouse_states: SshRemoteMouseStates,
 }
 
@@ -3424,9 +3417,6 @@ impl SshRemoteView {
             pending_delete_confirmation: None,
             scroll_state: ClippedScrollStateHandle::default(),
             wizard_body_scroll_state: ClippedScrollStateHandle::default(),
-            wizard_offset: Vector2F::zero(),
-            wizard_drag_start_origin: None,
-            wizard_drag_start_offset: Vector2F::zero(),
             mouse_states: SshRemoteMouseStates::default(),
         };
 
@@ -3439,18 +3429,11 @@ impl SshRemoteView {
 
     pub fn focus_first_field(&mut self, _ctx: &mut ViewContext<Self>) {}
 
-    fn reset_wizard_position(&mut self) {
-        self.wizard_offset = Vector2F::zero();
-        self.wizard_drag_start_origin = None;
-        self.wizard_drag_start_offset = Vector2F::zero();
-    }
-
     fn show_add_wizard(&mut self, ctx: &mut ViewContext<Self>) {
         self.pending_delete_confirmation = None;
         self.wizard_mode = Some(FormMode::Add);
         self.wizard_step = WizardStep::Method;
         self.wizard_error = None;
-        self.reset_wizard_position();
         self.connection_method = SshRemoteConnectionMethod::Manual;
         self.auth_method = SshRemoteAuthMethod::PasswordPrompt;
         self.install_strategy = SshRemoteAgentInstallStrategy::RemoteDownload;
@@ -3469,7 +3452,6 @@ impl SshRemoteView {
         self.wizard_mode = Some(FormMode::Edit(host_id.to_owned()));
         self.wizard_step = WizardStep::Config;
         self.wizard_error = None;
-        self.reset_wizard_position();
         self.connection_method = host.connection_method;
         self.auth_method = host.auth_method;
         self.install_strategy = match &host.agent_install_strategy {
@@ -3486,40 +3468,7 @@ impl SshRemoteView {
     fn close_wizard(&mut self, ctx: &mut ViewContext<Self>) {
         self.wizard_mode = None;
         self.wizard_error = None;
-        self.wizard_drag_start_origin = None;
         ctx.notify();
-    }
-
-    fn start_wizard_drag(&mut self, origin: Vector2F) {
-        self.wizard_drag_start_origin = Some(origin);
-        self.wizard_drag_start_offset = self.wizard_offset;
-    }
-
-    fn drag_wizard(&mut self, origin: Vector2F, ctx: &mut ViewContext<Self>) {
-        let Some(start_origin) = self.wizard_drag_start_origin else {
-            self.start_wizard_drag(origin);
-            return;
-        };
-        self.wizard_offset = self.wizard_drag_start_offset + (origin - start_origin);
-        ctx.notify();
-    }
-
-    fn end_wizard_drag(&mut self) {
-        self.wizard_drag_start_origin = None;
-    }
-
-    fn wizard_window_centering_offset(&self, app: &AppContext) -> Vector2F {
-        let Some(window_bounds) = app.window_bounds(&self.window_id) else {
-            return Vector2F::zero();
-        };
-        let Some(panel_bounds) = app.element_position_by_id_at_last_frame(
-            self.window_id,
-            super::SSH_REMOTE_PANEL_POSITION_ID,
-        ) else {
-            return Vector2F::zero();
-        };
-
-        vec2f(window_bounds.width() / 2. - panel_bounds.center().x(), 0.)
     }
 
     fn previous_step(&mut self, ctx: &mut ViewContext<Self>) {
@@ -4739,61 +4688,26 @@ impl SshRemoteView {
             false,
         );
 
-        let title_area =
-            Hoverable::new(self.mouse_states.wizard_drag_header.clone(), move |state| {
-                let mut container = Container::new(
-                    Flex::column()
-                        .with_spacing(3.)
-                        .with_child(
-                            Text::new_inline(title, appearance.header_font_family(), 16.)
-                                .with_color(theme.main_text_color(theme.surface_1()).into())
-                                .with_style(Properties::default().weight(Weight::Semibold))
-                                .finish(),
-                        )
-                        .with_child(
-                            Text::new_inline(description, appearance.ui_font_family(), 11.5)
-                                .with_color(theme.sub_text_color(theme.surface_1()).into())
-                                .finish(),
-                        )
+        let title_area = Container::new(
+            Flex::column()
+                .with_spacing(3.)
+                .with_child(
+                    Text::new_inline(title, appearance.header_font_family(), 16.)
+                        .with_color(theme.main_text_color(theme.surface_1()).into())
+                        .with_style(Properties::default().weight(Weight::Semibold))
                         .finish(),
                 )
-                .with_horizontal_padding(4.)
-                .with_vertical_padding(3.)
-                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)));
-
-                if state.is_hovered() {
-                    container = container.with_background(theme.surface_overlay_1());
-                }
-
-                container.finish()
-            })
-            .with_cursor(Cursor::OpenHand)
-            .finish();
-
-        let draggable_title_hit_area = ConstrainedBox::new(
-            Container::new(title_area)
-                .with_background_color(ColorU::transparent_black())
+                .with_child(
+                    Text::new_inline(description, appearance.ui_font_family(), 11.5)
+                        .with_color(theme.sub_text_color(theme.surface_1()).into())
+                        .finish(),
+                )
                 .finish(),
         )
-        .with_width(WIZARD_BODY_WIDTH - ICON_BUTTON_SIZE - 12.)
-        .with_height(WIZARD_HEADER_HEIGHT - 10.)
+        .with_horizontal_padding(4.)
+        .with_vertical_padding(3.)
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
         .finish();
-
-        let draggable_title = EventHandler::new(draggable_title_hit_area)
-            .with_always_handle()
-            .on_left_mouse_down(|ctx, _, position| {
-                ctx.dispatch_typed_action(SshRemoteViewAction::StartWizardDrag(position));
-                DispatchEventResult::StopPropagation
-            })
-            .on_mouse_dragged(|ctx, _, position| {
-                ctx.dispatch_typed_action(SshRemoteViewAction::DragWizard(position));
-                DispatchEventResult::StopPropagation
-            })
-            .on_left_mouse_up(|ctx, _, _| {
-                ctx.dispatch_typed_action(SshRemoteViewAction::EndWizardDrag);
-                DispatchEventResult::StopPropagation
-            })
-            .finish();
 
         ConstrainedBox::new(
             Container::new(
@@ -4801,7 +4715,7 @@ impl SshRemoteView {
                     .with_main_axis_size(MainAxisSize::Max)
                     .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
                     .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                    .with_child(draggable_title)
+                    .with_child(title_area)
                     .with_child(close_button)
                     .finish(),
             )
@@ -5313,9 +5227,6 @@ impl TypedActionView for SshRemoteView {
                 self.pending_delete_confirmation = None;
                 ctx.emit(SshRemoteViewEvent::DisconnectHost(host_id.clone()));
             }
-            SshRemoteViewAction::StartWizardDrag(origin) => self.start_wizard_drag(*origin),
-            SshRemoteViewAction::DragWizard(origin) => self.drag_wizard(*origin, ctx),
-            SshRemoteViewAction::EndWizardDrag => self.end_wizard_drag(),
         }
     }
 }
@@ -5429,7 +5340,7 @@ impl View for SshRemoteView {
         stack.add_positioned_overlay_child(
             self.render_wizard_modal(app),
             OffsetPositioning::offset_from_parent(
-                self.wizard_window_centering_offset(app) + self.wizard_offset,
+                Vector2F::zero(),
                 ParentOffsetBounds::WindowByPosition,
                 ParentAnchor::Center,
                 ChildAnchor::Center,
