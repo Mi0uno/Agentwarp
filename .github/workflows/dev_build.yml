@@ -1,0 +1,90 @@
+name: Dev Build (Linux x64 GUI)
+
+# Local dev helper: build target/release/warp-oss on a beefy Linux runner
+# and upload it as an artifact that developers download with
+# `gh run download` and run directly. No cross-platform builds, no installer
+# packaging, no release publishing.
+#
+# This workflow does NOT touch beta_release.yml / ci.yml; it is intentionally
+# independent so that pushing a feature branch never pollutes the master
+# beta pipeline.
+
+on:
+  push:
+    branches-ignore:
+      - master
+  pull_request:
+    branches:
+      - master
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  WARP_BIN_NAME: warp-oss
+
+permissions:
+  contents: read
+
+concurrency:
+  # When a developer pushes new commits to the same branch, cancel any
+  # in-flight run and start fresh — keeps the actions minutes bill low
+  # and avoids the user downloading a stale artifact.
+  group: dev-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux_gui:
+    name: Build Linux x64 warp-oss
+    runs-on: ubuntu-latest-large  # 16C / 64G, full default parallelism
+    timeout-minutes: 60
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ffe5f5447ce83dd # v6.0.2
+
+      # Reuse the shared environment bootstrap so the cache key, LFS pull,
+      # and toolchain install all match what beta_release.yml and ci.yml do.
+      - uses: ./.github/actions/prepare_environment
+        with:
+          target_os: linux
+          is_self_hosted: false
+
+      - name: Verify OSS icon
+        shell: bash
+        run: test -f app/channels/oss/icon/no-padding/icon.ico
+
+      - name: Build warp-oss (release)
+        # Use the default runner parallelism (16 jobs on ubuntu-latest-large);
+        # no -j cap needed because this runner is sized for it.
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release -p warp --bin warp-oss
+
+      - name: Verify binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x "target/release/${WARP_BIN_NAME}"
+          file "target/release/${WARP_BIN_NAME}"
+          "target/release/${WARP_BIN_NAME}" --help || true
+
+      - name: Bundle artifact (warp-oss + .cargo-linked .so hint)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "target/release/${WARP_BIN_NAME}" "dist/${WARP_BIN_NAME}"
+          # Record the commit SHA so a developer can match a downloaded
+          # artifact back to a git ref without guessing.
+          printf '%s\n' "${{ github.sha }}" > dist/BUILD_SHA
+          printf '%s\n' "${{ github.ref_name }}" > dist/BUILD_REF
+          tar -C dist -czf "warp-oss-linux-x64.tar.gz" .
+          ls -lh "warp-oss-linux-x64.tar.gz"
+
+      - name: Upload Linux GUI artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: warp-oss-linux-x64
+          path: warp-oss-linux-x64.tar.gz
+          if-no-files-found: error
+          retention-days: 14
