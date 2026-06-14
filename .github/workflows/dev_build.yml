@@ -63,7 +63,7 @@ jobs:
             pkg-config build-essential protobuf-compiler \
             libssl-dev libasound2-dev libfreetype-dev \
             libfontconfig1-dev libgit2-dev libclang-dev cmake
-          protoc --version
+          /usr/bin/protoc --version
           # Sanity check that the well-known types are installed.
           test -f /usr/include/google/protobuf/descriptor.proto
 
@@ -78,12 +78,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sudo mv "$(command -v protoc)" "$(command -v protoc).real"
+          sudo mv /usr/bin/protoc /usr/bin/protoc.real
           sudo tee /usr/local/bin/protoc >/dev/null <<'EOF'
           #!/usr/bin/env bash
           exec /usr/bin/protoc.real -I /usr/include "$@"
           EOF
           sudo chmod +x /usr/local/bin/protoc
+          # Make sure /usr/local/bin takes precedence over /usr/bin in PATH.
+          echo "/usr/local/bin" | sudo tee /etc/profile.d/protoc-wrapper.sh >/dev/null
+          # Symlink so `protoc` resolves to the wrapper in any context.
+          sudo ln -sf /usr/local/bin/protoc /usr/bin/protoc
           which protoc
           protoc --version
           # Confirm the wrapper still resolves the well-known types.
