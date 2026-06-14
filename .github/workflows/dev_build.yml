@@ -64,6 +64,31 @@ jobs:
             libssl-dev libasound2-dev libfreetype-dev \
             libfontconfig1-dev libgit2-dev libclang-dev cmake
           protoc --version
+          # Sanity check that the well-known types are installed.
+          test -f /usr/include/google/protobuf/descriptor.proto
+
+      # Wrap protoc to force-add /usr/include to its search path. The
+      # private warp_multi_agent_api build script invokes prost-build
+      # which in turn shells out to `protoc`; on Ubuntu 24.04 the well-
+      # known types are in /usr/include/google/protobuf/ but protoc
+      # does not search there by default when given an explicit list of
+      # proto includes via the build script. The wrapper passes them
+      # through transparently.
+      - name: Wrap protoc with -I /usr/include
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo mv "$(command -v protoc)" "$(command -v protoc).real"
+          sudo tee /usr/local/bin/protoc >/dev/null <<'EOF'
+          #!/usr/bin/env bash
+          exec /usr/bin/protoc.real -I /usr/include "$@"
+          EOF
+          sudo chmod +x /usr/local/bin/protoc
+          which protoc
+          protoc --version
+          # Confirm the wrapper still resolves the well-known types.
+          printf 'syntax = "proto3";\nmessage Empty {}\n' > /tmp/empty.proto
+          protoc --proto_path=/tmp --descriptor_set_out=/dev/null /tmp/empty.proto && echo "WKT search OK"
 
       # Cache ~/.cargo and target/ between runs, keyed on Cargo.lock.
       # Task branches read the master cache but do not write back
