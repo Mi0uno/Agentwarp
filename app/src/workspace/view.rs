@@ -13825,6 +13825,40 @@ impl Workspace {
         ctx.notify();
     }
 
+    fn focus_agent_session(&mut self, session_id: &str, ctx: &mut ViewContext<Self>) {
+        // Focus-only path. If the session is no longer present in the model
+        // (e.g. archived + deleted in another window), do nothing — the user
+        // can reach the explicit Resume action from the actions menu.
+        let Some(record) = AgentSessionsModel::as_ref(ctx).session(session_id).cloned() else {
+            return;
+        };
+
+        // Reattach metadata for any new terminal that may have appeared.
+        AgentSessionsModel::handle(ctx).update(ctx, |model, ctx| {
+            model.resolve_missing_agent_session_id(session_id, ctx);
+        });
+
+        if let Some(terminal_view_id) = record.terminal_view_id.filter(|terminal_view_id| {
+            Self::terminal_view_matches_agent_session_environment(&record, *terminal_view_id, ctx)
+        }) {
+            if self.terminal_view_is_long_running_locally(terminal_view_id, ctx) {
+                // Agent is still alive on its PTY: just bring the terminal to
+                // the front. Never relaunch — that's what the explicit
+                // "Resume session" action in the per-row menu is for.
+                if self.focus_terminal_view_locally(terminal_view_id, ctx)
+                    || self.focus_terminal_view_in_other_window(terminal_view_id, ctx)
+                {
+                    return;
+                }
+            }
+        }
+        // Either there is no backing terminal yet (never started, or the
+        // backing terminal was closed and we lost the attach), or the
+        // backing PTY is no longer running the agent. Both cases fall
+        // through silently from the row click — relaunching must be
+        // explicit, otherwise we are back to killing live agents.
+    }
+
     fn restore_agent_session(&mut self, session_id: &str, ctx: &mut ViewContext<Self>) {
         AgentSessionsModel::handle(ctx).update(ctx, |model, ctx| {
             model.resolve_missing_agent_session_id(session_id, ctx);
@@ -25983,6 +26017,9 @@ impl TypedActionView for Workspace {
             }
             StartAgentChildSessionFromActive => {
                 self.start_agent_child_session_from_active(ctx);
+            }
+            FocusAgentSession { session_id } => {
+                self.focus_agent_session(session_id, ctx);
             }
             RestoreAgentSession { session_id } => {
                 self.restore_agent_session(session_id, ctx);

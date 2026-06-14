@@ -653,8 +653,16 @@ pub enum WorkspaceAction {
     },
     /// Start a child CLI agent session from the currently active Agent Session terminal.
     StartAgentChildSessionFromActive,
-    /// Restore a session from the Agent Sessions side panel, focusing its terminal if it is live
-    /// or reopening the agent in the session's project directory.
+    /// Focus the terminal backing an existing Agent Session. Focus-only: never
+    /// respawns the underlying CLI agent. Use this for the Agent Sessions side
+    /// panel row click, so toggling between sessions does not restart them.
+    FocusAgentSession {
+        session_id: String,
+    },
+    /// Reopen the Agent Session: focus its terminal if the CLI agent is still
+    /// running, otherwise relaunch the agent (e.g. `codex resume <id>`) in the
+    /// session's project directory. Surfaces only from the per-session actions
+    /// menu as an explicit "Resume session" action, not from the row click.
     RestoreAgentSession {
         session_id: String,
     },
@@ -925,6 +933,7 @@ impl WorkspaceAction {
             | StartAgentChildSession { .. }
             | StartAgentChildSessionFromActive
             | RestoreAgentSession { .. }
+            | FocusAgentSession { .. }
             | RestoreAgentSessionGroup { .. }
             | SelectTabConfig(_)
             | ToggleVerticalTabsPanel => true, // actions that actually change a state of the state of user's

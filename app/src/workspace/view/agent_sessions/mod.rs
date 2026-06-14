@@ -55,6 +55,8 @@ use crate::terminal::cli_agent_sessions::{
     CLIAgentSessionContext, CLIAgentSessionStatus, CLIAgentSessionsModel,
     CLIAgentSessionsModelEvent,
 };
+use crate::terminal::model::block::BlockState;
+use crate::terminal::view::TerminalView;
 use crate::workspace::tab_settings::{SingletonAgentGroupBehavior, TabSettings};
 use crate::workspace::view::ssh_remote::{
     SshRemoteConnectionStatus, SshRemoteHost, SshRemoteModel, SSH_REMOTE_LOCAL_ENVIRONMENT_ID,
@@ -3038,6 +3040,28 @@ impl AgentSessionsView {
             self.mouse_state(format!("session_action:{row_state_key}:actions"));
         let rename_editor = self.rename_editor.clone();
 
+        // Snapshot the session's lifecycle for the click handler. Rendering is
+        // the safest place to inspect the TerminalView's block state (we have
+        // a `&AppContext` and can hold a short lock without contending with
+        // event-driven paths), so we classify the session here:
+        //
+        //   * NotStarted — no `terminal_view_id` ever bound in this process.
+        //     Happens for sessions that were never opened, and for records
+        //     reloaded after a Warp restart (`#[serde(skip)]` drops the id).
+        //     The user expects the row to surface the session: launch.
+        //
+        //   * Running — the terminal is still running its block. Includes
+        //     the brief 0-1s window where `is_long_running` lags because
+        //     `LONG_RUNNING_COMMAND_DURATION_MS` hasn't elapsed yet, which
+        //     is why we read the block state directly instead of trusting
+        //     the cached `was_long_running` flag.
+        //
+        //   * Dead — the terminal's block is no longer executing
+        //     (DoneWithExecution / DoneWithNoExecution / Static / no active
+        //     block). Typical case: the user `Ctrl+D`'d out of codex, or it
+        //     crashed. Relaunching the agent matches user intent.
+        let lifecycle_state = compute_session_lifecycle_state(session, app);
+
         let hoverable = Hoverable::new(mouse_state, move |state| {
             let title_element: Box<dyn Element> = if is_renaming {
                 render_inline_rename_editor(&rename_editor, appearance, app)
@@ -3199,7 +3223,19 @@ impl AgentSessionsView {
                         ctx.dispatch_typed_action(WorkspaceAction::RestoreAgentSessionGroup {
                             parent_session_id: restore_session_id.clone(),
                         });
+                    } else if matches!(lifecycle_state, SessionLifecycle::Running) {
+                        // Block is still executing (or in a Background state)
+                        // — the agent is alive. Just bring the terminal to
+                        // the front; never relaunch, the user may be in the
+                        // middle of a conversation.
+                        ctx.dispatch_typed_action(WorkspaceAction::FocusAgentSession {
+                            session_id: restore_session_id.clone(),
+                        });
                     } else {
+                        // NotStarted (never attached in this process) or
+                        // Dead (Ctrl+D'd / crashed / never came up). In both
+                        // cases the user-visible expectation is "make this
+                        // session usable", so reopen via the restore path.
                         ctx.dispatch_typed_action(WorkspaceAction::RestoreAgentSession {
                             session_id: restore_session_id.clone(),
                         });
@@ -3776,6 +3812,12 @@ impl TypedActionView for AgentSessionsView {
                     parent_session_id,
                 });
             }
+            AgentSessionsViewAction::ResumeSession { session_id } => {
+                self.open_session_actions_id = None;
+                ctx.dispatch_typed_action(&WorkspaceAction::RestoreAgentSession {
+                    session_id: session_id.clone(),
+                });
+            }
             AgentSessionsViewAction::StartDrag { session_id } => {
                 self.open_session_actions_id = None;
                 self.open_project_actions_key = None;
@@ -3991,6 +4033,9 @@ pub enum AgentSessionsViewAction {
     StartChild {
         session_id: String,
     },
+    ResumeSession {
+        session_id: String,
+    },
     StartDrag {
         session_id: String,
     },
@@ -4155,6 +4200,16 @@ fn render_session_actions_menu(
     appearance: &Appearance,
 ) -> Box<dyn Element> {
     let mut menu = Flex::column().with_main_axis_size(MainAxisSize::Min);
+    menu.add_child(render_action_menu_item(
+        new_child_button_state.clone(),
+        Icon::Refresh,
+        "Resume session",
+        AgentSessionsViewAction::ResumeSession {
+            session_id: session_id.to_owned(),
+        },
+        false,
+        appearance,
+    ));
     if can_start_child {
         menu.add_child(render_action_menu_item(
             new_child_button_state,
@@ -6350,4 +6405,68 @@ mod tests {
         assert_eq!(child_sessions[0].parent_agent_session_id, "parent-session");
         assert_eq!(child_sessions[0].title, "Codex child - Carson");
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionLifecycle {
+    /// `terminal_view_id` is None — the session was never attached in this
+    /// process, or its `#[serde(skip)]` binding was lost across a restart.
+    NotStarted,
+    /// The terminal's active block is still in `Executing` (or `Background`).
+    /// The agent is alive: clicking the row must just focus, never relaunch.
+    Running,
+    /// The terminal exists but its block has finished
+    /// (`DoneWithExecution` / `DoneWithNoExecution` / `Static` / no active
+    /// block). Typical cause: the user `Ctrl+D`'d out of codex, or the agent
+    /// crashed. Relaunching matches the user's click intent.
+    Dead,
+}
+
+/// Snapshot the session's lifecycle at render time so the click handler can
+/// decide between `FocusAgentSession` (running) and `RestoreAgentSession`
+/// (needs to (re)launch) without re-inspecting the model on the event path.
+///
+/// Why not just use `record.terminal_view_id.is_some()`? Because that field
+/// stays `Some` even after the agent inside the terminal exits (e.g. `Ctrl+D`
+/// from a codex TUI). A user who kills the agent and then clicks the row
+/// expects Warp to bring the session back, not silently refocus a dead tab.
+///
+/// Why not `is_long_running`? It is false for the first ~1s after launch
+/// (the `LONG_RUNNING_COMMAND_DURATION_MS` cache hasn't kicked in yet) and
+/// also false once the block finishes. We want neither of those to be
+/// mis-classified as "dead", so we read the block state directly.
+fn compute_session_lifecycle_state(
+    record: &AgentSessionRecord,
+    app: &AppContext,
+) -> SessionLifecycle {
+    let Some(terminal_view_id) = record.terminal_view_id else {
+        return SessionLifecycle::NotStarted;
+    };
+
+    // The session may have been opened in another window. Scan every window
+    // we know about; if any of them still hosts a running block, treat the
+    // session as alive. We do not need to mutate any view, only peek, so
+    // walking windows here is safe.
+    for window_id in app.window_ids() {
+        let Some(handle) = app.view_with_id::<TerminalView>(window_id, terminal_view_id) else {
+            continue;
+        };
+        let terminal_view = handle.as_ref(app);
+        // Hold the lock only for the brief active-block read; this matches
+        // the existing pattern in workspace/view.rs and never escapes this
+        // function, so it cannot deadlock with model acquisition elsewhere.
+        let model = terminal_view.model.lock();
+        if matches!(
+            model.block_list().active_block().state(),
+            BlockState::Executing | BlockState::Background
+        ) {
+            return SessionLifecycle::Running;
+        }
+        return SessionLifecycle::Dead;
+    }
+
+    // `terminal_view_id` is set but the TerminalView is gone from every
+    // window. The view was closed or the app reloaded; treat as not started
+    // so the next click reopens the session.
+    SessionLifecycle::NotStarted
 }
