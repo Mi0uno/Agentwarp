@@ -62,6 +62,8 @@ use crate::terminal::view::Event;
 use crate::terminal::{TerminalManager, TerminalView};
 use crate::view_components::ToastFlavor;
 use crate::workspace::sync_inputs::SyncedInputState;
+use crate::workspace::view::agent_sessions::AgentSessionsModel;
+use crate::workspace::view::seed_cli_agent_session_for_record;
 use crate::workspace::{PaneViewLocator, WorkspaceRegistry};
 use crate::AIExecutionProfilesModel;
 // Imports below are only consumed by the non-wasm `launch_local_*_child`
@@ -443,6 +445,27 @@ impl PaneContent for TerminalPane {
                 model.register_ambient_session(terminal_view_id, task_id, ctx);
             }
         });
+
+        // Rebuild the `CLIAgentSession` placeholder if a reversible close
+        // (`DetachType::HiddenForClose`) wiped the in-memory session but the
+        // persistent `AgentSessionRecord` still binds this terminal to an
+        // agent. Without this, the status badge / rich input / footer would
+        // be missing until the next OSC 777 event — which may never fire if
+        // the agent is sitting at a prompt. A regular shell tab that just
+        // got re-attached has no matching `AgentSessionRecord` and is a no-op.
+        if CLIAgentSessionsModel::as_ref(ctx)
+            .session(terminal_view_id)
+            .is_none()
+        {
+            if let Some(record) = AgentSessionsModel::as_ref(ctx)
+                .records()
+                .iter()
+                .find(|record| record.terminal_view_id == Some(terminal_view_id))
+                .cloned()
+            {
+                seed_cli_agent_session_for_record(terminal_view_id, &record, ctx);
+            }
+        }
     }
 
     fn detach(
@@ -492,7 +515,11 @@ impl PaneContent for TerminalPane {
 
         // Clean up any active CLI agent session so its notification is removed.
         // Skip this for moves — the session is still running and will re-register in the new tab.
-        if !matches!(detach_type, DetachType::Moved) {
+        // Also skip for `HiddenForClose` (reversible close via the Undo stack). On undo,
+        // `attach` will either re-register the existing `AgentSessionRecord` placeholder
+        // (if any) or wait for the next OSC 777 event. Removing the session here would
+        // wipe the status badge / rich input / footer for the duration of the undo.
+        if matches!(detach_type, DetachType::Closed) {
             CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, ctx| {
                 sessions.remove_session(terminal_view_id, ctx);
             });

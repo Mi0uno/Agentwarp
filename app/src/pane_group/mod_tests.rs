@@ -80,7 +80,13 @@ use crate::settings_view::keybindings::KeybindingChangedNotifier;
 use crate::suggestions::ignored_suggestions_model::IgnoredSuggestionsModel;
 use crate::system::SystemStats;
 use crate::terminal::alt_screen_reporting::AltScreenReporting;
-use crate::terminal::cli_agent_sessions::CLIAgentSessionsModel;
+use crate::terminal::cli_agent::AgentReasoningEffortModel;
+use crate::terminal::cli_agent::AgentRuntimeSettingsModel;
+use crate::terminal::cli_agent::CLIAgent;
+use crate::terminal::cli_agent_sessions::{
+    CLIAgentInputState, CLIAgentSession, CLIAgentSessionContext, CLIAgentSessionStatus,
+    CLIAgentSessionsModel,
+};
 use crate::terminal::history::History;
 use crate::terminal::keys::TerminalKeybindings;
 use crate::terminal::local_tty::spawner::PtySpawner;
@@ -96,6 +102,8 @@ use crate::undo_close::UndoCloseStack;
 use crate::warp_managed_paths_watcher::WarpManagedPathsWatcher;
 use crate::workflows::local_workflows::LocalWorkflows;
 use crate::workspace::sync_inputs::SyncedInputState;
+use crate::workspace::view::agent_sessions::AgentSessionsModel;
+use crate::workspace::view::ssh_remote::SshRemoteModel;
 use crate::workspace::{ActiveSession, OneTimeModalModel, WorkspaceRegistry};
 use crate::workspaces::team_tester::TeamTesterStatus;
 use crate::workspaces::update_manager::TeamUpdateManager;
@@ -164,6 +172,10 @@ fn initialize_app(app: &mut App) {
         )
     });
     app.add_singleton_model(|_| CLIAgentSessionsModel::new());
+    app.add_singleton_model(AgentReasoningEffortModel::new);
+    app.add_singleton_model(AgentRuntimeSettingsModel::new);
+    app.add_singleton_model(AgentSessionsModel::new);
+    app.add_singleton_model(SshRemoteModel::new);
     app.add_singleton_model(OrchestrationEventService::new);
     app.add_singleton_model(LocalAgentTaskSyncModel::new);
     if FeatureFlag::OrchestrationV2.is_enabled() {
@@ -3331,4 +3343,89 @@ fn decide_remote_child_hydration_empty_token_falls_back() {
             "empty/whitespace token={empty_token:?} must fall through to Fallback",
         );
     }
+}
+
+/// Regression test: `TerminalPane::detach` with `DetachType::HiddenForClose`
+/// (a reversible close via the Undo stack) must preserve the in-memory
+/// `CLIAgentSession` so the status badge / rich input / footer survive
+/// the duration of the undo. `DetachType::Closed` (a permanent close)
+/// must still wipe the session.
+#[test]
+fn terminal_pane_detach_preserves_cli_agent_session_on_hidden_for_close() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let pane_group = mock_pane_group(&mut app, Default::default());
+
+        let (terminal_view_id, pane_id) = pane_group.update(&mut app, |panes, ctx| {
+            let pane_id = get_newly_created_pane_id(panes, &[]);
+            let terminal_pane = panes
+                .terminal_session_by_id(pane_id)
+                .expect("default pane is a terminal pane");
+            let terminal_view_id = terminal_pane.terminal_view(ctx).id();
+
+            // Seed a CLI agent session for the default terminal view.
+            CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, ctx| {
+                sessions.set_session(
+                    terminal_view_id,
+                    CLIAgentSession {
+                        agent: CLIAgent::Claude,
+                        status: CLIAgentSessionStatus::InProgress,
+                        session_context: CLIAgentSessionContext::default(),
+                        input_state: CLIAgentInputState::Closed,
+                        should_auto_toggle_input: false,
+                        listener: None,
+                        remote_host: None,
+                        plugin_version: None,
+                        draft_text: None,
+                        custom_command_prefix: None,
+                        received_rich_notification: false,
+                    },
+                    ctx,
+                );
+            });
+
+            assert!(
+                CLIAgentSessionsModel::as_ref(ctx)
+                    .session(terminal_view_id)
+                    .is_some(),
+                "session seeded for terminal view",
+            );
+
+            (terminal_view_id, pane_id)
+        });
+
+        // Reversible close (`HiddenForClose`): session must remain.
+        pane_group.update(&mut app, |panes, ctx| {
+            let terminal_pane = panes
+                .terminal_session_by_id(pane_id)
+                .expect("terminal pane still present");
+            pane::PaneContent::detach(terminal_pane, panes, pane::DetachType::HiddenForClose, ctx);
+        });
+
+        pane_group.read(&app, |_panes, ctx| {
+            assert!(
+                CLIAgentSessionsModel::as_ref(ctx)
+                    .session(terminal_view_id)
+                    .is_some(),
+                "session must be preserved on HiddenForClose (reversible close)",
+            );
+        });
+
+        // Permanent close (`Closed`): session must be wiped.
+        pane_group.update(&mut app, |panes, ctx| {
+            let terminal_pane = panes
+                .terminal_session_by_id(pane_id)
+                .expect("terminal pane still present");
+            pane::PaneContent::detach(terminal_pane, panes, pane::DetachType::Closed, ctx);
+        });
+
+        pane_group.read(&app, |_panes, ctx| {
+            assert!(
+                CLIAgentSessionsModel::as_ref(ctx)
+                    .session(terminal_view_id)
+                    .is_none(),
+                "session must be removed on Closed (permanent close)",
+            );
+        });
+    });
 }

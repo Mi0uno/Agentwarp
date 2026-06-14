@@ -11795,20 +11795,27 @@ impl Workspace {
         if !re_adopted && detach_panes_for_close {
             let working_directories_model = self.working_directories_model.clone();
             pane_group.update(ctx, |pane_group, ctx| {
-                pane_group.for_all_terminal_panes(
-                    |terminal_view, ctx| {
-                        if terminal_view
-                            .model
-                            .lock()
-                            .block_list()
-                            .active_block()
-                            .is_active_and_long_running()
-                        {
-                            terminal_view.shutdown_pty(ctx);
-                        }
-                    },
-                    ctx,
-                );
+                // Only kill long-running PTYs on a permanent close. On a reversible close
+                // (`add_to_undo_stack == true`), the tab may be restored via the Undo stack;
+                // killing the PTY here would orphan the agent process and lose the in-memory
+                // session state. The PTY will still be torn down when the tab is permanently
+                // closed later (or the session ends naturally).
+                if !add_to_undo_stack {
+                    pane_group.for_all_terminal_panes(
+                        |terminal_view, ctx| {
+                            if terminal_view
+                                .model
+                                .lock()
+                                .block_list()
+                                .active_block()
+                                .is_active_and_long_running()
+                            {
+                                terminal_view.shutdown_pty(ctx);
+                            }
+                        },
+                        ctx,
+                    );
+                }
 
                 pane_group.detach_panes_for_close(&working_directories_model, ctx);
             });
@@ -13479,7 +13486,7 @@ impl Workspace {
                 AgentSessionsModel::handle(ctx).update(ctx, |model, ctx| {
                     model.attach_terminal(&session_id, terminal_view_id, ctx);
                 });
-                Self::seed_cli_agent_session_for_record(terminal_view_id, &session_record, ctx);
+                seed_cli_agent_session_for_record(terminal_view_id, &session_record, ctx);
                 active_terminal.update(ctx, |terminal, ctx| {
                     let launch_command = launch_command
                         .as_deref()
@@ -13550,7 +13557,7 @@ impl Workspace {
         let terminal_view_id = terminal_view.id();
         let launch_command = agent_session_restore_command(record, ctx);
         let launch_command = Self::maybe_wrap_agent_api_proxy_command(record, &launch_command, ctx);
-        Self::seed_cli_agent_session_for_record(terminal_view_id, record, ctx);
+        seed_cli_agent_session_for_record(terminal_view_id, record, ctx);
         AgentSessionsModel::handle(ctx).update(ctx, |model, ctx| {
             model.attach_terminal(&record.id, terminal_view_id, ctx);
         });
@@ -13562,56 +13569,6 @@ impl Workspace {
                 |terminal, _, ctx| {
                     terminal.apply_cli_agent_footer_visibility(true, ctx);
                 },
-            );
-        });
-    }
-
-    fn seed_cli_agent_session_for_record<V: View>(
-        terminal_view_id: EntityId,
-        record: &AgentSessionRecord,
-        ctx: &mut ViewContext<V>,
-    ) {
-        let already_tracked = CLIAgentSessionsModel::as_ref(ctx)
-            .session(terminal_view_id)
-            .is_some_and(|session| session.agent == record.agent);
-        if already_tracked {
-            return;
-        }
-
-        let project = record
-            .project_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(str::to_owned)
-            .or_else(|| Some(record.title.clone()));
-        let cwd = Some(record.project_path.to_string_lossy().into_owned());
-        let should_auto_toggle_input =
-            *AISettings::as_ref(ctx).auto_open_rich_input_on_cli_agent_start;
-        let remote_host = Self::ssh_remote_host_for_environment_id(&record.environment_id, ctx)
-            .map(|host| host.user_host());
-
-        CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions_model, ctx| {
-            sessions_model.set_session(
-                terminal_view_id,
-                CLIAgentSession {
-                    agent: record.agent,
-                    status: CLIAgentSessionStatus::InProgress,
-                    session_context: CLIAgentSessionContext {
-                        cwd,
-                        project,
-                        session_id: record.agent_session_id.clone(),
-                        ..Default::default()
-                    },
-                    input_state: CLIAgentInputState::Closed,
-                    should_auto_toggle_input,
-                    listener: None,
-                    plugin_version: None,
-                    remote_host,
-                    draft_text: None,
-                    custom_command_prefix: None,
-                    received_rich_notification: false,
-                },
-                ctx,
             );
         });
     }
@@ -13948,7 +13905,7 @@ impl Workspace {
         AgentSessionsModel::handle(ctx).update(ctx, |model, ctx| {
             model.attach_terminal(&record.id, terminal_view_id, ctx);
         });
-        Self::seed_cli_agent_session_for_record(terminal_view_id, record, ctx);
+        seed_cli_agent_session_for_record(terminal_view_id, record, ctx);
         terminal_view.update(ctx, |terminal, ctx| {
             terminal.execute_command_or_set_pending(&launch_command, ctx);
             terminal.apply_cli_agent_footer_visibility(true, ctx);
@@ -14152,7 +14109,7 @@ impl Workspace {
                     model.attach_terminal(&record.id, replacement_terminal_view_id, ctx);
                 }
             });
-            Self::seed_cli_agent_session_for_record(replacement_terminal_view_id, record, ctx);
+            seed_cli_agent_session_for_record(replacement_terminal_view_id, record, ctx);
         } else if let Some(cli_session) = replacement_cli_session {
             CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions_model, ctx| {
                 sessions_model.set_session(replacement_terminal_view_id, cli_session, ctx);
@@ -24373,6 +24330,65 @@ impl Workspace {
         // Open the URL on desktop. This does nothing if the app isn't installed.
         crate::uri::web_intent_parser::open_url_on_desktop(url);
     }
+}
+
+/// Seed a placeholder `CLIAgentSession` for the given terminal view from an
+/// existing `AgentSessionRecord`. Called by several `Workspace` methods when
+/// restoring a session, and by `TerminalPane::attach` to rebuild a session
+/// that was wiped by a reversible close (`DetachType::HiddenForClose`).
+///
+/// The placeholder has `listener: None` and `InProgress` status; the next OSC 777
+/// event for the terminal (or the existing listener, if it survives) will upgrade
+/// it. If a session for the same agent is already tracked, this is a no-op.
+pub(crate) fn seed_cli_agent_session_for_record<V: View>(
+    terminal_view_id: EntityId,
+    record: &AgentSessionRecord,
+    ctx: &mut ViewContext<V>,
+) {
+    let already_tracked = CLIAgentSessionsModel::as_ref(ctx)
+        .session(terminal_view_id)
+        .is_some_and(|session| session.agent == record.agent);
+    if already_tracked {
+        return;
+    }
+
+    let project = record
+        .project_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+        .or_else(|| Some(record.title.clone()));
+    let cwd = Some(record.project_path.to_string_lossy().into_owned());
+    let should_auto_toggle_input =
+        *AISettings::as_ref(ctx).auto_open_rich_input_on_cli_agent_start;
+    let remote_host = ssh_remote_host_id_from_environment_id(&record.environment_id)
+        .and_then(|host_id| SshRemoteModel::as_ref(ctx).host(host_id).cloned())
+        .map(|host| host.user_host());
+
+    CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions_model, ctx| {
+        sessions_model.set_session(
+            terminal_view_id,
+            CLIAgentSession {
+                agent: record.agent,
+                status: CLIAgentSessionStatus::InProgress,
+                session_context: CLIAgentSessionContext {
+                    cwd,
+                    project,
+                    session_id: record.agent_session_id.clone(),
+                    ..Default::default()
+                },
+                input_state: CLIAgentInputState::Closed,
+                should_auto_toggle_input,
+                listener: None,
+                plugin_version: None,
+                remote_host,
+                draft_text: None,
+                custom_command_prefix: None,
+                received_rich_notification: false,
+            },
+            ctx,
+        );
+    });
 }
 
 impl Entity for Workspace {
