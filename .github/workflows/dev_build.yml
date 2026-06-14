@@ -50,6 +50,21 @@ jobs:
         with:
           toolchain: stable
 
+      - name: Install system build dependencies
+        # Public ubuntu-latest image ships with most dev libs but no protoc
+        # (warp_multi_agent_api's build script invokes prost-build which
+        # needs protoc on PATH). pkg-config and build-essential are needed
+        # for many of warp's native deps (openssl, alsa, freetype, etc.).
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config build-essential protobuf-compiler \
+            libssl-dev libasound2-dev libfreetype-dev \
+            libfontconfig1-dev libgit2-dev libclang-dev cmake
+          protoc --version
+
       # Cache ~/.cargo and target/ between runs, keyed on Cargo.lock.
       # Task branches read the master cache but do not write back
       # (save-if: master) to avoid polluting the shared cache.
