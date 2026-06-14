@@ -35,8 +35,8 @@ concurrency:
 jobs:
   linux_gui:
     name: Build Linux x64 warp-oss
-    runs-on: ubuntu-latest-large  # 16C / 64G, full default parallelism
-    timeout-minutes: 60
+    runs-on: ubuntu-latest  # GitHub-hosted public runner; warp-internal's `ubuntu-latest-large` is not available to forks
+    timeout-minutes: 90
     steps:
       - name: Checkout sources
         uses: actions/checkout@de0fac2e4500dabe0009e67214ffe5f5447ce83dd # v6.0.2
@@ -53,12 +53,12 @@ jobs:
         run: test -f app/channels/oss/icon/no-padding/icon.ico
 
       - name: Build warp-oss (release)
-        # Use the default runner parallelism (16 jobs on ubuntu-latest-large);
-        # no -j cap needed because this runner is sized for it.
+        # Public `ubuntu-latest` runner is 4 cores / 16 GiB. Keep -j explicit
+        # so we don't get throttled by GitHub's per-job CPU caps.
         shell: bash
         run: |
           set -euo pipefail
-          cargo build --release -p warp --bin warp-oss
+          cargo build --release -j 4 -p warp --bin warp-oss
 
       - name: Verify binary
         shell: bash
