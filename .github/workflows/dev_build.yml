@@ -1,0 +1,158 @@
+name: Dev Build (Linux x64 GUI)
+
+# Local dev helper: build target/release/warp-oss on a GitHub-hosted Linux
+# runner and upload it as an artifact that developers download with
+# `gh run download` and run directly. No cross-platform builds, no installer
+# packaging, no release publishing.
+#
+# This workflow is intentionally independent of beta_release.yml / ci.yml /
+# the shared .github/actions/prepare_environment composite — those reuse
+# private action SHAs from warpdotdev/warp-internal that are not resolvable
+# from forks (Mi0uno/Agentwarp). We pin only public actions here.
+
+on:
+  push:
+    branches-ignore:
+      - master
+  pull_request:
+    branches:
+      - master
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  WARP_BIN_NAME: warp-oss
+
+permissions:
+  contents: read
+
+concurrency:
+  # When a developer pushes new commits to the same branch, cancel any
+  # in-flight run and start fresh — keeps Actions minutes low and avoids
+  # the user downloading a stale artifact.
+  group: dev-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux_gui:
+    name: Build Linux x64 warp-oss
+    runs-on: ubuntu-latest  # 4 cores / 16 GiB public runner
+    timeout-minutes: 90
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Install system build dependencies
+        # Public ubuntu-latest image ships with most dev libs but no protoc
+        # (warp_multi_agent_api's build script invokes prost-build which
+        # needs protoc on PATH). pkg-config and build-essential are needed
+        # for many of warp's native deps (openssl, alsa, freetype, etc.).
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config build-essential protobuf-compiler libprotobuf-dev \
+            libssl-dev libasound2-dev libfreetype-dev \
+            libfontconfig1-dev libgit2-dev libclang-dev cmake
+          /usr/bin/protoc --version
+          # Sanity check that the well-known types are installed.
+          test -f /usr/include/google/protobuf/descriptor.proto
+
+      # Wrap protoc to force-add /usr/include to its search path. The
+      # private warp_multi_agent_api build script invokes prost-build
+      # which in turn shells out to `protoc`; on Ubuntu 24.04 the well-
+      # known types are in /usr/include/google/protobuf/ but protoc
+      # does not search there by default when given an explicit list of
+      # proto includes via the build script. The wrapper passes them
+      # through transparently.
+      - name: Wrap protoc with -I /usr/include
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo mv /usr/bin/protoc /usr/bin/protoc.real
+          sudo tee /usr/local/bin/protoc >/dev/null <<'EOF'
+          #!/usr/bin/env bash
+          exec /usr/bin/protoc.real -I /usr/include "$@"
+          EOF
+          sudo chmod +x /usr/local/bin/protoc
+          # Make sure /usr/local/bin takes precedence over /usr/bin in PATH.
+          echo "/usr/local/bin" | sudo tee /etc/profile.d/protoc-wrapper.sh >/dev/null
+          # Symlink so `protoc` resolves to the wrapper in any context.
+          sudo ln -sf /usr/local/bin/protoc /usr/bin/protoc
+          which protoc
+          protoc --version
+          # Confirm the wrapper still resolves the well-known types.
+          printf 'syntax = "proto3";\nmessage Empty {}\n' > /tmp/empty.proto
+          protoc --proto_path=/tmp --descriptor_set_out=/dev/null /tmp/empty.proto && echo "WKT search OK"
+
+      # Cache ~/.cargo and target/ between runs, keyed on Cargo.lock.
+      # Task branches read the master cache but do not write back
+      # (save-if: master) to avoid polluting the shared cache.
+      - name: Cache cargo registry, index, and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+
+      - name: Verify OSS icon
+        shell: bash
+        run: test -f app/channels/oss/icon/no-padding/icon.ico
+
+      - name: Show environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Runner: $(uname -a)"
+          echo "nproc: $(nproc)"
+          echo "free -h:"
+          free -h
+          echo "df -h /:"
+          df -h /
+          echo "rustc: $(rustc --version)"
+
+      - name: Build warp-oss (release)
+        # Public `ubuntu-latest` runner is 4 cores / 16 GiB. Cap at -j 4.
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release -j 4 -p warp --bin warp-oss
+
+      - name: Verify binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x "target/release/${WARP_BIN_NAME}"
+          file "target/release/${WARP_BIN_NAME}"
+          "./target/release/${WARP_BIN_NAME}" --version || true
+
+      - name: Bundle artifact (warp-oss + build markers)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "target/release/${WARP_BIN_NAME}" "dist/${WARP_BIN_NAME}"
+          # Record the commit SHA so a developer can match a downloaded
+          # artifact back to a git ref without guessing.
+          printf '%s\n' "${{ github.sha }}" > dist/BUILD_SHA
+          printf '%s\n' "${{ github.ref_name }}" > dist/BUILD_REF
+          printf '%s\n' "${{ github.run_id }}" > dist/BUILD_RUN_ID
+          printf '%s\n' "${{ github.run_number }}" > dist/BUILD_RUN_NUMBER
+          tar -C dist -czf "warp-oss-linux-x64.tar.gz" .
+          ls -lh "warp-oss-linux-x64.tar.gz"
+
+      - name: Upload Linux GUI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: warp-oss-linux-x64
+          path: warp-oss-linux-x64.tar.gz
+          if-no-files-found: error
+          retention-days: 14
