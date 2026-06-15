@@ -721,13 +721,47 @@ impl AgentSessionsModel {
     }
 
     pub fn latest_agent_session_id_for_project(
+        &self,
         agent: CLIAgent,
         project_path: &Path,
     ) -> Option<String> {
         match agent {
             CLIAgent::Codex => latest_codex_session_id_for_project(project_path),
+            CLIAgent::Claude => self.latest_recorded_agent_session_id(agent, project_path),
             _ => None,
         }
+    }
+
+    /// Returns the `agent_session_id` from the most recently updated
+    /// [`AgentSessionRecord`] that matches `agent` and `project_path`.
+    ///
+    /// Claude Code's CLI does not expose a "resume last" command — `claude --resume`
+    /// requires an explicit session id, and there is no `--last` equivalent. To
+    /// let the user switch the permission mode of an existing Claude Code agent
+    /// session and have Warp relaunch it under the same session id, we look up
+    /// the most recent recorded session for this project in our own
+    /// [`AgentSessionsModel`]. If the CLI is wired up to forward the session id
+    /// back via `CLIAgentEvent::session_id`, the matching record will already
+    /// have an `agent_session_id`; if not, this still works for projects where
+    /// the user has run multiple Claude Code agents in Warp.
+    fn latest_recorded_agent_session_id(
+        &self,
+        agent: CLIAgent,
+        project_path: &Path,
+    ) -> Option<String> {
+        let project_path = normalized_path_key(project_path);
+        self.records
+            .iter()
+            .filter(|record| record.agent == agent)
+            .filter(|record| normalized_path_key(&record.project_path) == project_path)
+            .filter_map(|record| {
+                record
+                    .agent_session_id
+                    .clone()
+                    .map(|id| (record.updated_at_ms, id))
+            })
+            .max_by_key(|(updated_at_ms, _)| *updated_at_ms)
+            .map(|(_, session_id)| session_id)
     }
 
     fn resolve_missing_agent_session_id_inner(&mut self, session_id: &str) -> bool {

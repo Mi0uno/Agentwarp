@@ -14068,7 +14068,7 @@ impl Workspace {
                         .as_deref()
                         .map(Path::new)
                         .and_then(|project_path| {
-                            AgentSessionsModel::latest_agent_session_id_for_project(
+                            AgentSessionsModel::as_ref(ctx).latest_agent_session_id_for_project(
                                 cli_session.agent,
                                 project_path,
                             )
@@ -14076,7 +14076,7 @@ impl Workspace {
                 })
                 .or_else(|| {
                     fallback_directory.as_deref().and_then(|project_path| {
-                        AgentSessionsModel::latest_agent_session_id_for_project(
+                        AgentSessionsModel::as_ref(ctx).latest_agent_session_id_for_project(
                             cli_session.agent,
                             project_path,
                         )
