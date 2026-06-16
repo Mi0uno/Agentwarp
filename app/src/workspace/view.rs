@@ -14020,7 +14020,28 @@ impl Workspace {
                         return;
                     }
                 };
-            let Some(launch_command) = agent_session_restart_runtime_command(record, ctx) else {
+            // A freshly-launched Claude session may not have its session id
+            // recorded yet (the CLI emits it asynchronously), so switching the
+            // model or permission mode would otherwise toast "Cannot restart
+            // this agent without a resumable session id.". Resolve the id —
+            // the record's own id when known, else the sole unambiguous on-disk
+            // Claude session for this project — and build the resume command
+            // against a record carrying it. Resolution refuses to guess when
+            // multiple sessions exist, keeping conversations isolated.
+            let resolved_session_id =
+                AgentSessionsModel::as_ref(ctx).resolve_agent_session_id_for_restart(record);
+            let backfilled_record = match &resolved_session_id {
+                Some(session_id) if record.agent_session_id.as_deref() != Some(session_id) => {
+                    Some(AgentSessionRecord {
+                        agent_session_id: Some(session_id.clone()),
+                        ..record.clone()
+                    })
+                }
+                _ => None,
+            };
+            let command_record = backfilled_record.as_ref().unwrap_or(record);
+            let Some(launch_command) = agent_session_restart_runtime_command(command_record, ctx)
+            else {
                 self.show_cli_agent_restart_error_toast(
                     "Cannot restart this agent without a resumable session id.",
                     ctx,
@@ -14076,10 +14097,8 @@ impl Workspace {
                 })
                 .or_else(|| {
                     fallback_directory.as_deref().and_then(|project_path| {
-                        AgentSessionsModel::as_ref(ctx).latest_agent_session_id_for_project(
-                            cli_session.agent,
-                            project_path,
-                        )
+                        AgentSessionsModel::as_ref(ctx)
+                            .latest_agent_session_id_for_project(cli_session.agent, project_path)
                     })
                 });
             let Some(launch_command) = cli_agent_restart_runtime_command(

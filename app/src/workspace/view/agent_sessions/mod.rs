@@ -720,6 +720,81 @@ impl AgentSessionsModel {
         self.session(&record_id)?.agent_session_id.clone()
     }
 
+    /// Resolves the session id to resume when restarting `record` under a new
+    /// set of runtime options (model / permission mode / reasoning effort).
+    ///
+    /// Conversation isolation is the hard constraint here: we must never resume
+    /// a session id that belongs to a *different* tab, or two tabs would splice
+    /// into one Claude conversation. The resolution order reflects that:
+    ///
+    /// 1. `record.agent_session_id` — the id the current tab's live CLI session
+    ///    reported back through `CLIAgentEvent::session_id`. This is the strict,
+    ///    correct id for exactly this tab, so it always wins.
+    /// 2. Otherwise, agent-specific fallbacks that are still isolation-safe:
+    ///    - Codex resolves from its on-disk transcripts (each keyed by cwd).
+    ///    - Claude has no "resume last" command (`claude --resume` needs an
+    ///      explicit uuid). A Warp-launched Claude session pins its uuid via
+    ///      `--session-id` and writes `~/.claude/projects/<encoded_cwd>/<uuid>.jsonl`
+    ///      immediately, so we scan that directory. To keep tabs isolated we only
+    ///      return an id when the project has a *single* on-disk Claude session
+    ///      that no other tracked record already claims — see
+    ///      [`Self::unclaimed_claude_session_id_for_project`].
+    ///
+    /// Returns `None` when no id can be resolved *without risking* cross-tab
+    /// contamination; the caller then surfaces the restart error rather than
+    /// guessing.
+    pub fn resolve_agent_session_id_for_restart(
+        &self,
+        record: &AgentSessionRecord,
+    ) -> Option<String> {
+        if let Some(session_id) = record
+            .agent_session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|session_id| !session_id.is_empty())
+        {
+            return Some(session_id.to_owned());
+        }
+        match record.agent {
+            CLIAgent::Codex => latest_codex_session_id_for_project(&record.project_path),
+            CLIAgent::Claude => self.unclaimed_claude_session_id_for_project(&record.project_path),
+            _ => None,
+        }
+    }
+
+    /// Returns the on-disk Claude session id for `project_path` **only** when it
+    /// is unambiguous: exactly one `<uuid>.jsonl` exists under
+    /// `~/.claude/projects/<encoded_cwd>/` and no other tracked record already
+    /// claims it. Returns `None` when there are zero or multiple candidate
+    /// sessions, so we never resume one tab's conversation into another.
+    fn unclaimed_claude_session_id_for_project(&self, project_path: &Path) -> Option<String> {
+        let candidates = claude_session_ids_for_project(project_path);
+        self.unclaimed_claude_session_id_from_candidates(&candidates)
+    }
+
+    /// Isolation guard shared with the on-disk lookup, split out so it can be
+    /// unit-tested without touching the filesystem. Returns the sole candidate
+    /// only when there is exactly one and no other Claude record already claims
+    /// it; any ambiguity resolves to `None`.
+    fn unclaimed_claude_session_id_from_candidates(&self, candidates: &[String]) -> Option<String> {
+        // More than one on-disk session for this project: we cannot tell which
+        // one belongs to the current tab, so refuse rather than risk splicing
+        // two conversations together.
+        let [session_id] = candidates else {
+            return None;
+        };
+        // Defense in depth: if another record already owns this id, it is not
+        // ours to resume.
+        let claimed_by_other = self.records.iter().any(|other| {
+            other.agent == CLIAgent::Claude
+                && other.agent_session_id.as_deref() == Some(session_id.as_str())
+        });
+        if claimed_by_other {
+            return None;
+        }
+        Some(session_id.clone())
+    }
+
     pub fn latest_agent_session_id_for_project(
         &self,
         agent: CLIAgent,
@@ -727,41 +802,9 @@ impl AgentSessionsModel {
     ) -> Option<String> {
         match agent {
             CLIAgent::Codex => latest_codex_session_id_for_project(project_path),
-            CLIAgent::Claude => self.latest_recorded_agent_session_id(agent, project_path),
+            CLIAgent::Claude => self.unclaimed_claude_session_id_for_project(project_path),
             _ => None,
         }
-    }
-
-    /// Returns the `agent_session_id` from the most recently updated
-    /// [`AgentSessionRecord`] that matches `agent` and `project_path`.
-    ///
-    /// Claude Code's CLI does not expose a "resume last" command — `claude --resume`
-    /// requires an explicit session id, and there is no `--last` equivalent. To
-    /// let the user switch the permission mode of an existing Claude Code agent
-    /// session and have Warp relaunch it under the same session id, we look up
-    /// the most recent recorded session for this project in our own
-    /// [`AgentSessionsModel`]. If the CLI is wired up to forward the session id
-    /// back via `CLIAgentEvent::session_id`, the matching record will already
-    /// have an `agent_session_id`; if not, this still works for projects where
-    /// the user has run multiple Claude Code agents in Warp.
-    fn latest_recorded_agent_session_id(
-        &self,
-        agent: CLIAgent,
-        project_path: &Path,
-    ) -> Option<String> {
-        let project_path = normalized_path_key(project_path);
-        self.records
-            .iter()
-            .filter(|record| record.agent == agent)
-            .filter(|record| normalized_path_key(&record.project_path) == project_path)
-            .filter_map(|record| {
-                record
-                    .agent_session_id
-                    .clone()
-                    .map(|id| (record.updated_at_ms, id))
-            })
-            .max_by_key(|(updated_at_ms, _)| *updated_at_ms)
-            .map(|(_, session_id)| session_id)
     }
 
     fn resolve_missing_agent_session_id_inner(&mut self, session_id: &str) -> bool {
@@ -5411,6 +5454,84 @@ fn latest_codex_session_id_for_project(_project_path: &Path) -> Option<String> {
     None
 }
 
+/// Resolve the Claude config dir: `$CLAUDE_CONFIG_DIR` if set, else `~/.claude`.
+/// Mirrors the resolution used by the Claude harness runner so we scan the same
+/// directory the CLI writes session transcripts to.
+#[cfg(not(target_family = "wasm"))]
+fn claude_config_home_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
+        if !dir.is_empty() {
+            return Some(PathBuf::from(dir));
+        }
+    }
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude"))
+}
+
+/// Encode a project path as Claude's per-project transcript directory name.
+///
+/// Claude stores a session's jsonl under
+/// `~/.claude/projects/<encoded_cwd>/<session_uuid>.jsonl`, where the directory
+/// name is the cwd with every `/` and `.` replaced by `-`. Keep this in sync
+/// with `claude_transcript::encode_cwd`.
+#[cfg(not(target_family = "wasm"))]
+fn encode_claude_project_dir(cwd: &Path) -> String {
+    cwd.to_string_lossy().replace(['/', '.'], "-")
+}
+
+/// Returns the Claude session uuids recorded on disk for `project_path`, sorted
+/// most-recently-modified first.
+///
+/// A Warp-launched Claude session pins its uuid via `--session-id` and writes
+/// `~/.claude/projects/<encoded_cwd>/<uuid>.jsonl` immediately, so the file
+/// stems are the resumable session ids for this project. Only well-formed uuid
+/// stems are returned. Callers decide how to disambiguate when more than one is
+/// present — see [`AgentSessionsModel::unclaimed_claude_session_id_for_project`].
+#[cfg(not(target_family = "wasm"))]
+fn claude_session_ids_for_project(project_path: &Path) -> Vec<String> {
+    let Some(config_dir) = claude_config_home_dir() else {
+        return Vec::new();
+    };
+    claude_session_ids_for_project_in_home(&config_dir, project_path)
+}
+
+#[cfg(target_family = "wasm")]
+fn claude_session_ids_for_project(_project_path: &Path) -> Vec<String> {
+    Vec::new()
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn claude_session_ids_for_project_in_home(config_dir: &Path, project_path: &Path) -> Vec<String> {
+    let encoded = encode_claude_project_dir(&expand_tilde(project_path));
+    let projects_dir = config_dir.join("projects").join(&encoded);
+    let Ok(entries) = fs::read_dir(&projects_dir) else {
+        return Vec::new();
+    };
+
+    let mut sessions: Vec<(SystemTime, String)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        // Only accept well-formed session uuids so we never feed a stray file
+        // name into `claude --resume`.
+        if Uuid::parse_str(stem).is_err() {
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .unwrap_or(UNIX_EPOCH);
+        sessions.push((modified, stem.to_owned()));
+    }
+
+    sessions.sort_by(|a, b| b.0.cmp(&a.0));
+    sessions.into_iter().map(|(_, id)| id).collect()
+}
+
 #[cfg(not(target_family = "wasm"))]
 fn latest_codex_session_id_for_project_in_home(
     codex_home: &Path,
@@ -6271,6 +6392,190 @@ mod tests {
                 .agent_session_id
                 .as_deref(),
             Some("shared-codex-id")
+        );
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn claude_record(
+        id: &str,
+        project_path: &Path,
+        agent_session_id: Option<&str>,
+        updated_at_ms: i64,
+    ) -> AgentSessionRecord {
+        AgentSessionRecord {
+            id: id.to_owned(),
+            environment_id: default_agent_session_environment_id(),
+            project_path: project_path.to_path_buf(),
+            agent: CLIAgent::Claude,
+            title: id.to_owned(),
+            status: AgentSessionStatus::InProgress,
+            agent_session_id: agent_session_id.map(str::to_owned),
+            parent_session_id: None,
+            parent_agent_session_id: None,
+            updated_at_ms,
+            sort_order: updated_at_ms,
+            is_pinned: false,
+            archived_at_ms: None,
+            title_overridden: false,
+            auto_title_fingerprint: None,
+            auto_title_summarized_at_ms: None,
+            auto_title_source_chars: 0,
+            hosted_transcript: None,
+            hosted_transcript_updated_at_ms: None,
+            terminal_view_id: None,
+            group_terminal_view_id: None,
+        }
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn model_with_records(records: Vec<AgentSessionRecord>) -> AgentSessionsModel {
+        AgentSessionsModel {
+            pending_title_generations: HashSet::new(),
+            project_paths: Vec::new(),
+            records,
+        }
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn resolve_restart_id_keeps_records_own_claude_session_id() {
+        // Strict bind: when the current tab's record already carries an id
+        // (forwarded from its live CLI session), that id always wins — no disk
+        // lookup, no chance of resuming a sibling tab's conversation.
+        let project_path = PathBuf::from("/tmp/project");
+        let record = claude_record("a", &project_path, Some("own-id"), 5);
+        let model = model_with_records(vec![
+            record.clone(),
+            // A newer sibling session in the same project must NOT override our
+            // own recorded id.
+            claude_record("sibling", &project_path, Some("sibling-id"), 99),
+        ]);
+
+        assert_eq!(
+            model
+                .resolve_agent_session_id_for_restart(&record)
+                .as_deref(),
+            Some("own-id")
+        );
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn resolve_restart_id_trims_blank_record_id_then_finds_no_disk_session() {
+        // A whitespace-only id is treated as absent; with no on-disk Claude
+        // session under a (non-existent) project dir, we must return None
+        // rather than guess.
+        let project_path = PathBuf::from("/tmp/nonexistent-claude-project-xyz");
+        let record = claude_record("a", &project_path, Some("   "), 5);
+        let model = model_with_records(vec![record.clone()]);
+
+        assert_eq!(model.resolve_agent_session_id_for_restart(&record), None);
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn claude_disk_scan_returns_single_session_uuid() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_dir = temp_dir.path().join(".claude");
+        let project_path = PathBuf::from("/home/dev/proj");
+        let project_dir = config_dir
+            .join("projects")
+            .join(encode_claude_project_dir(&project_path));
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let uuid = "11111111-1111-4111-8111-111111111111";
+        std::fs::write(project_dir.join(format!("{uuid}.jsonl")), "{}\n").unwrap();
+        // A non-uuid file and a non-jsonl file must be ignored.
+        std::fs::write(project_dir.join("notes.txt"), "x").unwrap();
+        std::fs::write(project_dir.join("scratch.jsonl"), "{}\n").unwrap();
+
+        assert_eq!(
+            claude_session_ids_for_project_in_home(&config_dir, &project_path),
+            vec![uuid.to_owned()]
+        );
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn claude_disk_scan_orders_newest_first() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_dir = temp_dir.path().join(".claude");
+        let project_path = PathBuf::from("/home/dev/proj");
+        let project_dir = config_dir
+            .join("projects")
+            .join(encode_claude_project_dir(&project_path));
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let older = "11111111-1111-4111-8111-111111111111";
+        let newer = "22222222-2222-4222-8222-222222222222";
+        std::fs::write(project_dir.join(format!("{older}.jsonl")), "{}\n").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(project_dir.join(format!("{newer}.jsonl")), "{}\n").unwrap();
+
+        assert_eq!(
+            claude_session_ids_for_project_in_home(&config_dir, &project_path),
+            vec![newer.to_owned(), older.to_owned()]
+        );
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn unclaimed_claude_session_refuses_when_multiple_sessions_exist() {
+        // Two on-disk sessions for one project: isolation requires we refuse to
+        // pick one, since we cannot tell which belongs to the current tab.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_dir = temp_dir.path().join(".claude");
+        let project_path = PathBuf::from("/home/dev/proj");
+        let project_dir = config_dir
+            .join("projects")
+            .join(encode_claude_project_dir(&project_path));
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(
+            project_dir.join("11111111-1111-4111-8111-111111111111.jsonl"),
+            "{}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project_dir.join("22222222-2222-4222-8222-222222222222.jsonl"),
+            "{}\n",
+        )
+        .unwrap();
+
+        let candidates = claude_session_ids_for_project_in_home(&config_dir, &project_path);
+        assert_eq!(candidates.len(), 2, "scan should see both sessions");
+
+        // The isolation guard turns an ambiguous project into None.
+        let model = model_with_records(Vec::new());
+        assert_eq!(
+            model.unclaimed_claude_session_id_from_candidates(&candidates),
+            None
+        );
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn unclaimed_claude_session_returns_sole_unclaimed_id() {
+        let model = model_with_records(Vec::new());
+        assert_eq!(
+            model
+                .unclaimed_claude_session_id_from_candidates(&["solo-id".to_owned()])
+                .as_deref(),
+            Some("solo-id")
+        );
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn unclaimed_claude_session_refuses_id_claimed_by_another_record() {
+        // The sole on-disk session is already owned by a different tab's record,
+        // so resuming it here would splice the two conversations.
+        let project_path = PathBuf::from("/home/dev/proj");
+        let owner = claude_record("owner", &project_path, Some("solo-id"), 7);
+        let model = model_with_records(vec![owner]);
+
+        assert_eq!(
+            model.unclaimed_claude_session_id_from_candidates(&["solo-id".to_owned()]),
+            None
         );
     }
 
