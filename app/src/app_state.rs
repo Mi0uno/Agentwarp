@@ -306,6 +306,7 @@ pub enum LeftPanelDisplayedTab {
 impl From<ToolPanelView> for LeftPanelDisplayedTab {
     fn from(view: ToolPanelView) -> Self {
         match view {
+            ToolPanelView::ToolConfigurations => LeftPanelDisplayedTab::WarpDrive,
             ToolPanelView::ProjectExplorer => LeftPanelDisplayedTab::FileTree,
             ToolPanelView::GlobalSearch { .. } => LeftPanelDisplayedTab::GlobalSearch,
             ToolPanelView::WarpDrive => LeftPanelDisplayedTab::WarpDrive,

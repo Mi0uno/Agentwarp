@@ -22,6 +22,7 @@ use crate::ai::agent::conversation::AIConversationId;
 use crate::ai::agent::AIAgentExchangeId;
 use crate::ai::ambient_agents::AmbientAgentTaskId;
 use crate::ai::document::ai_document_model::{AIDocumentId, AIDocumentVersion};
+use crate::ai::skills::SkillReference;
 use crate::auth::auth_manager::LoginGatedFeature;
 use crate::drive::items::WarpDriveItemId;
 use crate::drive::CloudObjectTypeAndId;
@@ -320,6 +321,8 @@ pub enum WorkspaceAction {
     /// In Code Mode V2 this toggles the left panel which contains both the project explorer and
     /// Warp Drive. This happens as explicit action from the user.
     ToggleLeftPanel,
+    /// Toggles directly to the tools configuration center.
+    ToggleToolsPanel,
     /// Toggles directly to the Warp Drive tab of the left panel in Code Mode V2
     ToggleWarpDrive,
     /// Unconditionally opens Warp Drive. This is used in the case of user lifecycle
@@ -473,6 +476,10 @@ pub enum WorkspaceAction {
     },
     OpenAIFactCollection,
     OpenMCPServerCollection,
+    OpenAddMCPServer,
+    OpenSkill {
+        skill_reference: SkillReference,
+    },
     /// Open the Environment Management pane in Create mode.
     OpenEnvironmentManagementPane,
     ToggleAIDocumentPane {
@@ -1011,6 +1018,7 @@ impl WorkspaceAction {
             | DragGroup { .. }
             | StartGroupDrag(_)
             | ToggleLeftPanel
+            | ToggleToolsPanel
             | ToggleWarpDrive
             | OpenWarpDrive
             | ClosePanel
@@ -1086,6 +1094,8 @@ impl WorkspaceAction {
             | TabHoverWidthEnd
             | OpenAIFactCollection
             | OpenMCPServerCollection
+            | OpenAddMCPServer
+            | OpenSkill { .. }
             | FocusTerminalViewInWorkspace { .. }
             | FocusPane(..)
             | StartNewConversation { .. }

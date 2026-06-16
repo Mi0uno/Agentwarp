@@ -1095,6 +1095,7 @@ pub struct Workspace {
     file_upload_sessions: FileUploadSessions,
     ai_fact_view: ViewHandle<AIFactView>,
     left_panel_open: bool,
+    remote_panel_open: bool,
     vertical_tabs_panel_open: bool,
     vertical_tabs_panel: VerticalTabsPanelState,
     agent_sessions_view: ViewHandle<AgentSessionsView>,
@@ -1103,6 +1104,7 @@ pub struct Workspace {
     ssh_remote_directory_picker_purpose: SshRemoteDirectoryPickerPurpose,
     pending_ssh_remote_directory_project_edit: Option<PathBuf>,
     left_panel_view: ViewHandle<LeftPanelView>,
+    remote_panel_view: ViewHandle<LeftPanelView>,
     left_panel_views: Vec<ToolPanelView>,
     right_panel_view: ViewHandle<RightPanelView>,
     working_directories_model: ModelHandle<pane_group::WorkingDirectoriesModel>,
@@ -3303,11 +3305,25 @@ impl Workspace {
             LeftPanelView::new(
                 working_directories_model.clone(),
                 left_panel_views.clone(),
+                WorkspaceAction::ToggleLeftPanel,
                 ctx,
             )
         });
 
         ctx.subscribe_to_view(&left_panel_view, |me, _, event, ctx| {
+            me.handle_left_panel_event(event, ctx);
+        });
+
+        let remote_panel_view = ctx.add_typed_action_view(|ctx| {
+            LeftPanelView::new(
+                working_directories_model.clone(),
+                vec![ToolPanelView::SshRemote],
+                WorkspaceAction::ToggleSshRemote,
+                ctx,
+            )
+        });
+
+        ctx.subscribe_to_view(&remote_panel_view, |me, _, event, ctx| {
             me.handle_left_panel_event(event, ctx);
         });
 
@@ -3699,6 +3715,7 @@ impl Workspace {
             file_upload_sessions: Default::default(),
             ai_fact_view,
             left_panel_open: false,
+            remote_panel_open: false,
             vertical_tabs_panel_open: false,
             vertical_tabs_panel: Default::default(),
             agent_sessions_view,
@@ -3707,6 +3724,7 @@ impl Workspace {
             ssh_remote_directory_picker_purpose: SshRemoteDirectoryPickerPurpose::Project,
             pending_ssh_remote_directory_project_edit: None,
             left_panel_view,
+            remote_panel_view,
             left_panel_views,
             right_panel_view,
             working_directories_model,
@@ -4383,6 +4401,11 @@ impl Workspace {
         self.left_panel_view.update(ctx, |left_panel, ctx| {
             left_panel.set_active_pane_group(active_pane_group, &working_directories_model, ctx);
         });
+        let active_pane_group = self.active_tab_pane_group().clone();
+        let working_directories_model = self.working_directories_model.clone();
+        self.remote_panel_view.update(ctx, |remote_panel, ctx| {
+            remote_panel.set_active_pane_group(active_pane_group, &working_directories_model, ctx);
+        });
     }
 
     fn initial_vertical_tabs_panel_open(
@@ -4453,11 +4476,11 @@ impl Workspace {
             .left_panel_views
             .first()
             .copied()
-            .unwrap_or(ToolPanelView::WarpDrive);
+            .unwrap_or(ToolPanelView::ToolConfigurations);
 
         self.left_panel_view.update(ctx, |lp, ctx| {
             // Restore which panel tab was active
-            let active_view = match left_panel_snapshot.left_panel_displayed_tab {
+            let restored_view = match left_panel_snapshot.left_panel_displayed_tab {
                 LeftPanelDisplayedTab::FileTree => ToolPanelView::ProjectExplorer,
                 LeftPanelDisplayedTab::AgentSessions => fallback_left_panel_view,
                 LeftPanelDisplayedTab::GlobalSearch => ToolPanelView::GlobalSearch {
@@ -4465,6 +4488,11 @@ impl Workspace {
                 },
                 LeftPanelDisplayedTab::WarpDrive => ToolPanelView::WarpDrive,
                 LeftPanelDisplayedTab::ConversationListView => ToolPanelView::ConversationListView,
+            };
+            let active_view = if self.left_panel_views.contains(&restored_view) {
+                restored_view
+            } else {
+                fallback_left_panel_view
             };
             lp.restore_active_view_from_snapshot(active_view, ctx);
             lp.set_active_pane_group(pane_group.clone(), &self.working_directories_model, ctx);
@@ -5106,6 +5134,12 @@ impl Workspace {
         if self.left_panel_view.is_self_or_child_focused(app) {
             return FocusRegion::LeftPanel;
         }
+        if self.remote_panel_view.is_self_or_child_focused(app) {
+            if self.remote_panel_side(app) == PanelPosition::Left {
+                return FocusRegion::LeftPanel;
+            }
+            return FocusRegion::RightPanel;
+        }
         if self.right_panel_view.is_self_or_child_focused(app) {
             return FocusRegion::RightPanel;
         }
@@ -5121,11 +5155,14 @@ impl Workspace {
 
     fn has_left_region(&self, app: &AppContext) -> bool {
         self.active_tab_pane_group().as_ref(app).left_panel_open
+            || (self.remote_panel_open && self.remote_panel_side(app) == PanelPosition::Left)
     }
 
     fn has_right_region(&self, app: &AppContext) -> bool {
         let group = self.active_tab_pane_group().as_ref(app);
-        group.right_panel_open || self.current_workspace_state.is_right_panel_open()
+        group.right_panel_open
+            || self.current_workspace_state.is_right_panel_open()
+            || (self.remote_panel_open && self.remote_panel_side(app) == PanelPosition::Right)
     }
 
     fn focus_next_pane_in_group(&mut self, ctx: &mut ViewContext<Self>) -> bool {
@@ -5150,9 +5187,13 @@ impl Workspace {
 
     fn focus_left_region_entry(&mut self, ctx: &mut ViewContext<Self>) {
         if self.has_left_region(ctx) {
-            self.left_panel_view.update(ctx, |left_panel, ctx| {
-                left_panel.focus_active_view_on_entry(ctx);
-            });
+            if self.active_tab_pane_group().as_ref(ctx).left_panel_open {
+                self.left_panel_view.update(ctx, |left_panel, ctx| {
+                    left_panel.focus_active_view_on_entry(ctx);
+                });
+            } else if self.remote_panel_open && self.remote_panel_side(ctx) == PanelPosition::Left {
+                ctx.focus(&self.remote_panel_view);
+            }
         }
     }
 
@@ -5166,6 +5207,8 @@ impl Workspace {
             ctx.focus(&self.ai_assistant_panel);
         } else if self.current_workspace_state.is_resource_center_open {
             ctx.focus(&self.resource_center_view);
+        } else if self.remote_panel_open && self.remote_panel_side(ctx) == PanelPosition::Right {
+            ctx.focus(&self.remote_panel_view);
         }
     }
 
@@ -5680,6 +5723,14 @@ impl Workspace {
         self.left_panel_view.update(ctx, |left_panel, ctx| {
             left_panel.set_active_pane_group(
                 left_active_pane_group,
+                &working_directories_model,
+                ctx,
+            );
+        });
+        let remote_active_pane_group = self.active_tab_pane_group().clone();
+        self.remote_panel_view.update(ctx, |remote_panel, ctx| {
+            remote_panel.set_active_pane_group(
+                remote_active_pane_group,
                 &working_directories_model,
                 ctx,
             );
@@ -6326,6 +6377,11 @@ impl Workspace {
         } else {
             PanelPosition::Right
         };
+        let remote_position = if left_items.contains(&HeaderToolbarItemKind::SshRemote) {
+            PanelPosition::Left
+        } else {
+            PanelPosition::Right
+        };
         let code_review_position = if left_items.contains(&HeaderToolbarItemKind::CodeReview) {
             PanelPosition::Left
         } else {
@@ -6333,6 +6389,9 @@ impl Workspace {
         };
         self.left_panel_view.update(ctx, |view, ctx| {
             view.set_panel_position(tools_position, ctx);
+        });
+        self.remote_panel_view.update(ctx, |view, ctx| {
+            view.set_panel_position(remote_position, ctx);
         });
         self.right_panel_view.update(ctx, |view, ctx| {
             view.set_panel_position(code_review_position, ctx);
@@ -9371,6 +9430,23 @@ impl Workspace {
         }
 
         ctx.notify();
+    }
+
+    fn set_remote_panel_open(&mut self, is_open: bool, ctx: &mut ViewContext<Self>) {
+        if self.remote_panel_open == is_open {
+            return;
+        }
+        self.remote_panel_open = is_open;
+        if is_open {
+            ctx.focus(&self.remote_panel_view);
+        } else if self.remote_panel_view.is_self_or_child_focused(ctx) {
+            self.focus_active_tab(ctx);
+        }
+        ctx.notify();
+    }
+
+    fn toggle_remote_panel(&mut self, ctx: &mut ViewContext<Self>) {
+        self.set_remote_panel_open(!self.remote_panel_open, ctx);
     }
 
     #[cfg(feature = "local_fs")]
@@ -20823,8 +20899,9 @@ impl Workspace {
                         .left_panel_views
                         .first()
                         .copied()
-                        .unwrap_or(ToolPanelView::WarpDrive)
+                        .unwrap_or(ToolPanelView::ToolConfigurations)
                     {
+                        ToolPanelView::ToolConfigurations => "Tools",
                         ToolPanelView::ProjectExplorer => "Project explorer",
                         ToolPanelView::GlobalSearch { .. } => "Global search",
                         ToolPanelView::WarpDrive => "Warp Drive",
@@ -20871,21 +20948,11 @@ impl Workspace {
         appearance: &Appearance,
         ctx: &AppContext,
     ) -> Box<dyn Element> {
-        let is_active = self.active_tab_pane_group().as_ref(ctx).left_panel_open;
+        let is_active = self.active_tab_pane_group().as_ref(ctx).left_panel_open
+            && self.left_panel_view.as_ref(ctx).active_view() == ToolPanelView::ToolConfigurations;
 
         let tooltip_text = if self.left_panel_views.len() <= 1 {
-            match self
-                .left_panel_views
-                .first()
-                .copied()
-                .unwrap_or(ToolPanelView::WarpDrive)
-            {
-                ToolPanelView::ProjectExplorer => "Project explorer",
-                ToolPanelView::GlobalSearch { .. } => "Global search",
-                ToolPanelView::WarpDrive => "Warp Drive",
-                ToolPanelView::ConversationListView => "Agent conversations",
-                ToolPanelView::SshRemote => "SSH remote",
-            }
+            "Tools"
         } else {
             "Tools panel"
         };
@@ -20897,9 +20964,15 @@ impl Workspace {
                         appearance,
                         icons::Icon::Tool2,
                         &self.mouse_states.tools_panel_icon,
-                        WorkspaceAction::ToggleLeftPanel,
+                        WorkspaceAction::ToggleToolsPanel,
                         tooltip_text.to_string(),
-                        keybinding_name_to_display_string("workspace:toggle_left_panel", ctx),
+                        keybinding_name_to_display_string("workspace:toggle_tools_panel", ctx)
+                            .or_else(|| {
+                                keybinding_name_to_display_string(
+                                    "workspace:toggle_left_panel",
+                                    ctx,
+                                )
+                            }),
                         is_active,
                         false,
                     )
@@ -20918,8 +20991,7 @@ impl Workspace {
         appearance: &Appearance,
         ctx: &AppContext,
     ) -> Box<dyn Element> {
-        let is_active = self.active_tab_pane_group().as_ref(ctx).left_panel_open
-            && self.left_panel_view.as_ref(ctx).active_view() == ToolPanelView::SshRemote;
+        let is_active = self.remote_panel_open;
         let is_local_environment = SshRemoteModel::as_ref(ctx).active_host().is_none();
 
         let ssh_remote_button = Container::new(
@@ -20933,7 +21005,7 @@ impl Workspace {
                     },
                     &self.mouse_states.ssh_remote_icon,
                     WorkspaceAction::ToggleSshRemote,
-                    "SSH remote".to_string(),
+                    "Remote panel".to_string(),
                     keybinding_name_to_display_string(LEFT_PANEL_SSH_REMOTE_BINDING_NAME, ctx)
                         .or_else(|| {
                             keybinding_name_to_display_string(TOGGLE_SSH_REMOTE_BINDING_NAME, ctx)
@@ -21761,19 +21833,13 @@ impl Workspace {
         if !item.is_available(ctx) {
             return None;
         }
-        let vertical_tabs_active =
-            FeatureFlag::VerticalTabs.is_enabled() && *TabSettings::as_ref(ctx).use_vertical_tabs;
         let inner = match item {
             HeaderToolbarItemKind::TabsPanel => self.render_left_toggle_button(appearance, ctx),
             HeaderToolbarItemKind::ToolsPanel => {
                 if self.left_panel_views.is_empty() {
                     return None;
                 }
-                if vertical_tabs_active {
-                    self.render_tools_panel_button(appearance, ctx)
-                } else {
-                    self.render_left_toggle_button(appearance, ctx)
-                }
+                self.render_tools_panel_button(appearance, ctx)
             }
             HeaderToolbarItemKind::SshRemote => self.render_ssh_remote_button(appearance, ctx),
             HeaderToolbarItemKind::AgentManagement => {
@@ -23374,6 +23440,20 @@ impl Workspace {
         }
     }
 
+    fn remote_panel_side(&self, app: &AppContext) -> PanelPosition {
+        let config = TabSettings::as_ref(app)
+            .header_toolbar_chip_selection
+            .clone();
+        if config
+            .left_items()
+            .contains(&HeaderToolbarItemKind::SshRemote)
+        {
+            PanelPosition::Left
+        } else {
+            PanelPosition::Right
+        }
+    }
+
     /// Renders a configurable panel for the given toolbar item, if it is open.
     /// Returns `None` if the panel should not be rendered (item not supported,
     /// panel not open, or item is not a panel type).
@@ -23404,27 +23484,13 @@ impl Workspace {
                 if !pane_group.left_panel_open || warpui::platform::is_mobile_device() {
                     return None;
                 }
-                let ssh_remote_item_is_configured = config
-                    .left_items()
-                    .contains(&HeaderToolbarItemKind::SshRemote)
-                    || config
-                        .right_items()
-                        .contains(&HeaderToolbarItemKind::SshRemote);
-                if ssh_remote_item_is_configured
-                    && self.left_panel_view.as_ref(app).active_view() == ToolPanelView::SshRemote
-                {
-                    return None;
-                }
                 Some(ChildView::new(&self.left_panel_view).finish())
             }
             HeaderToolbarItemKind::SshRemote => {
-                if !pane_group.left_panel_open
-                    || warpui::platform::is_mobile_device()
-                    || self.left_panel_view.as_ref(app).active_view() != ToolPanelView::SshRemote
-                {
+                if !self.remote_panel_open || warpui::platform::is_mobile_device() {
                     return None;
                 }
-                Some(ChildView::new(&self.left_panel_view).finish())
+                Some(ChildView::new(&self.remote_panel_view).finish())
             }
             HeaderToolbarItemKind::CodeReview => {
                 if !pane_group.right_panel_open {
@@ -24316,31 +24382,8 @@ impl Workspace {
 
     /// Computes the list of available left panel views based on current AI settings and feature flags.
     fn compute_left_panel_views(ctx: &AppContext) -> Vec<ToolPanelView> {
-        let mut views = vec![];
-        if cfg!(feature = "local_fs") && *CodeSettings::as_ref(ctx).show_project_explorer.value() {
-            views.push(ToolPanelView::ProjectExplorer);
-        }
-        if FeatureFlag::AgentViewConversationListView.is_enabled()
-            && AISettings::as_ref(ctx).is_any_ai_enabled(ctx)
-            && *AISettings::as_ref(ctx).show_conversation_history
-        {
-            views.push(ToolPanelView::ConversationListView);
-        }
-        if !cfg!(target_family = "wasm") {
-            views.push(ToolPanelView::SshRemote);
-        }
-        if cfg!(feature = "local_fs")
-            && FeatureFlag::GlobalSearch.is_enabled()
-            && *CodeSettings::as_ref(ctx).show_global_search.value()
-        {
-            views.push(ToolPanelView::GlobalSearch {
-                entry_focus: GlobalSearchEntryFocus::Results,
-            });
-        }
-        if WarpDriveSettings::is_warp_drive_enabled(ctx) {
-            views.push(ToolPanelView::WarpDrive);
-        }
-        views
+        let _ = ctx;
+        vec![ToolPanelView::ToolConfigurations]
     }
 
     /// Recomputes the available left panel views based on current AI settings and feature flags,
@@ -24417,8 +24460,7 @@ pub(crate) fn seed_cli_agent_session_for_record<V: View>(
         .map(str::to_owned)
         .or_else(|| Some(record.title.clone()));
     let cwd = Some(record.project_path.to_string_lossy().into_owned());
-    let should_auto_toggle_input =
-        *AISettings::as_ref(ctx).auto_open_rich_input_on_cli_agent_start;
+    let should_auto_toggle_input = *AISettings::as_ref(ctx).auto_open_rich_input_on_cli_agent_start;
     let remote_host = ssh_remote_host_id_from_environment_id(&record.environment_id)
         .and_then(|host_id| SshRemoteModel::as_ref(ctx).host(host_id).cloned())
         .map(|host| host.user_host());
@@ -25171,6 +25213,12 @@ impl TypedActionView for Workspace {
                     }
                 }
             }
+            ToggleToolsPanel => {
+                let is_showing = self.active_tab_pane_group().as_ref(ctx).left_panel_open
+                    && self.left_panel_view.as_ref(ctx).active_view()
+                        == ToolPanelView::ToolConfigurations;
+                self.toggle_left_panel_view(&LeftPanelAction::ToolConfigurations, is_showing, ctx);
+            }
             ToggleRightPanel => {
                 let pane_group_handle = self.active_tab_pane_group().clone();
                 self.toggle_right_panel(&pane_group_handle, ctx);
@@ -25431,6 +25479,8 @@ impl TypedActionView for Workspace {
             ClosePanel => {
                 if self.left_panel_view.is_self_or_child_focused(ctx) {
                     self.close_left_panel(ctx);
+                } else if self.remote_panel_view.is_self_or_child_focused(ctx) {
+                    self.set_remote_panel_open(false, ctx);
                 } else if self.right_panel_view.is_self_or_child_focused(ctx) {
                     let pane_group_handle = self.active_tab_pane_group().clone();
                     self.close_right_panel(&pane_group_handle, ctx);
@@ -25852,6 +25902,77 @@ impl TypedActionView for Workspace {
                     },
                     ctx
                 );
+            }
+            OpenAddMCPServer => {
+                self.open_mcp_servers_page(
+                    MCPServersSettingsPage::Edit { item_id: None },
+                    None,
+                    ctx,
+                );
+            }
+            OpenSkill { skill_reference } => {
+                #[cfg(feature = "local_fs")]
+                {
+                    use crate::ai::skills::{SkillOpenOrigin, SkillTelemetryEvent};
+
+                    match skill_reference {
+                        crate::ai::skills::SkillReference::Path(path) => {
+                            let layout =
+                                *crate::util::file::external_editor::EditorSettings::as_ref(ctx)
+                                    .open_file_layout
+                                    .value();
+                            send_telemetry_from_ctx!(
+                                SkillTelemetryEvent::Opened {
+                                    reference: skill_reference.clone(),
+                                    name: crate::ai::skills::SkillManager::as_ref(ctx)
+                                        .skill_by_reference(skill_reference)
+                                        .map(|skill| skill.name.clone()),
+                                    origin: SkillOpenOrigin::OpenSkillCommand,
+                                },
+                                ctx
+                            );
+                            self.open_code(
+                                CodeSource::Skill {
+                                    reference: skill_reference.clone(),
+                                    location: path.clone(),
+                                    origin: SkillOpenOrigin::OpenSkillCommand,
+                                },
+                                layout,
+                                None,
+                                false,
+                                &[],
+                                ctx,
+                            );
+                        }
+                        crate::ai::skills::SkillReference::BundledSkillId(_) => {
+                            let window_id = ctx.window_id();
+                            ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
+                                toast_stack.add_ephemeral_toast(
+                                    DismissibleToast::error(
+                                        "Bundled skills cannot be edited".to_string(),
+                                    ),
+                                    window_id,
+                                    ctx,
+                                );
+                            });
+                        }
+                    }
+                }
+
+                #[cfg(not(feature = "local_fs"))]
+                {
+                    let _ = skill_reference;
+                    let window_id = ctx.window_id();
+                    ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
+                        toast_stack.add_ephemeral_toast(
+                            DismissibleToast::error(
+                                "Editing skills is not supported in this build".to_string(),
+                            ),
+                            window_id,
+                            ctx,
+                        );
+                    });
+                }
             }
             OpenEnvironmentManagementPane => {
                 self.open_environment_management_pane(None, EnvironmentsPage::Create, ctx);
@@ -26542,9 +26663,7 @@ impl TypedActionView for Workspace {
             }
             ToggleSshRemote => {
                 self.show_ssh_remote_environment_menu = false;
-                let is_showing =
-                    self.left_panel_view.as_ref(ctx).active_view() == ToolPanelView::SshRemote;
-                self.toggle_left_panel_view(&LeftPanelAction::SshRemote, is_showing, ctx);
+                self.toggle_remote_panel(ctx);
             }
             ToggleSshRemoteEnvironmentMenu => {
                 self.open_ssh_remote_environment_menu(ctx);

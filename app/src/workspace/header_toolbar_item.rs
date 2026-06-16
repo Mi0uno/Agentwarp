@@ -39,7 +39,7 @@ impl HeaderToolbarItemKind {
         match self {
             Self::TabsPanel => "Tabs Panel",
             Self::ToolsPanel => "Tools Panel",
-            Self::SshRemote => "SSH Remote",
+            Self::SshRemote => "Remote Panel",
             Self::AgentManagement => "Agent Management",
             Self::CodeReview => "Right Panel",
             Self::NotificationsMailbox => "Notifications",

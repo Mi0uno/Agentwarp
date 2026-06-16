@@ -3484,6 +3484,15 @@ impl SshRemoteView {
     }
 
     fn close_wizard(&mut self, ctx: &mut ViewContext<Self>) {
+        if self.wizard_step == WizardStep::Install
+            && self.install_status == SshRemoteInstallStatus::Running
+        {
+            self.wizard_error = Some(
+                "Remote setup is still running. Wait for it to finish before closing.".to_owned(),
+            );
+            ctx.notify();
+            return;
+        }
         self.wizard_mode = None;
         self.wizard_error = None;
         self.wizard_drag_start_origin = None;
@@ -3562,19 +3571,12 @@ impl SshRemoteView {
             WizardStep::Method | WizardStep::Resources | WizardStep::Install => None,
             WizardStep::Config => {
                 let setup_dir = self.editor_text(&self.remote_setup_dir_editor, ctx);
-                if setup_dir.trim().is_empty() {
+                let field_error = if setup_dir.trim().is_empty() {
                     Some("Remote setup directory is required.".to_owned())
                 } else if self.connection_method == SshRemoteConnectionMethod::SshConfig {
                     let alias = self.editor_text(&self.ssh_config_alias_editor, ctx);
                     if alias.trim().is_empty() {
                         Some("SSH config alias is required for this connection method.".to_owned())
-                    } else if self.auth_method == SshRemoteAuthMethod::PasswordPrompt
-                        && self
-                            .editor_text(&self.password_editor, ctx)
-                            .trim()
-                            .is_empty()
-                    {
-                        Some("Saved password is required for password mode.".to_owned())
                     } else {
                         None
                     }
@@ -3604,7 +3606,9 @@ impl SshRemoteView {
                             Some("Port must be a number from 1 to 65535.".to_owned())
                         }
                     }
-                }
+                };
+
+                field_error.or_else(|| self.validate_wizard_host(ctx))
             }
         };
 
@@ -3615,6 +3619,45 @@ impl SshRemoteView {
         } else {
             true
         }
+    }
+
+    fn validate_wizard_host(&self, ctx: &AppContext) -> Option<String> {
+        let form_mode = self.wizard_mode.clone().unwrap_or(FormMode::Add);
+        let host = self.build_host_from_wizard(form_mode, ctx);
+        let resolved = match host.resolve_embedded_target() {
+            Ok(resolved) => resolved,
+            Err(error) => return Some(error),
+        };
+
+        #[cfg(not(target_family = "wasm"))]
+        if let SshRemoteResolvedAuth::PrivateKey(identity_file) = &resolved.auth {
+            if !identity_file.exists() {
+                return Some(format!(
+                    "Private key file was not found: {}",
+                    identity_file.display()
+                ));
+            }
+        }
+
+        for existing in SshRemoteModel::as_ref(ctx).hosts() {
+            if existing.id == host.id {
+                continue;
+            }
+            let Ok(existing_target) = existing.resolve_embedded_target() else {
+                continue;
+            };
+            if existing_target.host == resolved.host
+                && existing_target.port == resolved.port
+                && existing_target.user == resolved.user
+            {
+                return Some(format!(
+                    "Remote host already exists as '{}'.",
+                    existing.display_name()
+                ));
+            }
+        }
+
+        None
     }
 
     fn build_host_from_wizard(&self, form_mode: FormMode, ctx: &AppContext) -> SshRemoteHost {
@@ -3659,6 +3702,9 @@ impl SshRemoteView {
     }
 
     fn start_remote_setup(&mut self, ctx: &mut ViewContext<Self>) {
+        if self.install_status == SshRemoteInstallStatus::Running {
+            return;
+        }
         let Some(form_mode) = self.wizard_mode.clone() else {
             return;
         };

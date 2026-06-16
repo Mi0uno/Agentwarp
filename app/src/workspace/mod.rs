@@ -711,6 +711,12 @@ pub fn init(app: &mut AppContext) {
         .with_context_predicate(id!("Workspace"))
         .with_custom_action(CustomAction::ToggleWarpDrive),
         EditableBinding::new(
+            "workspace:toggle_tools_panel",
+            BindingDescription::new("Open Tools Panel"),
+            WorkspaceAction::ToggleToolsPanel,
+        )
+        .with_context_predicate(id!("Workspace")),
+        EditableBinding::new(
             TOGGLE_RIGHT_PANEL_BINDING_NAME,
             BindingDescription::new("Toggle right tools panel")
                 .with_custom_description(bindings::MAC_MENUS_CONTEXT, "Toggle Right Tools Panel"),
