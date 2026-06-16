@@ -1222,13 +1222,16 @@ fn cli_agent_restart_runtime_command_with_options(
     cli_options: &crate::terminal::cli_agent::AgentRuntimeOptions,
 ) -> Option<String> {
     if agent.supports_resume() {
-        return agent_session_id
+        if let Some(command) = agent_session_id
             .and_then(|session_id| {
                 agent.resume_command_with_runtime_options(session_id, reasoning_effort, cli_options)
             })
             .or_else(|| {
                 agent.resume_last_command_with_runtime_options(reasoning_effort, cli_options)
-            });
+            })
+        {
+            return Some(command);
+        }
     }
 
     let command = agent.command_with_runtime_options(reasoning_effort, cli_options);
@@ -1455,6 +1458,27 @@ mod agent_session_hosted_transcript_tests {
                 &options,
             ),
             Some("codex resume --dangerously-bypass-approvals-and-sandbox --last".to_owned())
+        );
+    }
+
+    #[test]
+    fn cli_agent_restart_runtime_command_starts_fresh_claude_without_session_id() {
+        let options = crate::terminal::cli_agent::AgentRuntimeOptions {
+            model: Some("sonnet".to_owned()),
+            permission_mode: Some(crate::terminal::cli_agent::AgentPermissionMode::ApproveForMe),
+        };
+
+        assert_eq!(
+            cli_agent_restart_runtime_command_with_options(
+                CLIAgent::Claude,
+                None,
+                crate::terminal::cli_agent::AgentReasoningEffort::High,
+                &options,
+            ),
+            Some(
+                "claude --allow-dangerously-skip-permissions --permission-mode acceptEdits --model sonnet --effort high"
+                    .to_owned()
+            )
         );
     }
 
