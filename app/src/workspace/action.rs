@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use session_sharing_protocol::common::SessionId;
 use ui_components::lightbox;
+use uuid::Uuid;
 use warp_util::path::LineAndColumnArg;
 use warpui::accessibility::AccessibilityVerbosity;
 use warpui::geometry::rect::RectF;
@@ -477,6 +478,16 @@ pub enum WorkspaceAction {
     OpenAIFactCollection,
     OpenMCPServerCollection,
     OpenAddMCPServer,
+    OpenPromptWorkflow {
+        workflow_id: SyncId,
+    },
+    TrashPromptWorkflow {
+        workflow_id: SyncId,
+    },
+    ToggleMCPServer {
+        installation_uuid: Uuid,
+        should_run: bool,
+    },
     OpenSkill {
         skill_reference: SkillReference,
     },
@@ -1095,6 +1106,9 @@ impl WorkspaceAction {
             | OpenAIFactCollection
             | OpenMCPServerCollection
             | OpenAddMCPServer
+            | OpenPromptWorkflow { .. }
+            | TrashPromptWorkflow { .. }
+            | ToggleMCPServer { .. }
             | OpenSkill { .. }
             | FocusTerminalViewInWorkspace { .. }
             | FocusPane(..)

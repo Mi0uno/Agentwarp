@@ -25910,6 +25910,36 @@ impl TypedActionView for Workspace {
                     ctx,
                 );
             }
+            OpenPromptWorkflow { workflow_id } => {
+                self.open_workflow_with_existing(
+                    *workflow_id,
+                    &OpenWarpDriveObjectSettings::default(),
+                    ctx,
+                );
+            }
+            TrashPromptWorkflow { workflow_id } => {
+                UpdateManager::handle(ctx).update(ctx, |update_manager, ctx| {
+                    update_manager.trash_object(
+                        CloudObjectTypeAndId::from_id_and_type(*workflow_id, ObjectType::Workflow),
+                        ctx,
+                    );
+                });
+            }
+            ToggleMCPServer {
+                installation_uuid,
+                should_run,
+            } => {
+                crate::ai::mcp::TemplatableMCPServerManager::handle(ctx).update(
+                    ctx,
+                    |manager, ctx| {
+                        if *should_run {
+                            manager.spawn_server(*installation_uuid, ctx);
+                        } else {
+                            manager.shutdown_server(*installation_uuid, ctx);
+                        }
+                    },
+                );
+            }
             OpenSkill { skill_reference } => {
                 #[cfg(feature = "local_fs")]
                 {

@@ -1,6 +1,7 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
+use ai::skills::{home_skills_path, SkillProvider, SkillScope, SKILL_PROVIDER_DEFINITIONS};
 use strum::IntoEnumIterator;
 use warp_core::send_telemetry_from_ctx;
 use warp_core::ui::theme::color::internal_colors;
@@ -29,6 +30,8 @@ use crate::ai::mcp::{
 };
 use crate::ai::skills::{SkillDescriptor, SkillManager};
 use crate::appearance::Appearance;
+use crate::cloud_object::model::persistence::CloudModel;
+use crate::cloud_object::CloudObject;
 use crate::code::buffer_location::LocalOrRemotePath;
 #[cfg(feature = "local_fs")]
 use crate::code::file_tree::FileTreeEvent;
@@ -43,11 +46,14 @@ use crate::pane_group::working_directories::WorkingDirectory;
 use crate::pane_group::{
     PaneGroup, WorkingDirectoriesEvent, WorkingDirectoriesModel, {self},
 };
+use crate::server::ids::SyncId;
 #[cfg(feature = "local_fs")]
 use crate::server::telemetry::CodePanelsFileOpenEntrypoint;
 use crate::server::telemetry::{FileTreeSource, WarpDriveSource};
+use crate::settings::AISettings;
 use crate::settings_view::keybindings::{KeybindingChangedEvent, KeybindingChangedNotifier};
 use crate::settings_view::SettingsSection;
+use crate::terminal::cli_agent_sessions::CLIAgentSessionsModel;
 use crate::terminal::resizable_data::{ModalType, ResizableData};
 use crate::ui_components::buttons::{icon_button, icon_button_with_color};
 use crate::ui_components::icons;
@@ -90,6 +96,7 @@ struct MouseStateHandles {
 #[derive(Clone, Debug)]
 pub enum LeftPanelAction {
     ToolConfigurations,
+    SelectToolsConfigTab(ToolsConfigTab),
     ProjectExplorer,
     GlobalSearch { entry_focus: GlobalSearchEntryFocus },
     WarpDrive,
@@ -126,6 +133,47 @@ pub enum ToolPanelView {
     WarpDrive,
     ConversationListView,
     SshRemote,
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum ToolsConfigTab {
+    Prompts,
+    Mcp,
+    Skills,
+}
+
+impl ToolsConfigTab {
+    const ALL: [Self; 3] = [Self::Prompts, Self::Mcp, Self::Skills];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Prompts => "Prompts",
+            Self::Mcp => "MCP",
+            Self::Skills => "Skills",
+        }
+    }
+
+    fn icon(self) -> Icon {
+        match self {
+            Self::Prompts => Icon::Prompt,
+            Self::Mcp => Icon::Dataflow,
+            Self::Skills => Icon::Folder,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ToolsRowAction {
+    label: &'static str,
+    icon: Icon,
+    action: WorkspaceAction,
+}
+
+struct PromptWorkflowSummary {
+    id: SyncId,
+    name: String,
+    prompt_preview: String,
+    breadcrumbs: String,
 }
 
 /// Encapsulates the active view state to enforce that all mutations go through
@@ -192,6 +240,7 @@ pub struct LeftPanelView {
     mouse_state_handles: MouseStateHandles,
     close_button_mouse_state: MouseStateHandle,
     tools_config_scroll_state: ClippedScrollStateHandle,
+    tools_config_tab: ToolsConfigTab,
     warp_drive_view: ViewHandle<DrivePanel>,
     conversation_list_view: ViewHandle<ConversationListView>,
     ssh_remote_view: ViewHandle<SshRemoteView>,
@@ -411,6 +460,7 @@ impl LeftPanelView {
             mouse_state_handles: Default::default(),
             close_button_mouse_state: Default::default(),
             tools_config_scroll_state: ClippedScrollStateHandle::default(),
+            tools_config_tab: ToolsConfigTab::Prompts,
             warp_drive_view,
             conversation_list_view,
             ssh_remote_view,
@@ -1011,6 +1061,7 @@ impl LeftPanelView {
                 LeftPanelAction::ToolConfigurations => {
                     self.active_view.get() == ToolPanelView::ToolConfigurations
                 }
+                LeftPanelAction::SelectToolsConfigTab(_) => false,
                 LeftPanelAction::ProjectExplorer => {
                     self.active_view.get() == ToolPanelView::ProjectExplorer
                 }
@@ -1038,17 +1089,264 @@ impl LeftPanelView {
             .finish()
     }
 
-    fn render_tools_config_row(
+    fn render_tools_tab_button(
+        tab: ToolsConfigTab,
+        active: bool,
+        count: usize,
+        appearance: &Appearance,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let bg = if active {
+            internal_colors::fg_overlay_2(theme)
+        } else {
+            internal_colors::fg_overlay_1(theme)
+        };
+        let text_color = if active {
+            theme.main_text_color(theme.background())
+        } else {
+            theme.sub_text_color(theme.background())
+        };
+        let icon_color = text_color;
+
+        let button = Container::new(
+            Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_main_axis_alignment(MainAxisAlignment::Center)
+                .with_spacing(6.)
+                .with_child(
+                    ConstrainedBox::new(tab.icon().to_warpui_icon(icon_color).finish())
+                        .with_width(14.)
+                        .with_height(14.)
+                        .finish(),
+                )
+                .with_child(
+                    Text::new_inline(tab.label().to_owned(), appearance.ui_font_family(), 12.)
+                        .with_color(text_color.into())
+                        .with_style(Properties::default().weight(Weight::Semibold))
+                        .finish(),
+                )
+                .with_child(Self::render_count_chip(count, active, appearance))
+                .finish(),
+        )
+        .with_background(bg)
+        .with_border(Border::all(1.).with_border_fill(if active {
+            theme.active_ui_detail()
+        } else {
+            theme.nonactive_ui_detail()
+        }))
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(5.)))
+        .with_padding_left(8.)
+        .with_padding_right(8.)
+        .with_padding_top(5.)
+        .with_padding_bottom(5.)
+        .finish();
+
+        EventHandler::new(button)
+            .on_left_mouse_down(move |ctx, _, _| {
+                ctx.dispatch_typed_action(LeftPanelAction::SelectToolsConfigTab(tab));
+                warpui::elements::DispatchEventResult::StopPropagation
+            })
+            .finish()
+    }
+
+    fn render_count_chip(count: usize, active: bool, appearance: &Appearance) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        Container::new(
+            Text::new_inline(count.to_string(), appearance.ui_font_family(), 10.)
+                .with_color(if active {
+                    theme.main_text_color(theme.background()).into()
+                } else {
+                    theme.sub_text_color(theme.background()).into()
+                })
+                .with_style(Properties::default().weight(Weight::Semibold))
+                .finish(),
+        )
+        .with_background(internal_colors::fg_overlay_3(theme))
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(7.)))
+        .with_padding_left(6.)
+        .with_padding_right(6.)
+        .with_padding_top(1.)
+        .with_padding_bottom(1.)
+        .finish()
+    }
+
+    fn render_tools_tab_bar(&self, app: &AppContext) -> Box<dyn Element> {
+        let appearance = Appearance::as_ref(app);
+        let counts = self.tools_tab_counts(app);
+        let mut row = Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_spacing(6.);
+
+        for tab in ToolsConfigTab::ALL {
+            row.add_child(
+                Shrinkable::new(
+                    1.,
+                    Self::render_tools_tab_button(
+                        tab,
+                        self.tools_config_tab == tab,
+                        *counts.get(&tab).unwrap_or(&0),
+                        appearance,
+                    ),
+                )
+                .finish(),
+            );
+        }
+
+        Container::new(row.finish())
+            .with_padding_left(12.)
+            .with_padding_right(12.)
+            .with_padding_top(10.)
+            .with_padding_bottom(8.)
+            .with_border(
+                Border::bottom(1.).with_border_fill(appearance.theme().nonactive_ui_detail()),
+            )
+            .finish()
+    }
+
+    fn render_metric_chip(
+        label: String,
+        value: usize,
+        icon: Icon,
+        appearance: &Appearance,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        Container::new(
+            Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_spacing(5.)
+                .with_child(
+                    ConstrainedBox::new(
+                        icon.to_warpui_icon(theme.sub_text_color(theme.background()))
+                            .finish(),
+                    )
+                    .with_width(12.)
+                    .with_height(12.)
+                    .finish(),
+                )
+                .with_child(
+                    Text::new_inline(
+                        format!("{label}: {value}"),
+                        appearance.ui_font_family(),
+                        11.,
+                    )
+                    .with_color(theme.main_text_color(theme.background()).into())
+                    .with_style(Properties::default().weight(Weight::Semibold))
+                    .with_clip(ClipConfig::ellipsis())
+                    .finish(),
+                )
+                .finish(),
+        )
+        .with_background(internal_colors::fg_overlay_1(theme))
+        .with_border(Border::all(1.).with_border_fill(theme.nonactive_ui_detail()))
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(10.)))
+        .with_padding_left(8.)
+        .with_padding_right(8.)
+        .with_padding_top(3.)
+        .with_padding_bottom(3.)
+        .finish()
+    }
+
+    fn render_metric_chip_rows(
+        items: Vec<(String, usize, Icon)>,
+        appearance: &Appearance,
+    ) -> Box<dyn Element> {
+        let mut column = Flex::column().with_spacing(6.);
+        for chunk in items.chunks(3) {
+            let mut row = Flex::row().with_spacing(6.);
+            for (label, value, icon) in chunk {
+                row.add_child(
+                    Shrinkable::new(
+                        1.,
+                        Self::render_metric_chip(label.clone(), *value, *icon, appearance),
+                    )
+                    .finish(),
+                );
+            }
+            column.add_child(row.finish());
+        }
+        column.finish()
+    }
+
+    fn render_tools_action_pill(
+        action: ToolsRowAction,
+        appearance: &Appearance,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let text_color = theme.sub_text_color(theme.background());
+        let pill = Container::new(
+            Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_spacing(4.)
+                .with_child(
+                    ConstrainedBox::new(action.icon.to_warpui_icon(text_color).finish())
+                        .with_width(12.)
+                        .with_height(12.)
+                        .finish(),
+                )
+                .with_child(
+                    Text::new_inline(action.label.to_owned(), appearance.ui_font_family(), 11.)
+                        .with_color(text_color.into())
+                        .with_style(Properties::default().weight(Weight::Semibold))
+                        .finish(),
+                )
+                .finish(),
+        )
+        .with_background(internal_colors::fg_overlay_2(theme))
+        .with_border(Border::all(1.).with_border_fill(theme.nonactive_ui_detail()))
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
+        .with_padding_left(6.)
+        .with_padding_right(6.)
+        .with_padding_top(4.)
+        .with_padding_bottom(4.)
+        .finish();
+
+        EventHandler::new(pill)
+            .on_left_mouse_down(move |ctx, _, _| {
+                ctx.dispatch_typed_action(action.action.clone());
+                warpui::elements::DispatchEventResult::StopPropagation
+            })
+            .finish()
+    }
+
+    fn render_tools_management_row(
         title: String,
         subtitle: String,
         icon: Icon,
-        action: WorkspaceAction,
+        status: Option<String>,
+        primary_action: Option<WorkspaceAction>,
+        actions: Vec<ToolsRowAction>,
         appearance: &Appearance,
     ) -> Box<dyn Element> {
         let theme = appearance.theme();
         let icon_color = theme.sub_text_color(theme.background());
         let title_color = theme.main_text_color(theme.background());
         let subtitle_color = theme.sub_text_color(theme.background());
+
+        let mut trailing = Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_main_axis_alignment(MainAxisAlignment::End)
+            .with_spacing(6.);
+        if let Some(status) = status {
+            trailing.add_child(
+                Container::new(
+                    Text::new_inline(status, appearance.ui_font_family(), 10.)
+                        .with_color(theme.sub_text_color(theme.background()).into())
+                        .with_style(Properties::default().weight(Weight::Semibold))
+                        .with_clip(ClipConfig::ellipsis())
+                        .finish(),
+                )
+                .with_background(internal_colors::fg_overlay_2(theme))
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(8.)))
+                .with_padding_left(6.)
+                .with_padding_right(6.)
+                .with_padding_top(2.)
+                .with_padding_bottom(2.)
+                .finish(),
+            );
+        }
+        for action in actions {
+            trailing.add_child(Self::render_tools_action_pill(action, appearance));
+        }
 
         let row = Container::new(
             Flex::row()
@@ -1082,102 +1380,304 @@ impl LeftPanelView {
                     )
                     .finish(),
                 )
+                .with_child(trailing.finish())
                 .finish(),
         )
         .with_background(internal_colors::fg_overlay_1(theme))
-        .with_border(Border::all(1.).with_border_fill(theme.active_ui_detail()))
-        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
+        .with_border(Border::all(1.).with_border_fill(theme.nonactive_ui_detail()))
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(5.)))
         .with_padding_left(10.)
-        .with_padding_right(10.)
+        .with_padding_right(8.)
         .with_padding_top(8.)
         .with_padding_bottom(8.)
         .finish();
 
-        EventHandler::new(row)
-            .on_left_mouse_down(move |ctx, _, _| {
-                ctx.dispatch_typed_action(action.clone());
-                warpui::elements::DispatchEventResult::StopPropagation
-            })
-            .finish()
+        if let Some(action) = primary_action {
+            EventHandler::new(row)
+                .on_left_mouse_down(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(action.clone());
+                    warpui::elements::DispatchEventResult::StopPropagation
+                })
+                .finish()
+        } else {
+            row
+        }
     }
 
-    fn render_tools_config_static_row(
-        title: String,
-        subtitle: String,
-        icon: Icon,
-        appearance: &Appearance,
-    ) -> Box<dyn Element> {
-        let theme = appearance.theme();
-        let icon_color = theme.sub_text_color(theme.background());
-        let title_color = theme.main_text_color(theme.background());
-        let subtitle_color = theme.sub_text_color(theme.background());
-
-        Container::new(
-            Flex::row()
-                .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                .with_spacing(10.)
-                .with_child(
-                    ConstrainedBox::new(icon.to_warpui_icon(icon_color).finish())
-                        .with_width(16.)
-                        .with_height(16.)
-                        .finish(),
-                )
-                .with_child(
-                    Shrinkable::new(
-                        1.,
-                        Flex::column()
-                            .with_spacing(2.)
-                            .with_child(
-                                Text::new_inline(title, appearance.ui_font_family(), 12.)
-                                    .with_color(title_color.into())
-                                    .with_style(Properties::default().weight(Weight::Semibold))
-                                    .with_clip(ClipConfig::ellipsis())
-                                    .finish(),
-                            )
-                            .with_child(Self::render_small_text(
-                                subtitle,
-                                11.,
-                                subtitle_color,
-                                appearance,
-                            ))
-                            .finish(),
-                    )
-                    .finish(),
-                )
-                .finish(),
-        )
-        .with_background(internal_colors::fg_overlay_1(theme))
-        .with_border(Border::all(1.).with_border_fill(theme.active_ui_detail()))
-        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
-        .with_padding_left(10.)
-        .with_padding_right(10.)
-        .with_padding_top(8.)
-        .with_padding_bottom(8.)
-        .finish()
-    }
-
-    fn render_tools_config_section(
+    fn render_tools_section(
         title: &str,
-        rows: Vec<Box<dyn Element>>,
+        subtitle: Option<String>,
+        children: Vec<Box<dyn Element>>,
         appearance: &Appearance,
     ) -> Box<dyn Element> {
         let theme = appearance.theme();
-        let mut column = Flex::column().with_spacing(8.);
-        column.add_child(
+        let mut section = Flex::column().with_spacing(8.);
+        let mut header = Flex::column().with_spacing(2.);
+        header.add_child(
             Text::new_inline(title.to_owned(), appearance.ui_font_family(), 12.)
                 .with_color(theme.main_text_color(theme.background()).into())
                 .with_style(Properties::default().weight(Weight::Semibold))
                 .finish(),
         );
-        for row in rows {
-            column.add_child(row);
+        if let Some(subtitle) = subtitle {
+            header.add_child(Self::render_small_text(
+                subtitle,
+                11.,
+                theme.sub_text_color(theme.background()),
+                appearance,
+            ));
+        }
+        section.add_child(header.finish());
+        for child in children {
+            section.add_child(child);
         }
 
-        Container::new(column.finish())
+        Container::new(section.finish())
             .with_padding_left(12.)
             .with_padding_right(12.)
             .with_padding_top(8.)
             .with_padding_bottom(4.)
+            .finish()
+    }
+
+    fn render_empty_tools_row(message: &str, appearance: &Appearance) -> Box<dyn Element> {
+        Self::render_tools_management_row(
+            message.to_owned(),
+            "No configuration files were detected for the current scope".to_owned(),
+            Icon::File,
+            None,
+            None,
+            vec![],
+            appearance,
+        )
+    }
+
+    fn active_local_working_directory(&self, app: &AppContext) -> Option<LocalOrRemotePath> {
+        self.active_pane_group
+            .as_ref()
+            .and_then(|pane_group| pane_group.upgrade(app))
+            .and_then(|pane_group| {
+                pane_group
+                    .as_ref(app)
+                    .active_session_view(app)
+                    .and_then(|terminal| terminal.as_ref(app).pwd_if_local(app))
+            })
+            .map(PathBuf::from)
+            .map(LocalOrRemotePath::Local)
+    }
+
+    fn prompt_workflows(app: &AppContext) -> Vec<PromptWorkflowSummary> {
+        let mut workflows = CloudModel::as_ref(app)
+            .get_all_active_workflows()
+            .filter(|workflow| workflow.model().data.is_agent_mode_workflow())
+            .map(|workflow| PromptWorkflowSummary {
+                id: workflow.id,
+                name: workflow.model().data.name().to_owned(),
+                prompt_preview: workflow.model().data.content().trim().to_owned(),
+                breadcrumbs: workflow.breadcrumbs(app),
+            })
+            .collect::<Vec<_>>();
+        workflows.sort_by(|a, b| {
+            a.name
+                .to_ascii_lowercase()
+                .cmp(&b.name.to_ascii_lowercase())
+        });
+        workflows
+    }
+
+    fn tools_tab_counts(&self, app: &AppContext) -> HashMap<ToolsConfigTab, usize> {
+        let prompts = Self::prompt_workflows(app).len();
+        let manager = TemplatableMCPServerManager::as_ref(app);
+        let mcps = manager.get_installed_templatable_servers().len()
+            + FileBasedMCPManager::as_ref(app).file_based_servers().len();
+        let skills = SkillManager::as_ref(app)
+            .get_skills_for_working_directory(
+                self.active_local_working_directory(app).as_ref(),
+                app,
+            )
+            .len();
+
+        HashMap::from([
+            (ToolsConfigTab::Prompts, prompts),
+            (ToolsConfigTab::Mcp, mcps),
+            (ToolsConfigTab::Skills, skills),
+        ])
+    }
+
+    fn render_prompt_config_panel(&self, app: &AppContext) -> Box<dyn Element> {
+        let appearance = Appearance::as_ref(app);
+        let theme = appearance.theme();
+        let prompt_workflows = Self::prompt_workflows(app);
+
+        let active_session_info = self
+            .active_pane_group
+            .as_ref()
+            .and_then(|pane_group| pane_group.upgrade(app))
+            .and_then(|pane_group| pane_group.as_ref(app).active_session_view(app))
+            .and_then(|terminal| {
+                CLIAgentSessionsModel::as_ref(app)
+                    .session(terminal.id())
+                    .map(|session| (session.agent, session.received_rich_notification))
+            });
+
+        let mut system_prompt_rows = vec![if let Some((agent, received_rich_notification)) =
+            active_session_info
+        {
+            let agent_name = agent.display_name();
+            let subtitle = if received_rich_notification {
+                "Plugin session; runtime prompt state received".to_owned()
+            } else {
+                "CLI launch session; prompt override is applied when supported".to_owned()
+            };
+            Self::render_tools_management_row(
+                format!("Active session: {agent_name}"),
+                subtitle,
+                agent.icon().unwrap_or(Icon::Prompt),
+                Some("Runtime".to_owned()),
+                None,
+                vec![],
+                appearance,
+            )
+        } else {
+            Self::render_tools_management_row(
+                "No active agent session".to_owned(),
+                "Start an agent session to inspect runtime prompt state".to_owned(),
+                Icon::Prompt,
+                Some("Idle".to_owned()),
+                None,
+                vec![],
+                appearance,
+            )
+        }];
+
+        for agent in AISettings::cli_agent_builtin_prompt_agents() {
+            let prompt_setting = AISettings::as_ref(app).cli_agent_builtin_prompt(agent);
+            let has_custom_prompt = !prompt_setting.is_empty();
+            let status = if has_custom_prompt {
+                prompt_setting.mode.display_name().to_owned()
+            } else {
+                "Default".to_owned()
+            };
+            let subtitle = if has_custom_prompt {
+                prompt_setting
+                    .prompt
+                    .trim()
+                    .lines()
+                    .next()
+                    .unwrap_or("Custom prompt")
+                    .to_owned()
+            } else {
+                "Vendor default prompt; no custom override".to_owned()
+            };
+            system_prompt_rows.push(Self::render_tools_management_row(
+                agent.display_name().to_owned(),
+                subtitle,
+                agent.icon().unwrap_or(Icon::Prompt),
+                Some(status),
+                None,
+                vec![ToolsRowAction {
+                    label: "Edit",
+                    icon: Icon::Pencil,
+                    action: WorkspaceAction::ShowSettingsPage(SettingsSection::AgentBuiltinPrompts),
+                }],
+                appearance,
+            ));
+        }
+
+        let mut workflow_rows = vec![Self::render_tools_management_row(
+            "New prompt".to_owned(),
+            "Reusable Agent Mode workflow prompt".to_owned(),
+            Icon::Plus,
+            None,
+            Some(WorkspaceAction::CreatePersonalAIPrompt),
+            vec![],
+            appearance,
+        )];
+
+        if prompt_workflows.is_empty() {
+            workflow_rows.push(Self::render_empty_tools_row(
+                "No saved prompt workflows",
+                appearance,
+            ));
+        } else {
+            for workflow in prompt_workflows.into_iter().take(20) {
+                let subtitle = if workflow.prompt_preview.is_empty() {
+                    workflow.breadcrumbs
+                } else {
+                    format!("{} - {}", workflow.breadcrumbs, workflow.prompt_preview)
+                };
+                workflow_rows.push(Self::render_tools_management_row(
+                    workflow.name,
+                    subtitle,
+                    Icon::Prompt,
+                    Some("Prompt".to_owned()),
+                    Some(WorkspaceAction::OpenPromptWorkflow {
+                        workflow_id: workflow.id,
+                    }),
+                    vec![
+                        ToolsRowAction {
+                            label: "Edit",
+                            icon: Icon::Pencil,
+                            action: WorkspaceAction::OpenPromptWorkflow {
+                                workflow_id: workflow.id,
+                            },
+                        },
+                        ToolsRowAction {
+                            label: "Delete",
+                            icon: Icon::Trash,
+                            action: WorkspaceAction::TrashPromptWorkflow {
+                                workflow_id: workflow.id,
+                            },
+                        },
+                    ],
+                    appearance,
+                ));
+            }
+        }
+
+        let chips = Self::render_metric_chip_rows(
+            vec![
+                (
+                    "Saved".to_owned(),
+                    Self::prompt_workflows(app).len(),
+                    Icon::Prompt,
+                ),
+                (
+                    "Runtime".to_owned(),
+                    usize::from(active_session_info.is_some()),
+                    Icon::Settings,
+                ),
+                (
+                    "System".to_owned(),
+                    AISettings::cli_agent_builtin_prompt_agents().len(),
+                    Icon::Settings,
+                ),
+            ],
+            appearance,
+        );
+
+        let mut content = Flex::column().with_spacing(10.);
+        content.add_child(
+            Container::new(chips)
+                .with_padding_left(12.)
+                .with_padding_right(12.)
+                .finish(),
+        );
+        content.add_child(Self::render_tools_section(
+            "System Prompts",
+            Some("Runtime state and per-agent overrides".to_owned()),
+            system_prompt_rows,
+            appearance,
+        ));
+        content.add_child(Self::render_tools_section(
+            "Prompt Workflows",
+            Some("Saved Agent Mode prompts with owner breadcrumbs".to_owned()),
+            workflow_rows,
+            appearance,
+        ));
+
+        Container::new(content.finish())
+            .with_background(theme.background())
             .finish()
     }
 
@@ -1192,51 +1692,79 @@ impl LeftPanelView {
         }
     }
 
-    fn render_mcp_config_rows(&self, app: &AppContext) -> Vec<Box<dyn Element>> {
+    fn render_mcp_config_panel(&self, app: &AppContext) -> Box<dyn Element> {
         let appearance = Appearance::as_ref(app);
         let manager = TemplatableMCPServerManager::as_ref(app);
-        let mut rows = vec![
-            Self::render_tools_config_row(
-                "All MCP servers".to_owned(),
-                "Central MCP configuration for Warp, Claude, Codex, and other agents".to_owned(),
-                Icon::Dataflow,
-                WorkspaceAction::OpenMCPServerCollection,
-                appearance,
-            ),
-            Self::render_tools_config_row(
-                "Add MCP server".to_owned(),
-                "Create a shared server config or install from gallery".to_owned(),
-                Icon::Plus,
-                WorkspaceAction::OpenAddMCPServer,
-                appearance,
-            ),
+        let file_based_manager = FileBasedMCPManager::as_ref(app);
+        let file_based_servers = file_based_manager.file_based_servers();
+
+        let installed_count = manager.get_installed_templatable_servers().len();
+        let detected_count = file_based_servers.len();
+        let running_count = manager
+            .get_installed_templatable_servers()
+            .keys()
+            .filter(|uuid| {
+                matches!(
+                    manager.get_server_state(**uuid),
+                    Some(MCPServerState::Running)
+                )
+            })
+            .count();
+
+        let mut chip_items = vec![
+            ("Managed".to_owned(), installed_count, Icon::Dataflow),
+            ("Detected".to_owned(), detected_count, Icon::Dataflow02),
+            ("Running".to_owned(), running_count, Icon::Play),
         ];
+        chip_items.extend(MCPProvider::iter().map(|provider| {
+            let count = file_based_servers
+                .iter()
+                .filter(|installation| {
+                    !file_based_manager
+                        .directory_paths_for_installation_and_provider(
+                            installation.uuid(),
+                            provider,
+                        )
+                        .is_empty()
+                })
+                .count();
+            (provider.display_name().to_owned(), count, provider.icon())
+        }));
+        let chips = Self::render_metric_chip_rows(chip_items, appearance);
 
-        let file_based_count = FileBasedMCPManager::as_ref(app).file_based_servers().len();
-        rows.push(Self::render_tools_config_row(
-            "Detected provider configs".to_owned(),
-            format!(
-                "{file_based_count} servers from Claude, Codex, Warp, and other agent config files"
-            ),
-            Icon::Dataflow02,
-            WorkspaceAction::OpenMCPServerCollection,
+        let gateway_rows = vec![Self::render_tools_management_row(
+            "Agentwarp managed MCP layer".to_owned(),
+            "Runtime state, provider configs, and installed servers".to_owned(),
+            Icon::Dataflow,
+            Some("Unified".to_owned()),
+            None,
+            vec![ToolsRowAction {
+                label: "Add",
+                icon: Icon::Plus,
+                action: WorkspaceAction::OpenAddMCPServer,
+            }],
             appearance,
-        ));
+        )];
 
-        for provider in MCPProvider::iter() {
-            rows.push(Self::render_tools_config_row(
-                format!("{} MCP config", provider.display_name()),
-                format!(
-                    "Home: {} - Project: {}",
-                    provider.home_config_path().display(),
-                    provider.project_config_path().display()
-                ),
-                provider.icon(),
-                WorkspaceAction::OpenMCPServerCollection,
-                appearance,
-            ));
-        }
+        let provider_rows = MCPProvider::iter()
+            .map(|provider| {
+                Self::render_tools_management_row(
+                    provider.display_name().to_owned(),
+                    format!(
+                        "Home: {} - Project: {}",
+                        provider.home_config_path().display(),
+                        provider.project_config_path().display()
+                    ),
+                    provider.icon(),
+                    Some("Config".to_owned()),
+                    None,
+                    vec![],
+                    appearance,
+                )
+            })
+            .collect::<Vec<_>>();
 
+        let mut server_rows = Vec::new();
         let mut installations = manager
             .get_installed_templatable_servers()
             .values()
@@ -1248,23 +1776,107 @@ impl LeftPanelView {
                 .to_ascii_lowercase()
         });
 
-        for installation in installations.into_iter().take(8) {
-            let state = manager.get_server_state(installation.uuid());
-            let tool_count = manager.tools_for_server(installation.uuid()).len();
+        for installation in installations.into_iter().take(20) {
+            let uuid = installation.uuid();
+            let state = manager.get_server_state(uuid);
+            let tool_count = manager.tools_for_server(uuid).len();
+            let should_run = !matches!(state, Some(MCPServerState::Running));
             let subtitle = if tool_count == 0 {
-                Self::mcp_state_label(state).to_owned()
+                "No tools reported yet".to_owned()
             } else {
-                format!("{} - {} tools", Self::mcp_state_label(state), tool_count)
+                format!("{tool_count} tools available through the unified MCP manager")
             };
-            rows.push(Self::render_tools_config_static_row(
+            server_rows.push(Self::render_tools_management_row(
                 installation.templatable_mcp_server().name.clone(),
                 subtitle,
                 Icon::Dataflow,
+                Some(Self::mcp_state_label(state).to_owned()),
+                None,
+                vec![
+                    ToolsRowAction {
+                        label: if should_run { "Start" } else { "Stop" },
+                        icon: if should_run {
+                            Icon::Play
+                        } else {
+                            Icon::StopFilled
+                        },
+                        action: WorkspaceAction::ToggleMCPServer {
+                            installation_uuid: uuid,
+                            should_run,
+                        },
+                    },
+                    ToolsRowAction {
+                        label: "Edit",
+                        icon: Icon::Pencil,
+                        action: WorkspaceAction::OpenMCPServerCollection,
+                    },
+                ],
                 appearance,
             ));
         }
 
-        rows
+        for installation in file_based_servers.into_iter().take(12) {
+            let uuid = installation.uuid();
+            let state = manager.get_server_state(uuid);
+            let provider_label = MCPProvider::iter()
+                .find(|provider| {
+                    !file_based_manager
+                        .directory_paths_for_installation_and_provider(uuid, *provider)
+                        .is_empty()
+                })
+                .map(|provider| provider.display_name().to_owned())
+                .unwrap_or_else(|| "Provider config".to_owned());
+            server_rows.push(Self::render_tools_management_row(
+                installation.templatable_mcp_server().name.clone(),
+                format!("Detected from {provider_label}; managed without copying config into Warp"),
+                Icon::Dataflow02,
+                Some(Self::mcp_state_label(state).to_owned()),
+                None,
+                vec![ToolsRowAction {
+                    label: "Edit",
+                    icon: Icon::Pencil,
+                    action: WorkspaceAction::OpenMCPServerCollection,
+                }],
+                appearance,
+            ));
+        }
+
+        if server_rows.is_empty() {
+            server_rows.push(Self::render_empty_tools_row(
+                "No MCP servers detected",
+                appearance,
+            ));
+        }
+
+        let mut content = Flex::column().with_spacing(10.);
+        content.add_child(
+            Container::new(chips)
+                .with_padding_left(12.)
+                .with_padding_right(12.)
+                .finish(),
+        );
+        content.add_child(Self::render_tools_section(
+            "Unified MCP Management",
+            Some(
+                "Central management for Warp, Claude, Codex, Gemini, OpenCode, and Agents"
+                    .to_owned(),
+            ),
+            gateway_rows,
+            appearance,
+        ));
+        content.add_child(Self::render_tools_section(
+            "Provider Configs",
+            Some("Watched home and project config paths".to_owned()),
+            provider_rows,
+            appearance,
+        ));
+        content.add_child(Self::render_tools_section(
+            "Servers",
+            Some("Installed and auto-detected MCP servers managed from one place".to_owned()),
+            server_rows,
+            appearance,
+        ));
+        content.finish()
     }
 
     fn skill_subtitle(skill: &SkillDescriptor) -> String {
@@ -1278,111 +1890,162 @@ impl LeftPanelView {
         }
     }
 
-    fn render_skill_config_rows(&self, app: &AppContext) -> Vec<Box<dyn Element>> {
+    fn render_skill_config_panel(&self, app: &AppContext) -> Box<dyn Element> {
         let appearance = Appearance::as_ref(app);
-        let working_directory = self
-            .active_pane_group
-            .as_ref()
-            .and_then(|pane_group| pane_group.upgrade(app))
-            .and_then(|pane_group| {
-                pane_group
-                    .as_ref(app)
-                    .active_session_view(app)
-                    .and_then(|terminal| terminal.as_ref(app).pwd_if_local(app))
-            })
-            .map(PathBuf::from)
-            .map(LocalOrRemotePath::Local);
-
-        let mut rows = vec![Self::render_tools_config_row(
-            "Skill providers".to_owned(),
-            "Unified skill folders for Warp, Claude, Codex, Gemini, OpenCode, and more".to_owned(),
-            Icon::Folder,
-            WorkspaceAction::ShowSettingsPage(SettingsSection::WarpAgent),
-            appearance,
-        )];
-
+        let working_directory = self.active_local_working_directory(app);
         let mut skills = SkillManager::as_ref(app)
             .get_skills_for_working_directory(working_directory.as_ref(), app);
         skills.sort_by(|a, b| {
             a.provider
                 .to_string()
                 .cmp(&b.provider.to_string())
+                .then_with(|| a.scope.to_string().cmp(&b.scope.to_string()))
                 .then_with(|| a.name.cmp(&b.name))
         });
 
+        let mut provider_counts: HashMap<SkillProvider, usize> = HashMap::new();
+        let mut scope_counts: HashMap<SkillScope, usize> = HashMap::new();
+        for skill in &skills {
+            *provider_counts.entry(skill.provider).or_default() += 1;
+            *scope_counts.entry(skill.scope).or_default() += 1;
+        }
+
+        let chips = Self::render_metric_chip_rows(
+            vec![
+                (
+                    "Home".to_owned(),
+                    *scope_counts.get(&SkillScope::Home).unwrap_or(&0),
+                    Icon::Folder,
+                ),
+                (
+                    "Project".to_owned(),
+                    *scope_counts.get(&SkillScope::Project).unwrap_or(&0),
+                    Icon::Folder,
+                ),
+                (
+                    "Bundled".to_owned(),
+                    *scope_counts.get(&SkillScope::Bundled).unwrap_or(&0),
+                    Icon::Warp,
+                ),
+            ],
+            appearance,
+        );
+
+        let provider_rows = SKILL_PROVIDER_DEFINITIONS
+            .iter()
+            .map(|definition| {
+                let provider = definition.provider;
+                let home_path = home_skills_path(provider)
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "Not available on this platform".to_owned());
+                Self::render_tools_management_row(
+                    provider.to_string(),
+                    format!(
+                        "Home: {home_path} - Project: {}",
+                        definition.skills_path.display()
+                    ),
+                    provider.icon(),
+                    Some(format!(
+                        "{} skills",
+                        provider_counts.get(&provider).unwrap_or(&0)
+                    )),
+                    None,
+                    vec![],
+                    appearance,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let mut skill_rows = Vec::new();
         if skills.is_empty() {
-            rows.push(Self::render_tools_config_static_row(
-                "No skills detected".to_owned(),
-                "Add SKILL.md files under supported provider skill folders".to_owned(),
-                Icon::File,
+            skill_rows.push(Self::render_empty_tools_row(
+                "No skills detected",
                 appearance,
             ));
         } else {
-            for skill in skills.into_iter().take(10) {
-                rows.push(Self::render_tools_config_row(
+            for skill in skills.into_iter().take(30) {
+                let can_edit = !matches!(skill.scope, SkillScope::Bundled);
+                skill_rows.push(Self::render_tools_management_row(
                     format!("/{}", skill.name),
                     Self::skill_subtitle(&skill),
                     skill.icon_override.unwrap_or_else(|| skill.provider.icon()),
-                    WorkspaceAction::OpenSkill {
+                    Some(skill.scope.to_string()),
+                    can_edit.then(|| WorkspaceAction::OpenSkill {
                         skill_reference: skill.reference.clone(),
+                    }),
+                    if can_edit {
+                        vec![ToolsRowAction {
+                            label: "Open",
+                            icon: Icon::Pencil,
+                            action: WorkspaceAction::OpenSkill {
+                                skill_reference: skill.reference.clone(),
+                            },
+                        }]
+                    } else {
+                        vec![]
                     },
                     appearance,
                 ));
             }
         }
 
-        rows
+        let mut content = Flex::column().with_spacing(10.);
+        content.add_child(
+            Container::new(chips)
+                .with_padding_left(12.)
+                .with_padding_right(12.)
+                .finish(),
+        );
+        content.add_child(Self::render_tools_section(
+            "Skill Providers",
+            Some(
+                "Unified skill folders for Warp, Claude, Codex, Gemini, OpenCode, and other agents"
+                    .to_owned(),
+            ),
+            provider_rows,
+            appearance,
+        ));
+        content.add_child(Self::render_tools_section(
+            "Detected Skills",
+            Some(
+                "Skills automatically read from home, project, and bundled provider folders"
+                    .to_owned(),
+            ),
+            skill_rows,
+            appearance,
+        ));
+        content.finish()
     }
 
     fn render_tools_config_panel(&self, app: &AppContext) -> Box<dyn Element> {
         let appearance = Appearance::as_ref(app);
         let theme = appearance.theme();
-        let prompt_rows = vec![
-            Self::render_tools_config_row(
-                "System prompts".to_owned(),
-                "Built-in agent prompt configuration".to_owned(),
-                Icon::Prompt,
-                WorkspaceAction::ShowSettingsPage(SettingsSection::AgentBuiltinPrompts),
-                appearance,
-            ),
-            Self::render_tools_config_row(
-                "New personal prompt".to_owned(),
-                "Create a reusable prompt workflow".to_owned(),
-                Icon::Plus,
-                WorkspaceAction::CreatePersonalAIPrompt,
-                appearance,
-            ),
-        ];
+        let body = match self.tools_config_tab {
+            ToolsConfigTab::Prompts => self.render_prompt_config_panel(app),
+            ToolsConfigTab::Mcp => self.render_mcp_config_panel(app),
+            ToolsConfigTab::Skills => self.render_skill_config_panel(app),
+        };
 
-        let mut content = Flex::column()
+        Flex::column()
             .with_main_axis_size(MainAxisSize::Max)
-            .with_spacing(8.);
-        content.add_child(Self::render_tools_config_section(
-            "Prompt Configurations",
-            prompt_rows,
-            appearance,
-        ));
-        content.add_child(Self::render_tools_config_section(
-            "MCP Configurations",
-            self.render_mcp_config_rows(app),
-            appearance,
-        ));
-        content.add_child(Self::render_tools_config_section(
-            "Skill Configurations",
-            self.render_skill_config_rows(app),
-            appearance,
-        ));
-
-        ClippedScrollable::vertical(
-            self.tools_config_scroll_state.clone(),
-            content.finish(),
-            ScrollbarWidth::Auto,
-            theme.nonactive_ui_detail().into(),
-            theme.active_ui_detail().into(),
-            ElementFill::None,
-        )
-        .with_overlayed_scrollbar()
-        .finish()
+            .with_child(self.render_tools_tab_bar(app))
+            .with_child(
+                Shrinkable::new(
+                    1.,
+                    ClippedScrollable::vertical(
+                        self.tools_config_scroll_state.clone(),
+                        body,
+                        ScrollbarWidth::Auto,
+                        theme.nonactive_ui_detail().into(),
+                        theme.active_ui_detail().into(),
+                        ElementFill::None,
+                    )
+                    .with_overlayed_scrollbar()
+                    .finish(),
+                )
+                .finish(),
+            )
+            .finish()
     }
 
     fn render_button(
@@ -1461,6 +2124,10 @@ impl LeftPanelView {
     ) {
         match action {
             LeftPanelAction::ToolConfigurations => {
+                active_view_state::set(self, ToolPanelView::ToolConfigurations, ctx);
+            }
+            LeftPanelAction::SelectToolsConfigTab(tab) => {
+                self.tools_config_tab = *tab;
                 active_view_state::set(self, ToolPanelView::ToolConfigurations, ctx);
             }
             LeftPanelAction::ProjectExplorer => {
