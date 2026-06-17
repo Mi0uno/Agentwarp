@@ -2,7 +2,6 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use ai::skills::{home_skills_path, SkillProvider, SkillScope, SKILL_PROVIDER_DEFINITIONS};
-use pathfinder_geometry::vector::vec2f;
 use strum::IntoEnumIterator;
 use warp_core::send_telemetry_from_ctx;
 use warp_core::ui::theme::color::internal_colors;
@@ -1393,7 +1392,7 @@ impl LeftPanelView {
         .finish()
     }
 
-    fn render_tools_tab_bar(&self, app: &AppContext) -> Box<dyn Element> {
+    fn render_tools_tab_button_row(&self, app: &AppContext) -> Box<dyn Element> {
         let appearance = Appearance::as_ref(app);
         let counts = self.tools_tab_counts(app);
         let mut row = Flex::row()
@@ -1415,15 +1414,7 @@ impl LeftPanelView {
             );
         }
 
-        Container::new(row.finish())
-            .with_padding_left(12.)
-            .with_padding_right(12.)
-            .with_padding_top(10.)
-            .with_padding_bottom(8.)
-            .with_border(
-                Border::bottom(1.).with_border_fill(appearance.theme().nonactive_ui_detail()),
-            )
-            .finish()
+        row.finish()
     }
 
     fn render_provider_filter_button(
@@ -1517,10 +1508,7 @@ impl LeftPanelView {
     }
 
     fn render_tools_config_header(&self, app: &AppContext) -> Box<dyn Element> {
-        Flex::column()
-            .with_child(self.render_tools_tab_bar(app))
-            .with_child(self.render_tools_provider_filter_bar(app))
-            .finish()
+        self.render_tools_provider_filter_bar(app)
     }
 
     fn metric_label(label: String, value: usize) -> String {
@@ -3134,7 +3122,9 @@ impl View for LeftPanelView {
             Container::new({
                 let column = Flex::column();
 
-                let header_left = if let Some(row) = toolbelt_button_row {
+                let header_left = if self.active_view.get() == ToolPanelView::ToolConfigurations {
+                    self.render_tools_tab_button_row(app)
+                } else if let Some(row) = toolbelt_button_row {
                     row
                 } else {
                     Flex::row().finish()
@@ -3170,13 +3160,6 @@ impl View for LeftPanelView {
         if warpui::platform::is_mobile_device() {
             return panel_content;
         }
-
-        let panel_width = self
-            .resizable_state_handle
-            .lock()
-            .map(|state| state.size())
-            .unwrap_or(MIN_SIDEBAR_WIDTH);
-        let panel_content = Clipped::sized(panel_content, vec2f(panel_width, 100_000.0)).finish();
 
         let drag_side = match self.panel_position {
             super::PanelPosition::Left => DragBarSide::Right,
