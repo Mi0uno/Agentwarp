@@ -1,0 +1,101 @@
+name: Linux Dev .deb Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Package version tag. Leave empty to use v1.0.0-dev.<run>.<attempt>."
+        required: false
+        default: ""
+      channel:
+        description: "Release channel to bundle."
+        required: true
+        type: choice
+        default: oss
+        options:
+          - oss
+          - dev
+          - local
+      debug_build:
+        description: "Use Cargo's dev profile for faster validation builds."
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  SETTINGS_SCHEMA_CACHE: ${{ github.workspace }}/.settings_schema_cache.json
+
+jobs:
+  linux_deb:
+    name: Build Linux .deb (${{ inputs.channel }})
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: ./.github/actions/prepare_environment
+        with:
+          target_os: linux
+          is_self_hosted: false
+          install_release_deps: true
+
+      - name: Install Debian packaging tools
+        shell: bash
+        run: sudo apt-get install -y fakeroot
+
+      - name: Verify OSS icon
+        if: ${{ inputs.channel == 'oss' }}
+        shell: bash
+        run: test -f app/channels/oss/icon/no-padding/icon.ico
+
+      - name: Resolve package version
+        id: version
+        shell: bash
+        run: |
+          release_tag="${{ inputs.release_tag }}"
+          if [[ -z "$release_tag" ]]; then
+            release_tag="v1.0.0-dev.${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}"
+          fi
+
+          ref_slug="${GITHUB_REF_NAME//\//-}"
+          artifact_name="linux-dev-deb-${ref_slug}-${release_tag}"
+          artifact_name="$(printf '%s' "$artifact_name" | tr -cs 'A-Za-z0-9_.-' '-')"
+
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=$artifact_name" >> "$GITHUB_OUTPUT"
+
+      - name: Clean stale bundle output
+        shell: bash
+        run: rm -rf target/*/bundle/linux
+
+      - name: Build Debian package
+        id: bundle_app
+        shell: bash
+        run: |
+          debug_args=()
+          if [[ "$DEBUG_BUILD" == "true" ]]; then
+            debug_args+=(--debug)
+          fi
+
+          script/bundle "${debug_args[@]}" --channel "$CHANNEL" --release-tag "$RELEASE_TAG" --packages deb
+        env:
+          CHANNEL: ${{ inputs.channel }}
+          DEBUG_BUILD: ${{ inputs.debug_build }}
+          RELEASE_TAG: ${{ steps.version.outputs.release_tag }}
+
+      - name: List Debian packages
+        shell: bash
+        run: ls -lh target/*/bundle/linux/*.deb
+
+      - name: Upload Debian package artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: ${{ steps.version.outputs.artifact_name }}
+          path: target/*/bundle/linux/*.deb
+          if-no-files-found: error
+          retention-days: 14
