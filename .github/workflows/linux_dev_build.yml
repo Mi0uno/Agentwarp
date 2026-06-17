@@ -1,6 +1,9 @@
 name: Linux Dev .deb Build
 
 on:
+  push:
+    branches-ignore:
+      - master
   workflow_dispatch:
     inputs:
       release_tag:
@@ -31,7 +34,7 @@ env:
 
 jobs:
   linux_deb:
-    name: Build Linux .deb (${{ inputs.channel }})
+    name: Build Linux .deb (${{ github.event.inputs.channel || 'oss' }})
     runs-on: ubuntu-22.04
     timeout-minutes: 120
     steps:
@@ -49,7 +52,7 @@ jobs:
         run: sudo apt-get install -y fakeroot
 
       - name: Verify OSS icon
-        if: ${{ inputs.channel == 'oss' }}
+        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.channel == 'oss' }}
         shell: bash
         run: test -f app/channels/oss/icon/no-padding/icon.ico
 
@@ -57,7 +60,7 @@ jobs:
         id: version
         shell: bash
         run: |
-          release_tag="${{ inputs.release_tag }}"
+          release_tag="${{ github.event.inputs.release_tag || '' }}"
           if [[ -z "$release_tag" ]]; then
             release_tag="v1.0.0-dev.${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}"
           fi
@@ -84,8 +87,8 @@ jobs:
 
           script/bundle "${debug_args[@]}" --channel "$CHANNEL" --release-tag "$RELEASE_TAG" --packages deb
         env:
-          CHANNEL: ${{ inputs.channel }}
-          DEBUG_BUILD: ${{ inputs.debug_build }}
+          CHANNEL: ${{ github.event.inputs.channel || 'oss' }}
+          DEBUG_BUILD: ${{ github.event.inputs.debug_build || 'false' }}
           RELEASE_TAG: ${{ steps.version.outputs.release_tag }}
 
       - name: List Debian packages
