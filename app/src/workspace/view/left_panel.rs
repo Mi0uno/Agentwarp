@@ -1484,7 +1484,7 @@ impl LeftPanelView {
     fn render_tools_provider_filter_bar(&self, app: &AppContext) -> Box<dyn Element> {
         let appearance = Appearance::as_ref(app);
         let mut column = Flex::column().with_spacing(6.);
-        for chunk in ToolsProviderFilter::ALL.chunks(4) {
+        for chunk in ToolsProviderFilter::ALL.chunks(3) {
             let mut row = Flex::row()
                 .with_cross_axis_alignment(CrossAxisAlignment::Center)
                 .with_spacing(6.);
@@ -1727,6 +1727,35 @@ impl LeftPanelView {
             .finish()
     }
 
+    fn render_tools_action_icon_button(
+        action: ToolsRowAction,
+        appearance: &Appearance,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let ui_builder = appearance.ui_builder().clone();
+        let tooltip = action.label.to_owned();
+        icon_button_with_color(
+            appearance,
+            action.icon,
+            false,
+            MouseStateHandle::default(),
+            theme.sub_text_color(theme.background()),
+        )
+        .with_tooltip(move || ui_builder.tool_tip(tooltip.clone()).build().finish())
+        .with_style(UiComponentStyles {
+            width: Some(22.),
+            height: Some(22.),
+            padding: Some(Coords::uniform(4.)),
+            background: Some(internal_colors::fg_overlay_1(theme).into()),
+            ..Default::default()
+        })
+        .build()
+        .on_click(move |ctx, _, _| {
+            ctx.dispatch_typed_action(action.action.clone());
+        })
+        .finish()
+    }
+
     fn render_tools_management_row(
         title: String,
         subtitle: String,
@@ -1744,7 +1773,7 @@ impl LeftPanelView {
         let mut trailing = Flex::row()
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
             .with_main_axis_alignment(MainAxisAlignment::End)
-            .with_spacing(6.);
+            .with_spacing(4.);
         if let Some(status) = status {
             trailing.add_child(
                 Container::new(
@@ -1763,8 +1792,30 @@ impl LeftPanelView {
                 .finish(),
             );
         }
-        for action in actions {
-            trailing.add_child(Self::render_tools_action_pill(action, appearance));
+
+        let mut details = Flex::column().with_spacing(3.);
+        details.add_child(
+            Text::new_inline(title, appearance.ui_font_family(), 12.)
+                .with_color(title_color.into())
+                .with_style(Properties::default().weight(Weight::Semibold))
+                .with_clip(ClipConfig::ellipsis())
+                .finish(),
+        );
+        details.add_child(Self::render_small_text(
+            subtitle,
+            11.,
+            subtitle_color,
+            appearance,
+        ));
+
+        if !actions.is_empty() {
+            let mut action_row = Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_spacing(4.);
+            for action in actions {
+                action_row.add_child(Self::render_tools_action_icon_button(action, appearance));
+            }
+            details.add_child(action_row.finish());
         }
 
         let row = Container::new(
@@ -1777,28 +1828,7 @@ impl LeftPanelView {
                         .with_height(16.)
                         .finish(),
                 )
-                .with_child(
-                    Shrinkable::new(
-                        1.,
-                        Flex::column()
-                            .with_spacing(2.)
-                            .with_child(
-                                Text::new_inline(title, appearance.ui_font_family(), 12.)
-                                    .with_color(title_color.into())
-                                    .with_style(Properties::default().weight(Weight::Semibold))
-                                    .with_clip(ClipConfig::ellipsis())
-                                    .finish(),
-                            )
-                            .with_child(Self::render_small_text(
-                                subtitle,
-                                11.,
-                                subtitle_color,
-                                appearance,
-                            ))
-                            .finish(),
-                    )
-                    .finish(),
-                )
+                .with_child(Shrinkable::new(1., details.finish()).finish())
                 .with_child(trailing.finish())
                 .finish(),
         )
@@ -2327,7 +2357,7 @@ impl LeftPanelView {
                 ];
                 if provider != MCPProvider::Claude {
                     actions.push(ToolsRowAction {
-                        label: "Sync H",
+                        label: "Sync home config from Claude",
                         icon: Icon::RefreshCcw,
                         action: WorkspaceAction::SyncMCPConfig {
                             source: MCPProvider::Claude,
@@ -2336,7 +2366,7 @@ impl LeftPanelView {
                         },
                     });
                     actions.push(ToolsRowAction {
-                        label: "Sync P",
+                        label: "Sync project config from Claude",
                         icon: Icon::RefreshCcw,
                         action: WorkspaceAction::SyncMCPConfig {
                             source: MCPProvider::Claude,
@@ -2600,7 +2630,7 @@ impl LeftPanelView {
                 }
                 if provider != SkillProvider::Claude {
                     actions.push(ToolsRowAction {
-                        label: "Sync H",
+                        label: "Sync home skills from Claude",
                         icon: Icon::RefreshCcw,
                         action: WorkspaceAction::SyncSkillProvider {
                             source: SkillProvider::Claude,
@@ -2609,7 +2639,7 @@ impl LeftPanelView {
                         },
                     });
                     actions.push(ToolsRowAction {
-                        label: "Sync P",
+                        label: "Sync project skills from Claude",
                         icon: Icon::RefreshCcw,
                         action: WorkspaceAction::SyncSkillProvider {
                             source: SkillProvider::Claude,
