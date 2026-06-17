@@ -2,17 +2,18 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use ai::skills::{home_skills_path, SkillProvider, SkillScope, SKILL_PROVIDER_DEFINITIONS};
+use pathfinder_geometry::vector::vec2f;
 use strum::IntoEnumIterator;
 use warp_core::send_telemetry_from_ctx;
 use warp_core::ui::theme::color::internal_colors;
 use warp_core::ui::Icon;
 use warp_util::path::LineAndColumnArg;
 use warpui::elements::{
-    resizable_state_handle, Border, ChildView, ClippedScrollStateHandle, ClippedScrollable,
-    ConstrainedBox, Container, CornerRadius, CrossAxisAlignment, DragBarSide, Element, Empty,
-    EventHandler, Fill as ElementFill, Flex, MainAxisAlignment, MainAxisSize, MouseStateHandle,
-    ParentElement, Radius, Resizable, ResizableStateHandle, SavePosition, ScrollbarWidth,
-    Shrinkable, Text,
+    resizable_state_handle, Border, ChildView, Clipped, ClippedScrollStateHandle,
+    ClippedScrollable, ConstrainedBox, Container, CornerRadius, CrossAxisAlignment, DragBarSide,
+    Element, Empty, EventHandler, Fill as ElementFill, Flex, MainAxisAlignment, MainAxisSize,
+    MouseStateHandle, ParentElement, Radius, Resizable, ResizableStateHandle, SavePosition,
+    ScrollbarWidth, Shrinkable, Text,
 };
 use warpui::fonts::{Properties, Weight};
 use warpui::platform::Cursor;
@@ -1484,7 +1485,7 @@ impl LeftPanelView {
     fn render_tools_provider_filter_bar(&self, app: &AppContext) -> Box<dyn Element> {
         let appearance = Appearance::as_ref(app);
         let mut column = Flex::column().with_spacing(6.);
-        for chunk in ToolsProviderFilter::ALL.chunks(3) {
+        for chunk in ToolsProviderFilter::ALL.chunks(2) {
             let mut row = Flex::row()
                 .with_cross_axis_alignment(CrossAxisAlignment::Center)
                 .with_spacing(6.);
@@ -2760,7 +2761,7 @@ impl LeftPanelView {
             ToolsConfigTab::Skills => self.render_skill_config_panel(app),
         };
 
-        Flex::column()
+        let tools_content = Flex::column()
             .with_main_axis_size(MainAxisSize::Max)
             .with_child(self.render_tools_config_header(app))
             .with_child(
@@ -2779,7 +2780,9 @@ impl LeftPanelView {
                 )
                 .finish(),
             )
-            .finish()
+            .finish();
+
+        Clipped::new(tools_content).finish()
     }
 
     fn render_button(
@@ -3127,43 +3130,53 @@ impl View for LeftPanelView {
             .finish(),
         };
 
-        let panel_content = Container::new({
-            let column = Flex::column();
+        let panel_content = Clipped::new(
+            Container::new({
+                let column = Flex::column();
 
-            let header_left = if let Some(row) = toolbelt_button_row {
-                row
-            } else {
-                Flex::row().finish()
-            };
+                let header_left = if let Some(row) = toolbelt_button_row {
+                    row
+                } else {
+                    Flex::row().finish()
+                };
 
-            let header_row = Container::new(
-                ConstrainedBox::new(
-                    Flex::row()
-                        .with_main_axis_size(MainAxisSize::Max)
-                        .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
-                        .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                        .with_child(Shrinkable::new(1.0, header_left).finish())
-                        .with_child(self.close_button(appearance, app))
-                        .finish(),
+                let header_row = Container::new(
+                    ConstrainedBox::new(
+                        Flex::row()
+                            .with_main_axis_size(MainAxisSize::Max)
+                            .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
+                            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                            .with_child(Shrinkable::new(1.0, header_left).finish())
+                            .with_child(self.close_button(appearance, app))
+                            .finish(),
+                    )
+                    .with_height(PANE_HEADER_HEIGHT)
+                    .finish(),
                 )
-                .with_height(PANE_HEADER_HEIGHT)
-                .finish(),
-            )
-            .with_padding_left(10.)
-            .with_padding_right(HEADER_EDGE_PADDING)
-            .finish();
+                .with_padding_left(10.)
+                .with_padding_right(HEADER_EDGE_PADDING)
+                .finish();
 
-            column
-                .with_child(header_row)
-                .with_child(Shrinkable::new(1.0, content_area).finish())
-                .with_main_axis_size(MainAxisSize::Max)
-                .finish()
-        })
+                column
+                    .with_child(header_row)
+                    .with_child(Shrinkable::new(1.0, content_area).finish())
+                    .with_main_axis_size(MainAxisSize::Max)
+                    .finish()
+            })
+            .finish(),
+        )
         .finish();
 
         if warpui::platform::is_mobile_device() {
             return panel_content;
         }
+
+        let panel_width = self
+            .resizable_state_handle
+            .lock()
+            .map(|state| state.size())
+            .unwrap_or(MIN_SIDEBAR_WIDTH);
+        let panel_content = Clipped::sized(panel_content, vec2f(panel_width, 100_000.0)).finish();
 
         let drag_side = match self.panel_position {
             super::PanelPosition::Left => DragBarSide::Right,
