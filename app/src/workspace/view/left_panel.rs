@@ -40,6 +40,10 @@ use crate::coding_panel_enablement_state::CodingPanelEnablementState;
 use crate::drive::panel::{
     DrivePanel, DrivePanelEvent, MAX_SIDEBAR_WIDTH_RATIO, MIN_SIDEBAR_WIDTH,
 };
+use crate::editor::{
+    EditorOptions, EditorView, EnterAction, EnterSettings, Event as EditorEvent, TextColors,
+    TextOptions,
+};
 use crate::pane_group::pane::view::header::components::HEADER_EDGE_PADDING;
 use crate::pane_group::pane::view::header::PANE_HEADER_HEIGHT;
 use crate::pane_group::working_directories::WorkingDirectory;
@@ -50,11 +54,11 @@ use crate::server::ids::SyncId;
 #[cfg(feature = "local_fs")]
 use crate::server::telemetry::CodePanelsFileOpenEntrypoint;
 use crate::server::telemetry::{FileTreeSource, WarpDriveSource};
-use crate::settings::AISettings;
+use crate::settings::{AISettings, AISettingsChangedEvent, CLIAgentBuiltinPromptMode};
 use crate::settings_view::keybindings::{KeybindingChangedEvent, KeybindingChangedNotifier};
-use crate::settings_view::SettingsSection;
 use crate::terminal::cli_agent_sessions::CLIAgentSessionsModel;
 use crate::terminal::resizable_data::{ModalType, ResizableData};
+use crate::terminal::CLIAgent;
 use crate::ui_components::buttons::{icon_button, icon_button_with_color};
 use crate::ui_components::icons;
 use crate::util::bindings::keybinding_name_to_display_string;
@@ -63,6 +67,7 @@ use crate::util::file::external_editor::EditorSettings;
 #[cfg(feature = "local_fs")]
 use crate::util::openable_file_type::resolve_file_target_with_editor_choice;
 use crate::util::openable_file_type::FileTarget;
+use crate::workspace::action::ToolConfigScope;
 use crate::workspace::view::conversation_list::view::{
     ConversationListView, Event as ConversationListViewEvent,
 };
@@ -97,6 +102,7 @@ struct MouseStateHandles {
 pub enum LeftPanelAction {
     ToolConfigurations,
     SelectToolsConfigTab(ToolsConfigTab),
+    SelectToolsProviderFilter(ToolsProviderFilter),
     SelectSkillConfigFilter(SkillConfigFilter),
     ProjectExplorer,
     GlobalSearch { entry_focus: GlobalSearchEntryFocus },
@@ -160,6 +166,96 @@ impl ToolsConfigTab {
             Self::Mcp => Icon::Dataflow,
             Self::Skills => Icon::Folder,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum ToolsProviderFilter {
+    All,
+    Claude,
+    Codex,
+    OpenCode,
+    Warp,
+    Gemini,
+    Agents,
+}
+
+impl ToolsProviderFilter {
+    const ALL: [Self; 7] = [
+        Self::All,
+        Self::Claude,
+        Self::Codex,
+        Self::OpenCode,
+        Self::Warp,
+        Self::Gemini,
+        Self::Agents,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Claude => "Claude",
+            Self::Codex => "Codex",
+            Self::OpenCode => "OpenCode",
+            Self::Warp => "Warp",
+            Self::Gemini => "Gemini",
+            Self::Agents => "Agents",
+        }
+    }
+
+    fn icon(self) -> Icon {
+        match self {
+            Self::All => Icon::Settings,
+            Self::Claude => Icon::ClaudeLogo,
+            Self::Codex => Icon::OpenAILogo,
+            Self::OpenCode => Icon::OpenCodeLogo,
+            Self::Warp | Self::Agents => Icon::WarpLogoLight,
+            Self::Gemini => Icon::GeminiLogo,
+        }
+    }
+
+    fn cli_agent(self) -> Option<CLIAgent> {
+        match self {
+            Self::Claude => Some(CLIAgent::Claude),
+            Self::Codex => Some(CLIAgent::Codex),
+            Self::OpenCode => Some(CLIAgent::OpenCode),
+            _ => None,
+        }
+    }
+
+    fn skill_provider(self) -> Option<SkillProvider> {
+        match self {
+            Self::Claude => Some(SkillProvider::Claude),
+            Self::Codex => Some(SkillProvider::Codex),
+            Self::OpenCode => Some(SkillProvider::OpenCode),
+            Self::Warp => Some(SkillProvider::Warp),
+            Self::Gemini => Some(SkillProvider::Gemini),
+            Self::Agents => Some(SkillProvider::Agents),
+            Self::All => None,
+        }
+    }
+
+    fn mcp_provider(self) -> Option<MCPProvider> {
+        match self {
+            Self::Claude => Some(MCPProvider::Claude),
+            Self::Codex => Some(MCPProvider::Codex),
+            Self::Warp => Some(MCPProvider::Warp),
+            Self::OpenCode | Self::Gemini | Self::Agents => Some(MCPProvider::Agents),
+            Self::All => None,
+        }
+    }
+
+    fn matches_cli_agent(self, agent: CLIAgent) -> bool {
+        self.cli_agent().is_none_or(|filter| filter == agent)
+    }
+
+    fn matches_skill_provider(self, provider: SkillProvider) -> bool {
+        self.skill_provider()
+            .is_none_or(|filter| filter == provider)
+    }
+
+    fn matches_mcp_provider(self, provider: MCPProvider) -> bool {
+        self.mcp_provider().is_none_or(|filter| filter == provider)
     }
 }
 
@@ -272,7 +368,9 @@ pub struct LeftPanelView {
     close_button_mouse_state: MouseStateHandle,
     tools_config_scroll_state: ClippedScrollStateHandle,
     tools_config_tab: ToolsConfigTab,
+    tools_provider_filter: ToolsProviderFilter,
     skill_config_filter: SkillConfigFilter,
+    cli_agent_builtin_prompt_editors: Vec<(CLIAgent, ViewHandle<EditorView>)>,
     warp_drive_view: ViewHandle<DrivePanel>,
     conversation_list_view: ViewHandle<ConversationListView>,
     ssh_remote_view: ViewHandle<SshRemoteView>,
@@ -303,6 +401,71 @@ fn toolbelt_tooltip_keybinding(binding_names: &[&'static str], app: &AppContext)
 }
 
 impl LeftPanelView {
+    fn create_cli_agent_builtin_prompt_editor(
+        agent: CLIAgent,
+        ctx: &mut ViewContext<Self>,
+    ) -> ViewHandle<EditorView> {
+        let initial_prompt = AISettings::as_ref(ctx)
+            .cli_agent_builtin_prompt(agent)
+            .prompt
+            .clone();
+        let editor = ctx.add_typed_action_view(move |ctx| {
+            let appearance = Appearance::handle(ctx).as_ref(ctx);
+            let options = EditorOptions {
+                autogrow: true,
+                soft_wrap: true,
+                placeholder_soft_wrap: true,
+                enter_settings: EnterSettings {
+                    enter: EnterAction::Emit,
+                    ..Default::default()
+                },
+                text: TextOptions {
+                    font_size_override: Some(appearance.ui_font_size()),
+                    font_family_override: Some(appearance.monospace_font_family()),
+                    text_colors_override: Some(TextColors {
+                        default_color: appearance.theme().active_ui_text_color(),
+                        disabled_color: appearance.theme().disabled_ui_text_color(),
+                        hint_color: appearance.theme().disabled_ui_text_color(),
+                    }),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut editor = EditorView::new(options, ctx);
+            editor.set_placeholder_text(
+                format!("Custom system prompt for {}", agent.display_name()),
+                ctx,
+            );
+            editor.set_buffer_text(&initial_prompt, ctx);
+            editor
+        });
+
+        ctx.subscribe_to_view(&editor, move |_, editor, event, ctx| match event {
+            EditorEvent::Blurred | EditorEvent::Enter => {
+                let prompt = editor.as_ref(ctx).buffer_text(ctx);
+                AISettings::handle(ctx).update(ctx, |settings, ctx| {
+                    settings.set_cli_agent_builtin_prompt_text(agent, prompt, ctx);
+                });
+            }
+            _ => {}
+        });
+
+        editor
+    }
+
+    fn sync_cli_agent_builtin_prompt_editors(&mut self, ctx: &mut ViewContext<Self>) {
+        for (agent, editor) in &self.cli_agent_builtin_prompt_editors {
+            let prompt = AISettings::as_ref(ctx)
+                .cli_agent_builtin_prompt(*agent)
+                .prompt;
+            editor.update(ctx, |editor, ctx| {
+                if editor.buffer_text(ctx) != prompt {
+                    editor.system_reset_buffer_text(&prompt, ctx);
+                }
+            });
+        }
+    }
+
     fn ssh_remote_file_tree_root(
         pane_group: &ViewHandle<PaneGroup>,
         host: &SshRemoteHost,
@@ -371,6 +534,23 @@ impl LeftPanelView {
             }
             SshRemoteViewEvent::DisconnectHost(host_id) => {
                 ctx.emit(LeftPanelEvent::DisconnectSshRemoteHost(host_id.clone()));
+            }
+        });
+
+        let cli_agent_builtin_prompt_editors = AISettings::cli_agent_builtin_prompt_agents()
+            .into_iter()
+            .map(|agent| {
+                (
+                    agent,
+                    Self::create_cli_agent_builtin_prompt_editor(agent, ctx),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        ctx.subscribe_to_model(&AISettings::handle(ctx), |me, _, event, ctx| {
+            if matches!(event, AISettingsChangedEvent::CLIAgentBuiltinPrompts { .. }) {
+                me.sync_cli_agent_builtin_prompt_editors(ctx);
+                ctx.notify();
             }
         });
 
@@ -493,7 +673,9 @@ impl LeftPanelView {
             close_button_mouse_state: Default::default(),
             tools_config_scroll_state: ClippedScrollStateHandle::default(),
             tools_config_tab: ToolsConfigTab::Prompts,
+            tools_provider_filter: ToolsProviderFilter::All,
             skill_config_filter: SkillConfigFilter::Project,
+            cli_agent_builtin_prompt_editors,
             warp_drive_view,
             conversation_list_view,
             ssh_remote_view,
@@ -1095,6 +1277,7 @@ impl LeftPanelView {
                     self.active_view.get() == ToolPanelView::ToolConfigurations
                 }
                 LeftPanelAction::SelectToolsConfigTab(_) => false,
+                LeftPanelAction::SelectToolsProviderFilter(_) => false,
                 LeftPanelAction::SelectSkillConfigFilter(_) => false,
                 LeftPanelAction::ProjectExplorer => {
                     self.active_view.get() == ToolPanelView::ProjectExplorer
@@ -1239,6 +1422,103 @@ impl LeftPanelView {
             .with_border(
                 Border::bottom(1.).with_border_fill(appearance.theme().nonactive_ui_detail()),
             )
+            .finish()
+    }
+
+    fn render_provider_filter_button(
+        filter: ToolsProviderFilter,
+        active: bool,
+        appearance: &Appearance,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let text_color = if active {
+            theme.main_text_color(theme.background())
+        } else {
+            theme.sub_text_color(theme.background())
+        };
+        let button = Container::new(
+            Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_main_axis_alignment(MainAxisAlignment::Center)
+                .with_spacing(5.)
+                .with_child(
+                    ConstrainedBox::new(filter.icon().to_warpui_icon(text_color).finish())
+                        .with_width(12.)
+                        .with_height(12.)
+                        .finish(),
+                )
+                .with_child(
+                    Text::new_inline(filter.label().to_owned(), appearance.ui_font_family(), 11.)
+                        .with_color(text_color.into())
+                        .with_style(Properties::default().weight(Weight::Semibold))
+                        .with_clip(ClipConfig::ellipsis())
+                        .finish(),
+                )
+                .finish(),
+        )
+        .with_background(if active {
+            internal_colors::fg_overlay_2(theme)
+        } else {
+            internal_colors::fg_overlay_1(theme)
+        })
+        .with_border(Border::all(1.).with_border_fill(if active {
+            theme.active_ui_detail()
+        } else {
+            theme.nonactive_ui_detail()
+        }))
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
+        .with_padding_left(7.)
+        .with_padding_right(7.)
+        .with_padding_top(4.)
+        .with_padding_bottom(4.)
+        .finish();
+
+        EventHandler::new(button)
+            .on_left_mouse_down(move |ctx, _, _| {
+                ctx.dispatch_typed_action(LeftPanelAction::SelectToolsProviderFilter(filter));
+                warpui::elements::DispatchEventResult::StopPropagation
+            })
+            .finish()
+    }
+
+    fn render_tools_provider_filter_bar(&self, app: &AppContext) -> Box<dyn Element> {
+        let appearance = Appearance::as_ref(app);
+        let mut column = Flex::column().with_spacing(6.);
+        for chunk in ToolsProviderFilter::ALL.chunks(4) {
+            let mut row = Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_spacing(6.);
+            for filter in chunk {
+                row.add_child(
+                    Shrinkable::new(
+                        1.,
+                        Self::render_provider_filter_button(
+                            *filter,
+                            self.tools_provider_filter == *filter,
+                            appearance,
+                        ),
+                    )
+                    .finish(),
+                );
+            }
+            column.add_child(row.finish());
+        }
+
+        Container::new(column.finish())
+            .with_padding_left(12.)
+            .with_padding_right(12.)
+            .with_padding_top(8.)
+            .with_padding_bottom(8.)
+            .with_border(
+                Border::bottom(1.).with_border_fill(appearance.theme().nonactive_ui_detail()),
+            )
+            .finish()
+    }
+
+    fn render_tools_config_header(&self, app: &AppContext) -> Box<dyn Element> {
+        Flex::column()
+            .with_child(self.render_tools_tab_bar(app))
+            .with_child(self.render_tools_provider_filter_bar(app))
             .finish()
     }
 
@@ -1522,13 +1802,13 @@ impl LeftPanelView {
                 .with_child(trailing.finish())
                 .finish(),
         )
-        .with_background(internal_colors::fg_overlay_1(theme))
-        .with_border(Border::all(1.).with_border_fill(theme.nonactive_ui_detail()))
-        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(5.)))
+        .with_background(theme.background())
+        .with_border(Border::bottom(1.).with_border_fill(theme.nonactive_ui_detail()))
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(0.)))
         .with_padding_left(10.)
         .with_padding_right(8.)
-        .with_padding_top(8.)
-        .with_padding_bottom(8.)
+        .with_padding_top(7.)
+        .with_padding_bottom(7.)
         .finish();
 
         if let Some(action) = primary_action {
@@ -1591,6 +1871,106 @@ impl LeftPanelView {
         )
     }
 
+    fn render_prompt_agent_configuration(
+        agent: CLIAgent,
+        editor: &ViewHandle<EditorView>,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let appearance = Appearance::as_ref(app);
+        let theme = appearance.theme();
+        let prompt_setting = AISettings::as_ref(app).cli_agent_builtin_prompt(agent);
+        let has_custom_prompt = !prompt_setting.is_empty();
+        let status = if has_custom_prompt {
+            prompt_setting.mode.display_name().to_owned()
+        } else {
+            "Default".to_owned()
+        };
+        let summary = if has_custom_prompt {
+            prompt_setting
+                .prompt
+                .trim()
+                .lines()
+                .next()
+                .unwrap_or("Custom prompt")
+                .to_owned()
+        } else {
+            "Vendor default prompt; no custom override".to_owned()
+        };
+
+        let header = Self::render_tools_management_row(
+            agent.display_name().to_owned(),
+            summary,
+            agent.icon().unwrap_or(Icon::Prompt),
+            Some(status),
+            None,
+            vec![],
+            appearance,
+        );
+
+        let mut mode_row = Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_spacing(6.);
+        for mode in CLIAgentBuiltinPromptMode::iter() {
+            mode_row.add_child(Self::render_tools_action_pill(
+                ToolsRowAction {
+                    label: mode.display_name(),
+                    icon: if mode == prompt_setting.mode {
+                        Icon::Check
+                    } else {
+                        Icon::Settings
+                    },
+                    action: WorkspaceAction::SetCLIAgentBuiltinPromptMode { agent, mode },
+                },
+                appearance,
+            ));
+        }
+        if has_custom_prompt {
+            mode_row.add_child(Self::render_tools_action_pill(
+                ToolsRowAction {
+                    label: "Reset",
+                    icon: Icon::RefreshCcw,
+                    action: WorkspaceAction::ResetCLIAgentBuiltinPrompt { agent },
+                },
+                appearance,
+            ));
+        }
+
+        let editor_box = Container::new(
+            ConstrainedBox::new(ChildView::new(editor).finish())
+                .with_height(78.)
+                .finish(),
+        )
+        .with_background(theme.surface_1())
+        .with_border(Border::all(1.).with_border_fill(theme.outline()))
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
+        .with_padding_left(8.)
+        .with_padding_right(8.)
+        .with_padding_top(6.)
+        .with_padding_bottom(6.)
+        .finish();
+
+        Container::new(
+            Flex::column()
+                .with_spacing(6.)
+                .with_child(header)
+                .with_child(
+                    Container::new(mode_row.finish())
+                        .with_padding_left(10.)
+                        .with_padding_right(10.)
+                        .finish(),
+                )
+                .with_child(
+                    Container::new(editor_box)
+                        .with_padding_left(10.)
+                        .with_padding_right(10.)
+                        .finish(),
+                )
+                .finish(),
+        )
+        .with_padding_bottom(6.)
+        .finish()
+    }
+
     fn compact_path(path: &Path) -> String {
         if let Some(home_dir) = dirs::home_dir() {
             if let Ok(stripped) = path.strip_prefix(&home_dir) {
@@ -1650,17 +2030,55 @@ impl LeftPanelView {
     }
 
     fn tools_tab_counts(&self, app: &AppContext) -> HashMap<ToolsConfigTab, usize> {
-        let prompts = Self::prompt_workflows(app).len();
+        let builtin_prompt_count = AISettings::cli_agent_builtin_prompt_agents()
+            .into_iter()
+            .filter(|agent| self.tools_provider_filter.matches_cli_agent(*agent))
+            .count();
+        let prompts = builtin_prompt_count
+            + if self.tools_provider_filter == ToolsProviderFilter::All {
+                Self::prompt_workflows(app).len()
+            } else {
+                0
+            };
         let manager = TemplatableMCPServerManager::as_ref(app);
-        let mcps = manager.get_installed_templatable_servers().len()
-            + FileBasedMCPManager::as_ref(app).file_based_servers().len();
+        let file_based_manager = FileBasedMCPManager::as_ref(app);
+        let detected_mcp_count = file_based_manager
+            .file_based_servers()
+            .into_iter()
+            .filter(|installation| {
+                MCPProvider::iter().any(|provider| {
+                    self.tools_provider_filter.matches_mcp_provider(provider)
+                        && !file_based_manager
+                            .directory_paths_for_installation_and_provider(
+                                installation.uuid(),
+                                provider,
+                            )
+                            .is_empty()
+                })
+            })
+            .count();
+        let provider_config_count = MCPProvider::iter()
+            .filter(|provider| self.tools_provider_filter.matches_mcp_provider(*provider))
+            .count();
+        let mcps = detected_mcp_count
+            + provider_config_count
+            + if self.tools_provider_filter == ToolsProviderFilter::All {
+                manager.get_installed_templatable_servers().len()
+            } else {
+                0
+            };
         let skills = SkillManager::as_ref(app)
             .get_skills_for_working_directory(
                 self.active_local_working_directory(app).as_ref(),
                 app,
             )
             .into_iter()
-            .filter(|skill| self.skill_config_filter.matches(skill))
+            .filter(|skill| {
+                self.skill_config_filter.matches(skill)
+                    && self
+                        .tools_provider_filter
+                        .matches_skill_provider(skill.provider)
+            })
             .count();
 
         HashMap::from([
@@ -1686,26 +2104,27 @@ impl LeftPanelView {
                     .map(|session| (session.agent, session.received_rich_notification))
             });
 
-        let mut system_prompt_rows = vec![if let Some((agent, received_rich_notification)) =
-            active_session_info
-        {
-            let agent_name = agent.display_name();
-            let subtitle = if received_rich_notification {
-                "Plugin session; runtime prompt state received".to_owned()
-            } else {
-                "CLI launch session; prompt override is applied when supported".to_owned()
-            };
-            Self::render_tools_management_row(
-                format!("Active session: {agent_name}"),
-                subtitle,
-                agent.icon().unwrap_or(Icon::Prompt),
-                Some("Runtime".to_owned()),
-                None,
-                vec![],
-                appearance,
-            )
-        } else {
-            Self::render_tools_management_row(
+        let mut system_prompt_rows = Vec::new();
+        if let Some((agent, received_rich_notification)) = active_session_info {
+            if self.tools_provider_filter.matches_cli_agent(agent) {
+                let agent_name = agent.display_name();
+                let subtitle = if received_rich_notification {
+                    "Plugin session; runtime prompt state received".to_owned()
+                } else {
+                    "CLI launch session; prompt override is applied when supported".to_owned()
+                };
+                system_prompt_rows.push(Self::render_tools_management_row(
+                    format!("Active session: {agent_name}"),
+                    subtitle,
+                    agent.icon().unwrap_or(Icon::Prompt),
+                    Some("Runtime".to_owned()),
+                    None,
+                    vec![],
+                    appearance,
+                ));
+            }
+        } else if self.tools_provider_filter == ToolsProviderFilter::All {
+            system_prompt_rows.push(Self::render_tools_management_row(
                 "No active agent session".to_owned(),
                 "Start an agent session to inspect runtime prompt state".to_owned(),
                 Icon::Prompt,
@@ -1713,39 +2132,19 @@ impl LeftPanelView {
                 None,
                 vec![],
                 appearance,
-            )
-        }];
+            ));
+        }
 
-        for agent in AISettings::cli_agent_builtin_prompt_agents() {
-            let prompt_setting = AISettings::as_ref(app).cli_agent_builtin_prompt(agent);
-            let has_custom_prompt = !prompt_setting.is_empty();
-            let status = if has_custom_prompt {
-                prompt_setting.mode.display_name().to_owned()
-            } else {
-                "Default".to_owned()
-            };
-            let subtitle = if has_custom_prompt {
-                prompt_setting
-                    .prompt
-                    .trim()
-                    .lines()
-                    .next()
-                    .unwrap_or("Custom prompt")
-                    .to_owned()
-            } else {
-                "Vendor default prompt; no custom override".to_owned()
-            };
-            system_prompt_rows.push(Self::render_tools_management_row(
-                agent.display_name().to_owned(),
-                subtitle,
-                agent.icon().unwrap_or(Icon::Prompt),
-                Some(status),
-                None,
-                vec![ToolsRowAction {
-                    label: "Edit",
-                    icon: Icon::Pencil,
-                    action: WorkspaceAction::ShowSettingsPage(SettingsSection::AgentBuiltinPrompts),
-                }],
+        for (agent, editor) in &self.cli_agent_builtin_prompt_editors {
+            if self.tools_provider_filter.matches_cli_agent(*agent) {
+                system_prompt_rows
+                    .push(Self::render_prompt_agent_configuration(*agent, editor, app));
+            }
+        }
+
+        if system_prompt_rows.is_empty() {
+            system_prompt_rows.push(Self::render_empty_tools_row(
+                "No prompt configuration for this provider",
                 appearance,
             ));
         }
@@ -1760,7 +2159,18 @@ impl LeftPanelView {
             appearance,
         )];
 
-        if prompt_workflows.is_empty() {
+        if self.tools_provider_filter != ToolsProviderFilter::All {
+            workflow_rows.clear();
+            workflow_rows.push(Self::render_tools_management_row(
+                "Shared prompt workflows".to_owned(),
+                "Switch to All to manage reusable Agent Mode workflows".to_owned(),
+                Icon::Prompt,
+                Some("Shared".to_owned()),
+                None,
+                vec![],
+                appearance,
+            ));
+        } else if prompt_workflows.is_empty() {
             workflow_rows.push(Self::render_empty_tools_row(
                 "No saved prompt workflows",
                 appearance,
@@ -1890,18 +2300,59 @@ impl LeftPanelView {
             Icon::Dataflow,
             Some("Unified".to_owned()),
             None,
-            vec![ToolsRowAction {
-                label: "Add",
-                icon: Icon::Plus,
-                action: WorkspaceAction::OpenAddMCPServer,
-            }],
+            vec![],
             appearance,
         )];
 
         let provider_rows = MCPProvider::iter()
+            .filter(|provider| self.tools_provider_filter.matches_mcp_provider(*provider))
             .map(|provider| {
+                let mut actions = vec![
+                    ToolsRowAction {
+                        label: "Home",
+                        icon: Icon::File,
+                        action: WorkspaceAction::OpenMCPConfigFile {
+                            provider,
+                            scope: ToolConfigScope::Home,
+                        },
+                    },
+                    ToolsRowAction {
+                        label: "Project",
+                        icon: Icon::File,
+                        action: WorkspaceAction::OpenMCPConfigFile {
+                            provider,
+                            scope: ToolConfigScope::Project,
+                        },
+                    },
+                ];
+                if provider != MCPProvider::Claude {
+                    actions.push(ToolsRowAction {
+                        label: "Sync H",
+                        icon: Icon::RefreshCcw,
+                        action: WorkspaceAction::SyncMCPConfig {
+                            source: MCPProvider::Claude,
+                            target: provider,
+                            scope: ToolConfigScope::Home,
+                        },
+                    });
+                    actions.push(ToolsRowAction {
+                        label: "Sync P",
+                        icon: Icon::RefreshCcw,
+                        action: WorkspaceAction::SyncMCPConfig {
+                            source: MCPProvider::Claude,
+                            target: provider,
+                            scope: ToolConfigScope::Project,
+                        },
+                    });
+                }
                 Self::render_tools_management_row(
-                    provider.display_name().to_owned(),
+                    if self.tools_provider_filter == ToolsProviderFilter::OpenCode
+                        || self.tools_provider_filter == ToolsProviderFilter::Gemini
+                    {
+                        format!("{} shared MCP config", self.tools_provider_filter.label())
+                    } else {
+                        format!("{} MCP config", provider.display_name())
+                    },
                     format!(
                         "Home: {} - Project: {}",
                         Self::compact_path(&provider.home_config_path()),
@@ -1910,7 +2361,7 @@ impl LeftPanelView {
                     provider.icon(),
                     Some("Config".to_owned()),
                     None,
-                    vec![],
+                    actions,
                     appearance,
                 )
             })
@@ -1928,24 +2379,24 @@ impl LeftPanelView {
                 .to_ascii_lowercase()
         });
 
-        for installation in installations.into_iter().take(20) {
-            let uuid = installation.uuid();
-            let state = manager.get_server_state(uuid);
-            let tool_count = manager.tools_for_server(uuid).len();
-            let should_run = !matches!(state, Some(MCPServerState::Running));
-            let subtitle = if tool_count == 0 {
-                "No tools reported yet".to_owned()
-            } else {
-                format!("{tool_count} tools available through the unified MCP manager")
-            };
-            server_rows.push(Self::render_tools_management_row(
-                installation.templatable_mcp_server().name.clone(),
-                subtitle,
-                Icon::Dataflow,
-                Some(Self::mcp_state_label(state).to_owned()),
-                None,
-                vec![
-                    ToolsRowAction {
+        if self.tools_provider_filter == ToolsProviderFilter::All {
+            for installation in installations.into_iter().take(20) {
+                let uuid = installation.uuid();
+                let state = manager.get_server_state(uuid);
+                let tool_count = manager.tools_for_server(uuid).len();
+                let should_run = !matches!(state, Some(MCPServerState::Running));
+                let subtitle = if tool_count == 0 {
+                    "No tools reported yet".to_owned()
+                } else {
+                    format!("{tool_count} tools available through the unified MCP manager")
+                };
+                server_rows.push(Self::render_tools_management_row(
+                    installation.templatable_mcp_server().name.clone(),
+                    subtitle,
+                    Icon::Dataflow,
+                    Some(Self::mcp_state_label(state).to_owned()),
+                    None,
+                    vec![ToolsRowAction {
                         label: if should_run { "Start" } else { "Stop" },
                         icon: if should_run {
                             Icon::Play
@@ -1956,39 +2407,59 @@ impl LeftPanelView {
                             installation_uuid: uuid,
                             should_run,
                         },
-                    },
-                    ToolsRowAction {
-                        label: "Edit",
-                        icon: Icon::Pencil,
-                        action: WorkspaceAction::OpenMCPServerCollection,
-                    },
-                ],
-                appearance,
-            ));
+                    }],
+                    appearance,
+                ));
+            }
         }
 
         for installation in file_based_servers.into_iter().take(12) {
             let uuid = installation.uuid();
             let state = manager.get_server_state(uuid);
-            let provider_label = MCPProvider::iter()
-                .find(|provider| {
-                    !file_based_manager
-                        .directory_paths_for_installation_and_provider(uuid, *provider)
-                        .is_empty()
-                })
+            let provider = MCPProvider::iter().find(|provider| {
+                !file_based_manager
+                    .directory_paths_for_installation_and_provider(uuid, *provider)
+                    .is_empty()
+            });
+            let provider_label = provider
                 .map(|provider| provider.display_name().to_owned())
                 .unwrap_or_else(|| "Provider config".to_owned());
+            if let Some(provider) = provider {
+                if !self.tools_provider_filter.matches_mcp_provider(provider) {
+                    continue;
+                }
+            }
+            let actions = provider
+                .map(|provider| {
+                    let scope = file_based_manager
+                        .directory_paths_for_installation_and_provider(uuid, provider)
+                        .first()
+                        .and_then(|root| {
+                            self.active_local_working_directory_path(app)
+                                .map(|cwd| (root, cwd))
+                        })
+                        .map(|(root, cwd)| {
+                            if root == &cwd {
+                                ToolConfigScope::Project
+                            } else {
+                                ToolConfigScope::Home
+                            }
+                        })
+                        .unwrap_or(ToolConfigScope::Home);
+                    vec![ToolsRowAction {
+                        label: "Config",
+                        icon: Icon::File,
+                        action: WorkspaceAction::OpenMCPConfigFile { provider, scope },
+                    }]
+                })
+                .unwrap_or_default();
             server_rows.push(Self::render_tools_management_row(
                 installation.templatable_mcp_server().name.clone(),
                 format!("Detected from {provider_label}; managed without copying config into Warp"),
                 Icon::Dataflow02,
                 Some(Self::mcp_state_label(state).to_owned()),
                 None,
-                vec![ToolsRowAction {
-                    label: "Edit",
-                    icon: Icon::Pencil,
-                    action: WorkspaceAction::OpenMCPServerCollection,
-                }],
+                actions,
                 appearance,
             ));
         }
@@ -2060,9 +2531,20 @@ impl LeftPanelView {
         let mut scope_counts: HashMap<SkillScope, usize> = HashMap::new();
         for skill in &skills {
             *provider_counts.entry(skill.provider).or_default() += 1;
-            *scope_counts.entry(skill.scope).or_default() += 1;
+            if self
+                .tools_provider_filter
+                .matches_skill_provider(skill.provider)
+            {
+                *scope_counts.entry(skill.scope).or_default() += 1;
+            }
         }
-        let total_skill_count = skills.len();
+        let total_skill_count = skills
+            .iter()
+            .filter(|skill| {
+                self.tools_provider_filter
+                    .matches_skill_provider(skill.provider)
+            })
+            .count();
 
         let chips = Self::render_metric_chip_rows(
             vec![
@@ -2087,6 +2569,10 @@ impl LeftPanelView {
 
         let provider_rows = SKILL_PROVIDER_DEFINITIONS
             .iter()
+            .filter(|definition| {
+                self.tools_provider_filter
+                    .matches_skill_provider(definition.provider)
+            })
             .map(|definition| {
                 let provider = definition.provider;
                 let home_path = home_skills_path(provider);
@@ -2109,6 +2595,26 @@ impl LeftPanelView {
                         icon: Icon::Folder,
                         action: WorkspaceAction::OpenSkillFolder {
                             path: project_path.clone(),
+                        },
+                    });
+                }
+                if provider != SkillProvider::Claude {
+                    actions.push(ToolsRowAction {
+                        label: "Sync H",
+                        icon: Icon::RefreshCcw,
+                        action: WorkspaceAction::SyncSkillProvider {
+                            source: SkillProvider::Claude,
+                            target: provider,
+                            scope: ToolConfigScope::Home,
+                        },
+                    });
+                    actions.push(ToolsRowAction {
+                        label: "Sync P",
+                        icon: Icon::RefreshCcw,
+                        action: WorkspaceAction::SyncSkillProvider {
+                            source: SkillProvider::Claude,
+                            target: provider,
+                            scope: ToolConfigScope::Project,
                         },
                     });
                 }
@@ -2141,7 +2647,12 @@ impl LeftPanelView {
 
         let visible_skills = skills
             .into_iter()
-            .filter(|skill| self.skill_config_filter.matches(skill))
+            .filter(|skill| {
+                self.skill_config_filter.matches(skill)
+                    && self
+                        .tools_provider_filter
+                        .matches_skill_provider(skill.provider)
+            })
             .collect::<Vec<_>>();
         let mut skill_rows = Vec::new();
         if visible_skills.is_empty() {
@@ -2221,7 +2732,7 @@ impl LeftPanelView {
 
         Flex::column()
             .with_main_axis_size(MainAxisSize::Max)
-            .with_child(self.render_tools_tab_bar(app))
+            .with_child(self.render_tools_config_header(app))
             .with_child(
                 Shrinkable::new(
                     1.,
@@ -2321,6 +2832,10 @@ impl LeftPanelView {
             }
             LeftPanelAction::SelectToolsConfigTab(tab) => {
                 self.tools_config_tab = *tab;
+                active_view_state::set(self, ToolPanelView::ToolConfigurations, ctx);
+            }
+            LeftPanelAction::SelectToolsProviderFilter(filter) => {
+                self.tools_provider_filter = *filter;
                 active_view_state::set(self, ToolPanelView::ToolConfigurations, ctx);
             }
             LeftPanelAction::SelectSkillConfigFilter(filter) => {

@@ -23,6 +23,9 @@ use crate::ai::agent::conversation::AIConversationId;
 use crate::ai::agent::AIAgentExchangeId;
 use crate::ai::ambient_agents::AmbientAgentTaskId;
 use crate::ai::document::ai_document_model::{AIDocumentId, AIDocumentVersion};
+use crate::ai::mcp::MCPProvider;
+use ai::skills::SkillProvider;
+
 use crate::ai::skills::SkillReference;
 use crate::auth::auth_manager::LoginGatedFeature;
 use crate::drive::items::WarpDriveItemId;
@@ -35,6 +38,7 @@ use crate::server::ids::SyncId;
 use crate::server::telemetry::{
     AddTabWithShellSource, AgentModeEntrypoint, PaletteSource, SharingDialogSource,
 };
+use crate::settings::CLIAgentBuiltinPromptMode;
 use crate::settings_view::{SettingsAction as SettingsTabAction, SettingsSection};
 use crate::tab::{NewSessionMenuItem, SelectedTabColor};
 use crate::tab_configs::TabConfig;
@@ -75,6 +79,12 @@ pub enum RestoreConversationLayout {
     /// Restore the conversation in a new tab.
     #[default]
     NewTab,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ToolConfigScope {
+    Home,
+    Project,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -484,6 +494,22 @@ pub enum WorkspaceAction {
     TrashPromptWorkflow {
         workflow_id: SyncId,
     },
+    SetCLIAgentBuiltinPromptMode {
+        agent: CLIAgent,
+        mode: CLIAgentBuiltinPromptMode,
+    },
+    ResetCLIAgentBuiltinPrompt {
+        agent: CLIAgent,
+    },
+    OpenMCPConfigFile {
+        provider: MCPProvider,
+        scope: ToolConfigScope,
+    },
+    SyncMCPConfig {
+        source: MCPProvider,
+        target: MCPProvider,
+        scope: ToolConfigScope,
+    },
     ToggleMCPServer {
         installation_uuid: Uuid,
         should_run: bool,
@@ -493,6 +519,11 @@ pub enum WorkspaceAction {
     },
     OpenSkillFolder {
         path: PathBuf,
+    },
+    SyncSkillProvider {
+        source: SkillProvider,
+        target: SkillProvider,
+        scope: ToolConfigScope,
     },
     /// Open the Environment Management pane in Create mode.
     OpenEnvironmentManagementPane,
@@ -1111,9 +1142,14 @@ impl WorkspaceAction {
             | OpenAddMCPServer
             | OpenPromptWorkflow { .. }
             | TrashPromptWorkflow { .. }
+            | SetCLIAgentBuiltinPromptMode { .. }
+            | ResetCLIAgentBuiltinPrompt { .. }
+            | OpenMCPConfigFile { .. }
+            | SyncMCPConfig { .. }
             | ToggleMCPServer { .. }
             | OpenSkill { .. }
             | OpenSkillFolder { .. }
+            | SyncSkillProvider { .. }
             | FocusTerminalViewInWorkspace { .. }
             | FocusPane(..)
             | StartNewConversation { .. }

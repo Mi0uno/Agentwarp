@@ -42,6 +42,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use ::settings::{Setting, ToggleableSetting};
 use ai::index::full_source_code_embedding::manager::CodebaseIndexManager;
+use ai::skills::{home_skills_path, SkillProvider, SKILL_PROVIDER_DEFINITIONS};
 use autoupdate::AutoupdateStage;
 #[cfg(target_os = "macos")]
 use command::blocking::Command;
@@ -122,7 +123,7 @@ use self::vertical_tabs::{
 use super::action::AutoCloudHandoffTrigger;
 use super::action::{
     InitContent, NewSessionMenuAnchor, RestoreConversationLayout, TabContextMenuAnchor,
-    VerticalTabsPaneContextMenuTarget, WorkspaceAction,
+    ToolConfigScope, VerticalTabsPaneContextMenuTarget, WorkspaceAction,
 };
 #[cfg(all(feature = "local_fs", not(target_family = "wasm")))]
 use super::auto_handoff::AutoCloudHandoffController;
@@ -205,6 +206,7 @@ use crate::ai::execution_profiles::profiles::{AIExecutionProfilesModel, ClientPr
 use crate::ai::facts::view::AIFactPage;
 use crate::ai::facts::{AIFactManager, AIFactView, AIFactViewEvent};
 use crate::ai::llms::LLMPreferences;
+use crate::ai::mcp::{home_config_file_path, MCPProvider};
 use crate::ai::persisted_workspace::PersistedWorkspace;
 use crate::ai::{conversation_utils, AIRequestUsageModel};
 use crate::ai_assistant::execution_context::WarpAiExecutionContext;
@@ -327,10 +329,10 @@ use crate::settings::{
     active_theme_kind, cli_agent_api_usage_log_path, respect_system_theme,
     write_cli_agent_api_live_profiles_file, AISettings, AISettingsChangedEvent,
     AccessibilitySettings, AliasExpansionSettings, AppEditorSettings, BlockVisibilitySettings,
-    ChangelogSettings, CodeSettings, CodeSettingsChangedEvent, CtrlTabBehavior, CursorBlink,
-    DebugSettings, DefaultSessionMode, FontSettings, GPUSettings, InputModeSettings, InputSettings,
-    MonospaceFontSize, PaneSettings, PrivacySettings, SelectionSettings, Settings, SshSettings,
-    ThemeSettings,
+    CLIAgentBuiltinPromptMode, ChangelogSettings, CodeSettings, CodeSettingsChangedEvent,
+    CtrlTabBehavior, CursorBlink, DebugSettings, DefaultSessionMode, FontSettings, GPUSettings,
+    InputModeSettings, InputSettings, MonospaceFontSize, PaneSettings, PrivacySettings,
+    SelectionSettings, Settings, SshSettings, ThemeSettings,
 };
 use crate::settings_view::environments_page::EnvironmentsPage;
 use crate::settings_view::handoff_environment_creation_modal::{
@@ -24491,6 +24493,449 @@ pub(crate) fn seed_cli_agent_session_for_record<V: View>(
     });
 }
 
+impl Workspace {
+    fn active_local_config_root(&self, ctx: &AppContext) -> Option<PathBuf> {
+        self.active_tab_pane_group()
+            .as_ref(ctx)
+            .active_session_view(ctx)
+            .and_then(|terminal| terminal.as_ref(ctx).pwd_if_local(ctx))
+            .map(PathBuf::from)
+    }
+
+    fn show_tools_config_toast(
+        ctx: &mut ViewContext<Self>,
+        toast: DismissibleToast<WorkspaceAction>,
+    ) {
+        let window_id = ctx.window_id();
+        ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
+            toast_stack.add_ephemeral_toast(toast, window_id, ctx);
+        });
+    }
+
+    #[cfg(feature = "local_fs")]
+    fn open_local_config_path(&mut self, path: PathBuf, ctx: &mut ViewContext<Self>) {
+        let layout = *EditorSettings::as_ref(ctx).open_file_layout.value();
+        self.open_code(
+            CodeSource::FileTree {
+                location: LocalOrRemotePath::Local(path),
+            },
+            layout,
+            None,
+            false,
+            &[],
+            ctx,
+        );
+    }
+
+    #[cfg(feature = "local_fs")]
+    fn mcp_config_path_for(
+        &self,
+        provider: MCPProvider,
+        scope: ToolConfigScope,
+        ctx: &AppContext,
+    ) -> Option<PathBuf> {
+        match scope {
+            ToolConfigScope::Home => home_config_file_path(provider),
+            ToolConfigScope::Project => self
+                .active_local_config_root(ctx)
+                .map(|root| root.join(provider.project_config_path())),
+        }
+    }
+
+    #[cfg(feature = "local_fs")]
+    fn ensure_mcp_config_file(path: &Path, provider: MCPProvider) -> anyhow::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if path.exists() {
+            return Ok(());
+        }
+
+        let initial = match provider {
+            MCPProvider::Codex => "[mcp_servers]\n".to_owned(),
+            MCPProvider::Warp | MCPProvider::Claude | MCPProvider::Agents => {
+                "{\n  \"mcpServers\": {}\n}\n".to_owned()
+            }
+        };
+        std::fs::write(path, initial)?;
+        Ok(())
+    }
+
+    #[cfg(feature = "local_fs")]
+    fn open_mcp_config_file(
+        &mut self,
+        provider: MCPProvider,
+        scope: ToolConfigScope,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let Some(path) = self.mcp_config_path_for(provider, scope, ctx) else {
+            Self::show_tools_config_toast(
+                ctx,
+                DismissibleToast::error("No local project is active.".to_owned()),
+            );
+            return;
+        };
+
+        match Self::ensure_mcp_config_file(&path, provider) {
+            Ok(()) => self.open_local_config_path(path, ctx),
+            Err(err) => Self::show_tools_config_toast(
+                ctx,
+                DismissibleToast::error(format!("Failed to open MCP config: {err}")),
+            ),
+        }
+    }
+
+    #[cfg(feature = "local_fs")]
+    fn extract_mcp_server_map(
+        value: &serde_json::Value,
+    ) -> std::collections::HashMap<String, serde_json::Value> {
+        ["/mcp/servers", "/servers", "/mcpServers", "/mcp_servers"]
+            .into_iter()
+            .find_map(|pointer| {
+                value.pointer(pointer).and_then(|servers| {
+                    serde_json::from_value::<std::collections::HashMap<String, serde_json::Value>>(
+                        servers.clone(),
+                    )
+                    .ok()
+                })
+            })
+            .unwrap_or_default()
+    }
+
+    #[cfg(feature = "local_fs")]
+    fn read_mcp_server_map(
+        path: &Path,
+        provider: MCPProvider,
+    ) -> anyhow::Result<std::collections::HashMap<String, serde_json::Value>> {
+        let contents = match std::fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
+            Err(err) => return Err(err.into()),
+        };
+
+        if provider == MCPProvider::Codex {
+            let json = crate::ai::mcp::parsing::normalize_codex_toml_to_json(&contents)?;
+            let value: serde_json::Value = serde_json::from_str(&json)?;
+            return Ok(Self::extract_mcp_server_map(&value));
+        }
+
+        let value: serde_json::Value = serde_json::from_str(&contents)?;
+        Ok(Self::extract_mcp_server_map(&value))
+    }
+
+    #[cfg(feature = "local_fs")]
+    fn merge_json_mcp_config(
+        path: &Path,
+        servers_to_merge: std::collections::HashMap<String, serde_json::Value>,
+    ) -> anyhow::Result<usize> {
+        let mut value = match std::fs::read_to_string(path) {
+            Ok(contents) if !contents.trim().is_empty() => serde_json::from_str(&contents)?,
+            Ok(_) => serde_json::json!({}),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+            Err(err) => return Err(err.into()),
+        };
+
+        if !value.is_object() {
+            value = serde_json::json!({});
+        }
+        let object = value
+            .as_object_mut()
+            .expect("value was normalized to object");
+        let servers = object
+            .entry("mcpServers".to_owned())
+            .or_insert_with(|| serde_json::json!({}));
+        if !servers.is_object() {
+            *servers = serde_json::json!({});
+        }
+        let servers = servers
+            .as_object_mut()
+            .expect("mcpServers was normalized to object");
+
+        let mut added = 0;
+        for (name, server) in servers_to_merge {
+            if !servers.contains_key(&name) {
+                servers.insert(name, server);
+                added += 1;
+            }
+        }
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, format!("{}\n", serde_json::to_string_pretty(&value)?))?;
+        Ok(added)
+    }
+
+    #[cfg(feature = "local_fs")]
+    fn json_string_array(value: &serde_json::Value, key: &str) -> Option<toml_edit::Array> {
+        let values = value.get(key)?.as_array()?;
+        let mut array = toml_edit::Array::new();
+        for value in values {
+            if let Some(value) = value.as_str() {
+                array.push(value);
+            }
+        }
+        Some(array)
+    }
+
+    #[cfg(feature = "local_fs")]
+    fn json_string_inline_table(
+        value: &serde_json::Value,
+        key: &str,
+    ) -> Option<toml_edit::InlineTable> {
+        let values = value.get(key)?.as_object()?;
+        let mut table = toml_edit::InlineTable::new();
+        for (key, value) in values {
+            if let Some(value) = value.as_str() {
+                table.insert(key, toml_edit::Value::from(value));
+            }
+        }
+        Some(table)
+    }
+
+    #[cfg(feature = "local_fs")]
+    fn codex_mcp_server_item(server: &serde_json::Value) -> Option<toml_edit::Item> {
+        let mut table = toml_edit::Table::new();
+
+        if let Some(command) = server.get("command").and_then(|value| value.as_str()) {
+            table["command"] = toml_edit::value(command);
+            if let Some(args) = Self::json_string_array(server, "args") {
+                table["args"] = toml_edit::Item::Value(toml_edit::Value::Array(args));
+            }
+            if let Some(env) = Self::json_string_inline_table(server, "env") {
+                table["env"] = toml_edit::Item::Value(toml_edit::Value::InlineTable(env));
+            }
+            if let Some(cwd) = server
+                .get("working_directory")
+                .or_else(|| server.get("cwd"))
+                .and_then(|value| value.as_str())
+            {
+                table["cwd"] = toml_edit::value(cwd);
+            }
+            return Some(toml_edit::Item::Table(table));
+        }
+
+        if let Some(url) = server.get("url").and_then(|value| value.as_str()) {
+            table["url"] = toml_edit::value(url);
+            if let Some(headers) = Self::json_string_inline_table(server, "headers") {
+                table["http_headers"] =
+                    toml_edit::Item::Value(toml_edit::Value::InlineTable(headers));
+            }
+            return Some(toml_edit::Item::Table(table));
+        }
+
+        None
+    }
+
+    #[cfg(feature = "local_fs")]
+    fn merge_codex_mcp_config(
+        path: &Path,
+        servers_to_merge: std::collections::HashMap<String, serde_json::Value>,
+    ) -> anyhow::Result<usize> {
+        let contents = std::fs::read_to_string(path).unwrap_or_default();
+        let mut doc = contents
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap_or_else(|_| toml_edit::DocumentMut::new());
+
+        if !doc.as_table().contains_key("mcp_servers") || !doc["mcp_servers"].is_table() {
+            doc["mcp_servers"] = toml_edit::Item::Table(toml_edit::Table::new());
+        }
+        let table = doc["mcp_servers"]
+            .as_table_mut()
+            .expect("mcp_servers was normalized to table");
+
+        let mut added = 0;
+        for (name, server) in servers_to_merge {
+            if table.contains_key(&name) {
+                continue;
+            }
+            if let Some(item) = Self::codex_mcp_server_item(&server) {
+                table.insert(&name, item);
+                added += 1;
+            }
+        }
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, doc.to_string())?;
+        Ok(added)
+    }
+
+    #[cfg(feature = "local_fs")]
+    fn merge_mcp_config(
+        path: &Path,
+        provider: MCPProvider,
+        servers_to_merge: std::collections::HashMap<String, serde_json::Value>,
+    ) -> anyhow::Result<usize> {
+        match provider {
+            MCPProvider::Codex => Self::merge_codex_mcp_config(path, servers_to_merge),
+            MCPProvider::Warp | MCPProvider::Claude | MCPProvider::Agents => {
+                Self::merge_json_mcp_config(path, servers_to_merge)
+            }
+        }
+    }
+
+    #[cfg(feature = "local_fs")]
+    fn sync_mcp_config(
+        &mut self,
+        source: MCPProvider,
+        target: MCPProvider,
+        scope: ToolConfigScope,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let Some(source_path) = self.mcp_config_path_for(source, scope, ctx) else {
+            Self::show_tools_config_toast(
+                ctx,
+                DismissibleToast::error("No local project is active.".to_owned()),
+            );
+            return;
+        };
+        let Some(target_path) = self.mcp_config_path_for(target, scope, ctx) else {
+            Self::show_tools_config_toast(
+                ctx,
+                DismissibleToast::error("No local project is active.".to_owned()),
+            );
+            return;
+        };
+
+        let result = (|| -> anyhow::Result<usize> {
+            let source_servers = Self::read_mcp_server_map(&source_path, source)?;
+            if source_servers.is_empty() {
+                return Ok(0);
+            }
+            Self::ensure_mcp_config_file(&target_path, target)?;
+            Self::merge_mcp_config(&target_path, target, source_servers)
+        })();
+
+        match result {
+            Ok(0) => Self::show_tools_config_toast(
+                ctx,
+                DismissibleToast::default("No new MCP servers to sync.".to_owned()),
+            ),
+            Ok(count) => Self::show_tools_config_toast(
+                ctx,
+                DismissibleToast::success(format!(
+                    "Synced {count} MCP server{} to {}.",
+                    if count == 1 { "" } else { "s" },
+                    target.display_name()
+                )),
+            ),
+            Err(err) => Self::show_tools_config_toast(
+                ctx,
+                DismissibleToast::error(format!("MCP sync failed: {err}")),
+            ),
+        }
+    }
+
+    #[cfg(feature = "local_fs")]
+    fn skill_root_for_provider(
+        &self,
+        provider: SkillProvider,
+        scope: ToolConfigScope,
+        ctx: &AppContext,
+    ) -> Option<PathBuf> {
+        match scope {
+            ToolConfigScope::Home => home_skills_path(provider),
+            ToolConfigScope::Project => {
+                let definition = SKILL_PROVIDER_DEFINITIONS
+                    .iter()
+                    .find(|definition| definition.provider == provider)?;
+                self.active_local_config_root(ctx)
+                    .map(|root| root.join(&definition.skills_path))
+            }
+        }
+    }
+
+    #[cfg(feature = "local_fs")]
+    fn copy_directory_without_overwrite(source: &Path, target: &Path) -> anyhow::Result<()> {
+        if target.exists() {
+            return Ok(());
+        }
+        std::fs::create_dir_all(target)?;
+        for entry in std::fs::read_dir(source)? {
+            let entry = entry?;
+            let source_path = entry.path();
+            let target_path = target.join(entry.file_name());
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                Self::copy_directory_without_overwrite(&source_path, &target_path)?;
+            } else if file_type.is_file() && !target_path.exists() {
+                std::fs::copy(&source_path, &target_path)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "local_fs")]
+    fn sync_skill_provider(
+        &mut self,
+        source: SkillProvider,
+        target: SkillProvider,
+        scope: ToolConfigScope,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let Some(source_root) = self.skill_root_for_provider(source, scope, ctx) else {
+            Self::show_tools_config_toast(
+                ctx,
+                DismissibleToast::error("No source skill folder is available.".to_owned()),
+            );
+            return;
+        };
+        let Some(target_root) = self.skill_root_for_provider(target, scope, ctx) else {
+            Self::show_tools_config_toast(
+                ctx,
+                DismissibleToast::error("No target skill folder is available.".to_owned()),
+            );
+            return;
+        };
+
+        let result = (|| -> anyhow::Result<usize> {
+            if !source_root.exists() {
+                return Ok(0);
+            }
+            std::fs::create_dir_all(&target_root)?;
+            let mut copied = 0;
+            for entry in std::fs::read_dir(&source_root)? {
+                let entry = entry?;
+                if !entry.file_type()?.is_dir() {
+                    continue;
+                }
+                let source_skill_dir = entry.path();
+                if !source_skill_dir.join("SKILL.md").exists() {
+                    continue;
+                }
+                let target_skill_dir = target_root.join(entry.file_name());
+                if target_skill_dir.exists() {
+                    continue;
+                }
+                Self::copy_directory_without_overwrite(&source_skill_dir, &target_skill_dir)?;
+                copied += 1;
+            }
+            Ok(copied)
+        })();
+
+        match result {
+            Ok(0) => Self::show_tools_config_toast(
+                ctx,
+                DismissibleToast::default("No new skills to sync.".to_owned()),
+            ),
+            Ok(count) => Self::show_tools_config_toast(
+                ctx,
+                DismissibleToast::success(format!(
+                    "Synced {count} skill{} to {}.",
+                    if count == 1 { "" } else { "s" },
+                    target
+                )),
+            ),
+            Err(err) => Self::show_tools_config_toast(
+                ctx,
+                DismissibleToast::error(format!("Skill sync failed: {err}")),
+            ),
+        }
+    }
+}
+
 impl Entity for Workspace {
     type Event = ();
 }
@@ -25925,6 +26370,55 @@ impl TypedActionView for Workspace {
                     );
                 });
             }
+            SetCLIAgentBuiltinPromptMode { agent, mode } => {
+                AISettings::handle(ctx).update(ctx, |settings, ctx| {
+                    settings.set_cli_agent_builtin_prompt_mode(*agent, *mode, ctx);
+                });
+            }
+            ResetCLIAgentBuiltinPrompt { agent } => {
+                AISettings::handle(ctx).update(ctx, |settings, ctx| {
+                    settings.set_cli_agent_builtin_prompt_text(*agent, String::new(), ctx);
+                    settings.set_cli_agent_builtin_prompt_mode(
+                        *agent,
+                        CLIAgentBuiltinPromptMode::Append,
+                        ctx,
+                    );
+                });
+            }
+            OpenMCPConfigFile { provider, scope } => {
+                #[cfg(feature = "local_fs")]
+                self.open_mcp_config_file(*provider, *scope, ctx);
+
+                #[cfg(not(feature = "local_fs"))]
+                {
+                    let _ = (provider, scope);
+                    Self::show_tools_config_toast(
+                        ctx,
+                        DismissibleToast::error(
+                            "MCP config files are not available in this build.".to_owned(),
+                        ),
+                    );
+                }
+            }
+            SyncMCPConfig {
+                source,
+                target,
+                scope,
+            } => {
+                #[cfg(feature = "local_fs")]
+                self.sync_mcp_config(*source, *target, *scope, ctx);
+
+                #[cfg(not(feature = "local_fs"))]
+                {
+                    let _ = (source, target, scope);
+                    Self::show_tools_config_toast(
+                        ctx,
+                        DismissibleToast::error(
+                            "MCP config sync is not available in this build.".to_owned(),
+                        ),
+                    );
+                }
+            }
             ToggleMCPServer {
                 installation_uuid,
                 should_run,
@@ -26044,6 +26538,29 @@ impl TypedActionView for Workspace {
                         toast_stack.add_ephemeral_toast(
                             DismissibleToast::error(
                                 "Opening skill folders is not supported in this build".to_string(),
+                            ),
+                            window_id,
+                            ctx,
+                        );
+                    });
+                }
+            }
+            SyncSkillProvider {
+                source,
+                target,
+                scope,
+            } => {
+                #[cfg(feature = "local_fs")]
+                self.sync_skill_provider(*source, *target, *scope, ctx);
+
+                #[cfg(not(feature = "local_fs"))]
+                {
+                    let _ = (source, target, scope);
+                    let window_id = ctx.window_id();
+                    ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
+                        toast_stack.add_ephemeral_toast(
+                            DismissibleToast::error(
+                                "Skill sync is not supported in this build".to_string(),
                             ),
                             window_id,
                             ctx,
