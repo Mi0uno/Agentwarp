@@ -22,11 +22,11 @@ use warp_core::user_preferences::GetUserPreferences as _;
 #[cfg(not(target_family = "wasm"))]
 use warp_terminal::shell::ShellType;
 use warpui::elements::{
-    Align, Border, ChildAnchor, ClippedScrollStateHandle, ClippedScrollable, ConstrainedBox,
-    Container, CornerRadius, CrossAxisAlignment, DispatchEventResult, DropShadow, Element, Empty,
-    EventHandler, Fill as ElementFill, Flex, Hoverable, MainAxisAlignment, MainAxisSize,
-    MouseStateHandle, OffsetPositioning, ParentAnchor, ParentElement, ParentOffsetBounds, Radius,
-    ScrollbarWidth, Shrinkable, Stack, Text,
+    Align, Border, ChildAnchor, Clipped, ClippedScrollStateHandle, ClippedScrollable,
+    ConstrainedBox, Container, CornerRadius, CrossAxisAlignment, DispatchEventResult, DropShadow,
+    Element, Empty, EventHandler, Fill as ElementFill, Flex, Hoverable, MainAxisAlignment,
+    MainAxisSize, MouseStateHandle, OffsetPositioning, ParentAnchor, ParentElement,
+    ParentOffsetBounds, Radius, ScrollbarWidth, Shrinkable, Stack, Text,
 };
 use warpui::fonts::{Properties, Weight};
 use warpui::platform::Cursor;
@@ -5149,14 +5149,12 @@ impl SshRemoteView {
                     .with_child(actions.finish())
                     .finish(),
             )
-            .with_horizontal_padding(8.)
+            .with_horizontal_padding(SIDEBAR_HORIZONTAL_PADDING)
             .with_vertical_padding(7.)
-            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)));
+            .with_border(Border::bottom(1.).with_border_fill(theme.nonactive_ui_detail()));
 
             if is_active {
-                container = container
-                    .with_background(theme.surface_overlay_1())
-                    .with_border(Border::all(1.).with_border_fill(theme.active_ui_detail()));
+                container = container.with_background(theme.surface_overlay_1());
             } else if state.is_hovered() {
                 container = container.with_background(theme.surface_overlay_1());
             }
@@ -5359,19 +5357,13 @@ impl View for SshRemoteView {
         let model = SshRemoteModel::as_ref(app);
         let hosts = model.hosts().to_vec();
 
-        let mut content = Flex::column().with_spacing(8.);
+        let mut content = Flex::column();
         content.add_child(
             Container::new(
                 Flex::row()
                     .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                    .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
+                    .with_main_axis_alignment(MainAxisAlignment::End)
                     .with_main_axis_size(MainAxisSize::Max)
-                    .with_child(
-                        Text::new_inline("SSH remotes", appearance.ui_font_family(), 12.)
-                            .with_color(theme.sub_text_color(theme.background()).into())
-                            .with_style(Properties::default().weight(Weight::Medium))
-                            .finish(),
-                    )
                     .with_child(Self::render_icon_button(
                         self.mouse_states.add_button.clone(),
                         Icon::Plus,
@@ -5383,8 +5375,8 @@ impl View for SshRemoteView {
                     .finish(),
             )
             .with_horizontal_padding(SIDEBAR_HORIZONTAL_PADDING)
-            .with_padding_top(8.)
-            .with_padding_bottom(4.)
+            .with_padding_top(2.)
+            .with_padding_bottom(2.)
             .finish(),
         );
 
@@ -5395,21 +5387,23 @@ impl View for SshRemoteView {
                 let connection_status = model.connection_status(&host.id);
                 content.add_child(
                     Container::new(self.render_host_row(&host, connection_status, appearance))
-                        .with_horizontal_padding(SIDEBAR_HORIZONTAL_PADDING)
                         .finish(),
                 );
             }
         }
 
-        let panel = ClippedScrollable::vertical(
-            self.scroll_state.clone(),
-            content.finish(),
-            ScrollbarWidth::Auto,
-            theme.nonactive_ui_detail().into(),
-            theme.active_ui_detail().into(),
-            ElementFill::None,
+        let panel = Clipped::new(
+            ClippedScrollable::vertical(
+                self.scroll_state.clone(),
+                content.finish(),
+                ScrollbarWidth::Auto,
+                theme.nonactive_ui_detail().into(),
+                theme.active_ui_detail().into(),
+                ElementFill::None,
+            )
+            .with_overlayed_scrollbar()
+            .finish(),
         )
-        .with_overlayed_scrollbar()
         .finish();
 
         let delete_prompt = self.render_delete_confirmation_prompt(app);

@@ -1306,6 +1306,30 @@ impl LeftPanelView {
             .finish()
     }
 
+    fn render_panel_title(title: &str, icon: Icon, appearance: &Appearance) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_spacing(7.)
+            .with_child(
+                ConstrainedBox::new(
+                    icon.to_warpui_icon(theme.sub_text_color(theme.background()))
+                        .finish(),
+                )
+                .with_width(14.)
+                .with_height(14.)
+                .finish(),
+            )
+            .with_child(
+                Text::new_inline(title.to_owned(), appearance.ui_font_family(), 12.)
+                    .with_color(theme.main_text_color(theme.background()).into())
+                    .with_style(Properties::default().weight(Weight::Semibold))
+                    .with_clip(ClipConfig::ellipsis())
+                    .finish(),
+            )
+            .finish()
+    }
+
     fn render_tools_tab_button(
         tab: ToolsConfigTab,
         active: bool,
@@ -1756,6 +1780,108 @@ impl LeftPanelView {
         } else {
             row
         }
+    }
+
+    fn mcp_sync_targets(source: MCPProvider) -> impl Iterator<Item = MCPProvider> {
+        [
+            MCPProvider::Claude,
+            MCPProvider::Codex,
+            MCPProvider::Warp,
+            MCPProvider::Agents,
+        ]
+        .into_iter()
+        .filter(move |target| *target != source)
+    }
+
+    fn skill_sync_targets(source: SkillProvider) -> impl Iterator<Item = SkillProvider> {
+        [
+            SkillProvider::Claude,
+            SkillProvider::Codex,
+            SkillProvider::OpenCode,
+            SkillProvider::Warp,
+            SkillProvider::Gemini,
+            SkillProvider::Agents,
+        ]
+        .into_iter()
+        .filter(move |target| *target != source)
+    }
+
+    fn render_mcp_sync_rows(source: MCPProvider, appearance: &Appearance) -> Vec<Box<dyn Element>> {
+        Self::mcp_sync_targets(source)
+            .map(|target| {
+                Self::render_tools_management_row(
+                    format!("Sync to {}", target.display_name()),
+                    format!(
+                        "Copy missing servers from {} without overwriting existing entries",
+                        source.display_name()
+                    ),
+                    target.icon(),
+                    None,
+                    None,
+                    vec![
+                        ToolsRowAction {
+                            label: "Home config",
+                            icon: Icon::File,
+                            action: WorkspaceAction::SyncMCPConfig {
+                                source,
+                                target,
+                                scope: ToolConfigScope::Home,
+                            },
+                        },
+                        ToolsRowAction {
+                            label: "Project config",
+                            icon: Icon::File,
+                            action: WorkspaceAction::SyncMCPConfig {
+                                source,
+                                target,
+                                scope: ToolConfigScope::Project,
+                            },
+                        },
+                    ],
+                    appearance,
+                )
+            })
+            .collect()
+    }
+
+    fn render_skill_sync_rows(
+        source: SkillProvider,
+        appearance: &Appearance,
+    ) -> Vec<Box<dyn Element>> {
+        Self::skill_sync_targets(source)
+            .map(|target| {
+                Self::render_tools_management_row(
+                    format!("Sync to {target}"),
+                    format!(
+                        "Copy missing skills from {source} without overwriting existing skills"
+                    ),
+                    target.icon(),
+                    None,
+                    None,
+                    vec![
+                        ToolsRowAction {
+                            label: "Home skills",
+                            icon: Icon::Folder,
+                            action: WorkspaceAction::SyncSkillProvider {
+                                source,
+                                target,
+                                scope: ToolConfigScope::Home,
+                            },
+                        },
+                        ToolsRowAction {
+                            label: "Project skills",
+                            icon: Icon::Folder,
+                            action: WorkspaceAction::SyncSkillProvider {
+                                source,
+                                target,
+                                scope: ToolConfigScope::Project,
+                            },
+                        },
+                    ],
+                    appearance,
+                )
+            })
+            .collect()
     }
 
     fn render_tools_section(
@@ -2210,7 +2336,7 @@ impl LeftPanelView {
         let provider_rows = MCPProvider::iter()
             .filter(|provider| self.tools_provider_filter.matches_mcp_provider(*provider))
             .map(|provider| {
-                let mut actions = vec![
+                let actions = vec![
                     ToolsRowAction {
                         label: "Home",
                         icon: Icon::File,
@@ -2228,26 +2354,6 @@ impl LeftPanelView {
                         },
                     },
                 ];
-                if provider != MCPProvider::Claude {
-                    actions.push(ToolsRowAction {
-                        label: "Sync home config from Claude",
-                        icon: Icon::RefreshCcw,
-                        action: WorkspaceAction::SyncMCPConfig {
-                            source: MCPProvider::Claude,
-                            target: provider,
-                            scope: ToolConfigScope::Home,
-                        },
-                    });
-                    actions.push(ToolsRowAction {
-                        label: "Sync project config from Claude",
-                        icon: Icon::RefreshCcw,
-                        action: WorkspaceAction::SyncMCPConfig {
-                            source: MCPProvider::Claude,
-                            target: provider,
-                            scope: ToolConfigScope::Project,
-                        },
-                    });
-                }
                 Self::render_tools_management_row(
                     if self.tools_provider_filter == ToolsProviderFilter::OpenCode
                         || self.tools_provider_filter == ToolsProviderFilter::Gemini
@@ -2374,6 +2480,22 @@ impl LeftPanelView {
             ));
         }
 
+        let sync_rows = self
+            .tools_provider_filter
+            .mcp_provider()
+            .map(|source| Self::render_mcp_sync_rows(source, appearance))
+            .unwrap_or_else(|| {
+                vec![Self::render_tools_management_row(
+                    "Select a source provider".to_owned(),
+                    "Choose Claude, Codex, Warp, or Agents before syncing MCP servers".to_owned(),
+                    Icon::RefreshCcw,
+                    None,
+                    None,
+                    vec![],
+                    appearance,
+                )]
+            });
+
         let mut content = Flex::column().with_spacing(10.);
         content.add_child(Self::render_tools_section(
             "Unified MCP Management",
@@ -2388,6 +2510,12 @@ impl LeftPanelView {
             "Provider Configs",
             Some("Watched home and project config paths".to_owned()),
             provider_rows,
+            appearance,
+        ));
+        content.add_child(Self::render_tools_section(
+            "Sync Targets",
+            Some("Copy missing servers from the selected provider".to_owned()),
+            sync_rows,
             appearance,
         ));
         content.add_child(Self::render_tools_section(
@@ -2474,26 +2602,6 @@ impl LeftPanelView {
                         },
                     });
                 }
-                if provider != SkillProvider::Claude {
-                    actions.push(ToolsRowAction {
-                        label: "Sync home skills from Claude",
-                        icon: Icon::RefreshCcw,
-                        action: WorkspaceAction::SyncSkillProvider {
-                            source: SkillProvider::Claude,
-                            target: provider,
-                            scope: ToolConfigScope::Home,
-                        },
-                    });
-                    actions.push(ToolsRowAction {
-                        label: "Sync project skills from Claude",
-                        icon: Icon::RefreshCcw,
-                        action: WorkspaceAction::SyncSkillProvider {
-                            source: SkillProvider::Claude,
-                            target: provider,
-                            scope: ToolConfigScope::Project,
-                        },
-                    });
-                }
                 let subtitle = match (&home_path, &project_path) {
                     (Some(home), Some(project)) => format!(
                         "Home: {} - Project: {}",
@@ -2563,6 +2671,23 @@ impl LeftPanelView {
             }
         }
 
+        let sync_rows = self
+            .tools_provider_filter
+            .skill_provider()
+            .map(|source| Self::render_skill_sync_rows(source, appearance))
+            .unwrap_or_else(|| {
+                vec![Self::render_tools_management_row(
+                    "Select a source provider".to_owned(),
+                    "Choose Claude, Codex, OpenCode, Warp, Gemini, or Agents before syncing skills"
+                        .to_owned(),
+                    Icon::RefreshCcw,
+                    None,
+                    None,
+                    vec![],
+                    appearance,
+                )]
+            });
+
         let mut content = Flex::column().with_spacing(10.);
         content.add_child(self.render_skill_filter_bar(
             &scope_counts,
@@ -2586,6 +2711,12 @@ impl LeftPanelView {
                     .to_owned(),
             ),
             provider_rows,
+            appearance,
+        ));
+        content.add_child(Self::render_tools_section(
+            "Sync Targets",
+            Some("Copy missing skills from the selected provider".to_owned()),
+            sync_rows,
             appearance,
         ));
         content.finish()
@@ -2960,9 +3091,12 @@ impl View for LeftPanelView {
             }
             ToolPanelView::SshRemote => Shrinkable::new(
                 1.0,
-                SavePosition::new(
-                    ChildView::new(&self.ssh_remote_view).finish(),
-                    SSH_REMOTE_PANEL_POSITION_ID,
+                Clipped::new(
+                    SavePosition::new(
+                        ChildView::new(&self.ssh_remote_view).finish(),
+                        SSH_REMOTE_PANEL_POSITION_ID,
+                    )
+                    .finish(),
                 )
                 .finish(),
             )
@@ -2975,6 +3109,8 @@ impl View for LeftPanelView {
 
                 let header_left = if self.active_view.get() == ToolPanelView::ToolConfigurations {
                     self.render_tools_tab_button_row(app)
+                } else if self.active_view.get() == ToolPanelView::SshRemote {
+                    Self::render_panel_title("SSH remotes", Icon::Cloud, appearance)
                 } else if let Some(row) = toolbelt_button_row {
                     row
                 } else {
