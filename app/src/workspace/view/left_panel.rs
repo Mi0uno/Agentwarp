@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ai::skills::{home_skills_path, SkillProvider, SkillScope, SKILL_PROVIDER_DEFINITIONS};
 use strum::IntoEnumIterator;
@@ -97,6 +97,7 @@ struct MouseStateHandles {
 pub enum LeftPanelAction {
     ToolConfigurations,
     SelectToolsConfigTab(ToolsConfigTab),
+    SelectSkillConfigFilter(SkillConfigFilter),
     ProjectExplorer,
     GlobalSearch { entry_focus: GlobalSearchEntryFocus },
     WarpDrive,
@@ -158,6 +159,36 @@ impl ToolsConfigTab {
             Self::Prompts => Icon::Prompt,
             Self::Mcp => Icon::Dataflow,
             Self::Skills => Icon::Folder,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum SkillConfigFilter {
+    Project,
+    Home,
+    Bundled,
+    All,
+}
+
+impl SkillConfigFilter {
+    const ALL: [Self; 4] = [Self::Project, Self::Home, Self::Bundled, Self::All];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Project => "Project",
+            Self::Home => "Home",
+            Self::Bundled => "Bundled",
+            Self::All => "All",
+        }
+    }
+
+    fn matches(self, skill: &SkillDescriptor) -> bool {
+        match self {
+            Self::Project => matches!(skill.scope, SkillScope::Project),
+            Self::Home => matches!(skill.scope, SkillScope::Home),
+            Self::Bundled => matches!(skill.scope, SkillScope::Bundled),
+            Self::All => true,
         }
     }
 }
@@ -241,6 +272,7 @@ pub struct LeftPanelView {
     close_button_mouse_state: MouseStateHandle,
     tools_config_scroll_state: ClippedScrollStateHandle,
     tools_config_tab: ToolsConfigTab,
+    skill_config_filter: SkillConfigFilter,
     warp_drive_view: ViewHandle<DrivePanel>,
     conversation_list_view: ViewHandle<ConversationListView>,
     ssh_remote_view: ViewHandle<SshRemoteView>,
@@ -461,6 +493,7 @@ impl LeftPanelView {
             close_button_mouse_state: Default::default(),
             tools_config_scroll_state: ClippedScrollStateHandle::default(),
             tools_config_tab: ToolsConfigTab::Prompts,
+            skill_config_filter: SkillConfigFilter::Project,
             warp_drive_view,
             conversation_list_view,
             ssh_remote_view,
@@ -1062,6 +1095,7 @@ impl LeftPanelView {
                     self.active_view.get() == ToolPanelView::ToolConfigurations
                 }
                 LeftPanelAction::SelectToolsConfigTab(_) => false,
+                LeftPanelAction::SelectSkillConfigFilter(_) => false,
                 LeftPanelAction::ProjectExplorer => {
                     self.active_view.get() == ToolPanelView::ProjectExplorer
                 }
@@ -1151,8 +1185,13 @@ impl LeftPanelView {
 
     fn render_count_chip(count: usize, active: bool, appearance: &Appearance) -> Box<dyn Element> {
         let theme = appearance.theme();
+        let count_label = if count > 99 {
+            "99+".to_owned()
+        } else {
+            count.to_string()
+        };
         Container::new(
-            Text::new_inline(count.to_string(), appearance.ui_font_family(), 10.)
+            Text::new_inline(count_label, appearance.ui_font_family(), 10.)
                 .with_color(if active {
                     theme.main_text_color(theme.background()).into()
                 } else {
@@ -1203,6 +1242,15 @@ impl LeftPanelView {
             .finish()
     }
 
+    fn metric_label(label: String, value: usize) -> String {
+        let value = if value > 999 {
+            "999+".to_owned()
+        } else {
+            value.to_string()
+        };
+        format!("{label}: {value}")
+    }
+
     fn render_metric_chip(
         label: String,
         value: usize,
@@ -1225,7 +1273,7 @@ impl LeftPanelView {
                 )
                 .with_child(
                     Text::new_inline(
-                        format!("{label}: {value}"),
+                        Self::metric_label(label, value),
                         appearance.ui_font_family(),
                         11.,
                     )
@@ -1265,6 +1313,97 @@ impl LeftPanelView {
             column.add_child(row.finish());
         }
         column.finish()
+    }
+
+    fn render_skill_filter_button(
+        filter: SkillConfigFilter,
+        active: bool,
+        count: usize,
+        appearance: &Appearance,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let text_color = if active {
+            theme.main_text_color(theme.background())
+        } else {
+            theme.sub_text_color(theme.background())
+        };
+        let button = Container::new(
+            Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_main_axis_alignment(MainAxisAlignment::Center)
+                .with_spacing(5.)
+                .with_child(
+                    Text::new_inline(filter.label().to_owned(), appearance.ui_font_family(), 11.)
+                        .with_color(text_color.into())
+                        .with_style(Properties::default().weight(Weight::Semibold))
+                        .with_clip(ClipConfig::ellipsis())
+                        .finish(),
+                )
+                .with_child(Self::render_count_chip(count, active, appearance))
+                .finish(),
+        )
+        .with_background(if active {
+            internal_colors::fg_overlay_2(theme)
+        } else {
+            internal_colors::fg_overlay_1(theme)
+        })
+        .with_border(Border::all(1.).with_border_fill(if active {
+            theme.active_ui_detail()
+        } else {
+            theme.nonactive_ui_detail()
+        }))
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(5.)))
+        .with_padding_left(7.)
+        .with_padding_right(7.)
+        .with_padding_top(4.)
+        .with_padding_bottom(4.)
+        .finish();
+
+        EventHandler::new(button)
+            .on_left_mouse_down(move |ctx, _, _| {
+                ctx.dispatch_typed_action(LeftPanelAction::SelectSkillConfigFilter(filter));
+                warpui::elements::DispatchEventResult::StopPropagation
+            })
+            .finish()
+    }
+
+    fn render_skill_filter_bar(
+        &self,
+        scope_counts: &HashMap<SkillScope, usize>,
+        total_count: usize,
+        appearance: &Appearance,
+    ) -> Box<dyn Element> {
+        let count_for = |filter| match filter {
+            SkillConfigFilter::Project => *scope_counts.get(&SkillScope::Project).unwrap_or(&0),
+            SkillConfigFilter::Home => *scope_counts.get(&SkillScope::Home).unwrap_or(&0),
+            SkillConfigFilter::Bundled => *scope_counts.get(&SkillScope::Bundled).unwrap_or(&0),
+            SkillConfigFilter::All => total_count,
+        };
+
+        let mut rows = Flex::column().with_spacing(6.);
+        for chunk in SkillConfigFilter::ALL.chunks(2) {
+            let mut row = Flex::row().with_spacing(6.);
+            for filter in chunk {
+                row.add_child(
+                    Shrinkable::new(
+                        1.,
+                        Self::render_skill_filter_button(
+                            *filter,
+                            self.skill_config_filter == *filter,
+                            count_for(*filter),
+                            appearance,
+                        ),
+                    )
+                    .finish(),
+                );
+            }
+            rows.add_child(row.finish());
+        }
+
+        Container::new(rows.finish())
+            .with_padding_left(12.)
+            .with_padding_right(12.)
+            .finish()
     }
 
     fn render_tools_action_pill(
@@ -1452,6 +1591,18 @@ impl LeftPanelView {
         )
     }
 
+    fn compact_path(path: &Path) -> String {
+        if let Some(home_dir) = dirs::home_dir() {
+            if let Ok(stripped) = path.strip_prefix(&home_dir) {
+                if stripped.as_os_str().is_empty() {
+                    return "~".to_owned();
+                }
+                return format!("~/{}", stripped.display());
+            }
+        }
+        path.display().to_string()
+    }
+
     fn active_local_working_directory(&self, app: &AppContext) -> Option<LocalOrRemotePath> {
         self.active_pane_group
             .as_ref()
@@ -1464,6 +1615,19 @@ impl LeftPanelView {
             })
             .map(PathBuf::from)
             .map(LocalOrRemotePath::Local)
+    }
+
+    fn active_local_working_directory_path(&self, app: &AppContext) -> Option<PathBuf> {
+        self.active_pane_group
+            .as_ref()
+            .and_then(|pane_group| pane_group.upgrade(app))
+            .and_then(|pane_group| {
+                pane_group
+                    .as_ref(app)
+                    .active_session_view(app)
+                    .and_then(|terminal| terminal.as_ref(app).pwd_if_local(app))
+            })
+            .map(PathBuf::from)
     }
 
     fn prompt_workflows(app: &AppContext) -> Vec<PromptWorkflowSummary> {
@@ -1495,7 +1659,9 @@ impl LeftPanelView {
                 self.active_local_working_directory(app).as_ref(),
                 app,
             )
-            .len();
+            .into_iter()
+            .filter(|skill| self.skill_config_filter.matches(skill))
+            .count();
 
         HashMap::from([
             (ToolsConfigTab::Prompts, prompts),
@@ -1711,25 +1877,11 @@ impl LeftPanelView {
             })
             .count();
 
-        let mut chip_items = vec![
+        let chip_items = vec![
             ("Managed".to_owned(), installed_count, Icon::Dataflow),
             ("Detected".to_owned(), detected_count, Icon::Dataflow02),
             ("Running".to_owned(), running_count, Icon::Play),
         ];
-        chip_items.extend(MCPProvider::iter().map(|provider| {
-            let count = file_based_servers
-                .iter()
-                .filter(|installation| {
-                    !file_based_manager
-                        .directory_paths_for_installation_and_provider(
-                            installation.uuid(),
-                            provider,
-                        )
-                        .is_empty()
-                })
-                .count();
-            (provider.display_name().to_owned(), count, provider.icon())
-        }));
         let chips = Self::render_metric_chip_rows(chip_items, appearance);
 
         let gateway_rows = vec![Self::render_tools_management_row(
@@ -1752,8 +1904,8 @@ impl LeftPanelView {
                     provider.display_name().to_owned(),
                     format!(
                         "Home: {} - Project: {}",
-                        provider.home_config_path().display(),
-                        provider.project_config_path().display()
+                        Self::compact_path(&provider.home_config_path()),
+                        Self::compact_path(&provider.project_config_path())
                     ),
                     provider.icon(),
                     Some("Config".to_owned()),
@@ -1893,6 +2045,7 @@ impl LeftPanelView {
     fn render_skill_config_panel(&self, app: &AppContext) -> Box<dyn Element> {
         let appearance = Appearance::as_ref(app);
         let working_directory = self.active_local_working_directory(app);
+        let working_directory_path = self.active_local_working_directory_path(app);
         let mut skills = SkillManager::as_ref(app)
             .get_skills_for_working_directory(working_directory.as_ref(), app);
         skills.sort_by(|a, b| {
@@ -1909,6 +2062,7 @@ impl LeftPanelView {
             *provider_counts.entry(skill.provider).or_default() += 1;
             *scope_counts.entry(skill.scope).or_default() += 1;
         }
+        let total_skill_count = skills.len();
 
         let chips = Self::render_metric_chip_rows(
             vec![
@@ -1935,35 +2089,68 @@ impl LeftPanelView {
             .iter()
             .map(|definition| {
                 let provider = definition.provider;
-                let home_path = home_skills_path(provider)
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_else(|| "Not available on this platform".to_owned());
+                let home_path = home_skills_path(provider);
+                let project_path = working_directory_path
+                    .as_ref()
+                    .map(|cwd| cwd.join(&definition.skills_path));
+                let mut actions = Vec::new();
+                if let Some(home_path) = &home_path {
+                    actions.push(ToolsRowAction {
+                        label: "Home",
+                        icon: Icon::Folder,
+                        action: WorkspaceAction::OpenSkillFolder {
+                            path: home_path.clone(),
+                        },
+                    });
+                }
+                if let Some(project_path) = &project_path {
+                    actions.push(ToolsRowAction {
+                        label: "Project",
+                        icon: Icon::Folder,
+                        action: WorkspaceAction::OpenSkillFolder {
+                            path: project_path.clone(),
+                        },
+                    });
+                }
+                let subtitle = match (&home_path, &project_path) {
+                    (Some(home), Some(project)) => format!(
+                        "Home: {} - Project: {}",
+                        Self::compact_path(home),
+                        Self::compact_path(project)
+                    ),
+                    (Some(home), None) => {
+                        format!("Home: {} - Project: no local cwd", Self::compact_path(home))
+                    }
+                    (None, Some(project)) => format!("Project: {}", Self::compact_path(project)),
+                    (None, None) => "No local skill folder is available".to_owned(),
+                };
                 Self::render_tools_management_row(
                     provider.to_string(),
-                    format!(
-                        "Home: {home_path} - Project: {}",
-                        definition.skills_path.display()
-                    ),
+                    subtitle,
                     provider.icon(),
-                    Some(format!(
-                        "{} skills",
-                        provider_counts.get(&provider).unwrap_or(&0)
+                    Some(Self::metric_label(
+                        "Skills".to_owned(),
+                        *provider_counts.get(&provider).unwrap_or(&0),
                     )),
                     None,
-                    vec![],
+                    actions,
                     appearance,
                 )
             })
             .collect::<Vec<_>>();
 
+        let visible_skills = skills
+            .into_iter()
+            .filter(|skill| self.skill_config_filter.matches(skill))
+            .collect::<Vec<_>>();
         let mut skill_rows = Vec::new();
-        if skills.is_empty() {
+        if visible_skills.is_empty() {
             skill_rows.push(Self::render_empty_tools_row(
                 "No skills detected",
                 appearance,
             ));
         } else {
-            for skill in skills.into_iter().take(30) {
+            for skill in visible_skills.into_iter().take(40) {
                 let can_edit = !matches!(skill.scope, SkillScope::Bundled);
                 skill_rows.push(Self::render_tools_management_row(
                     format!("/{}", skill.name),
@@ -1996,22 +2183,28 @@ impl LeftPanelView {
                 .with_padding_right(12.)
                 .finish(),
         );
-        content.add_child(Self::render_tools_section(
-            "Skill Providers",
-            Some(
-                "Unified skill folders for Warp, Claude, Codex, Gemini, OpenCode, and other agents"
-                    .to_owned(),
-            ),
-            provider_rows,
+        content.add_child(self.render_skill_filter_bar(
+            &scope_counts,
+            total_skill_count,
             appearance,
         ));
         content.add_child(Self::render_tools_section(
             "Detected Skills",
+            Some(format!(
+                "{} skills from the {} scope",
+                Self::metric_label("Showing".to_owned(), skill_rows.len()),
+                self.skill_config_filter.label()
+            )),
+            skill_rows,
+            appearance,
+        ));
+        content.add_child(Self::render_tools_section(
+            "Provider Folders",
             Some(
-                "Skills automatically read from home, project, and bundled provider folders"
+                "Open or create skill folders for Warp, Claude, Codex, Gemini, OpenCode, and Agents"
                     .to_owned(),
             ),
-            skill_rows,
+            provider_rows,
             appearance,
         ));
         content.finish()
@@ -2128,6 +2321,11 @@ impl LeftPanelView {
             }
             LeftPanelAction::SelectToolsConfigTab(tab) => {
                 self.tools_config_tab = *tab;
+                active_view_state::set(self, ToolPanelView::ToolConfigurations, ctx);
+            }
+            LeftPanelAction::SelectSkillConfigFilter(filter) => {
+                self.skill_config_filter = *filter;
+                self.tools_config_tab = ToolsConfigTab::Skills;
                 active_view_state::set(self, ToolPanelView::ToolConfigurations, ctx);
             }
             LeftPanelAction::ProjectExplorer => {

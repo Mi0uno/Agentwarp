@@ -491,6 +491,9 @@ pub enum WorkspaceAction {
     OpenSkill {
         skill_reference: SkillReference,
     },
+    OpenSkillFolder {
+        path: PathBuf,
+    },
     /// Open the Environment Management pane in Create mode.
     OpenEnvironmentManagementPane,
     ToggleAIDocumentPane {
@@ -1110,6 +1113,7 @@ impl WorkspaceAction {
             | TrashPromptWorkflow { .. }
             | ToggleMCPServer { .. }
             | OpenSkill { .. }
+            | OpenSkillFolder { .. }
             | FocusTerminalViewInWorkspace { .. }
             | FocusPane(..)
             | StartNewConversation { .. }

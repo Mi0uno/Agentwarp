@@ -26004,6 +26004,53 @@ impl TypedActionView for Workspace {
                     });
                 }
             }
+            OpenSkillFolder { path } => {
+                #[cfg(feature = "local_fs")]
+                {
+                    if let Err(err) = std::fs::create_dir_all(path) {
+                        let window_id = ctx.window_id();
+                        ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
+                            toast_stack.add_ephemeral_toast(
+                                DismissibleToast::error(format!(
+                                    "Failed to create skill folder: {err}"
+                                )),
+                                window_id,
+                                ctx,
+                            );
+                        });
+                    } else {
+                        let layout =
+                            *crate::util::file::external_editor::EditorSettings::as_ref(ctx)
+                                .open_file_layout
+                                .value();
+                        self.open_code(
+                            CodeSource::FileTree {
+                                location: LocalOrRemotePath::Local(path.clone()),
+                            },
+                            layout,
+                            None,
+                            false,
+                            &[],
+                            ctx,
+                        );
+                    }
+                }
+
+                #[cfg(not(feature = "local_fs"))]
+                {
+                    let _ = path;
+                    let window_id = ctx.window_id();
+                    ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
+                        toast_stack.add_ephemeral_toast(
+                            DismissibleToast::error(
+                                "Opening skill folders is not supported in this build".to_string(),
+                            ),
+                            window_id,
+                            ctx,
+                        );
+                    });
+                }
+            }
             OpenEnvironmentManagementPane => {
                 self.open_environment_management_pane(None, EnvironmentsPage::Create, ctx);
             }
