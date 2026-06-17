@@ -88,7 +88,7 @@ jobs:
           script/bundle "${debug_args[@]}" --channel "$CHANNEL" --release-tag "$RELEASE_TAG" --packages deb
         env:
           CHANNEL: ${{ github.event.inputs.channel || 'oss' }}
-          DEBUG_BUILD: ${{ github.event_name == 'push' && 'true' || github.event.inputs.debug_build || 'false' }}
+          DEBUG_BUILD: ${{ github.event.inputs.debug_build || 'false' }}
           RELEASE_TAG: ${{ steps.version.outputs.release_tag }}
 
       - name: List Debian packages
