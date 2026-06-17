@@ -8,7 +8,7 @@ use warp_core::ui::theme::color::internal_colors;
 use warp_core::ui::Icon;
 use warp_util::path::LineAndColumnArg;
 use warpui::elements::{
-    resizable_state_handle, Border, ChildView, Clipped, ClippedScrollStateHandle,
+    resizable_state_handle, Align, Border, ChildView, Clipped, ClippedScrollStateHandle,
     ClippedScrollable, ConstrainedBox, Container, CornerRadius, CrossAxisAlignment, DragBarSide,
     Element, Empty, EventHandler, Fill as ElementFill, Flex, MainAxisAlignment, MainAxisSize,
     MouseStateHandle, ParentElement, Radius, Resizable, ResizableStateHandle, SavePosition,
@@ -1429,24 +1429,13 @@ impl LeftPanelView {
             theme.sub_text_color(theme.background())
         };
         let button = Container::new(
-            Flex::row()
-                .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                .with_main_axis_alignment(MainAxisAlignment::Center)
-                .with_spacing(5.)
-                .with_child(
-                    ConstrainedBox::new(filter.icon().to_warpui_icon(text_color).finish())
-                        .with_width(12.)
-                        .with_height(12.)
-                        .finish(),
-                )
-                .with_child(
-                    Text::new_inline(filter.label().to_owned(), appearance.ui_font_family(), 11.)
-                        .with_color(text_color.into())
-                        .with_style(Properties::default().weight(Weight::Semibold))
-                        .with_clip(ClipConfig::ellipsis())
-                        .finish(),
-                )
-                .finish(),
+            Align::new(
+                ConstrainedBox::new(filter.icon().to_warpui_icon(text_color).finish())
+                    .with_width(13.)
+                    .with_height(13.)
+                    .finish(),
+            )
+            .finish(),
         )
         .with_background(if active {
             internal_colors::fg_overlay_2(theme)
@@ -1459,10 +1448,10 @@ impl LeftPanelView {
             theme.nonactive_ui_detail()
         }))
         .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
-        .with_padding_left(7.)
-        .with_padding_right(7.)
-        .with_padding_top(4.)
-        .with_padding_bottom(4.)
+        .with_padding_left(6.)
+        .with_padding_right(6.)
+        .with_padding_top(5.)
+        .with_padding_bottom(5.)
         .finish();
 
         EventHandler::new(button)
@@ -1475,32 +1464,23 @@ impl LeftPanelView {
 
     fn render_tools_provider_filter_bar(&self, app: &AppContext) -> Box<dyn Element> {
         let appearance = Appearance::as_ref(app);
-        let mut column = Flex::column().with_spacing(6.);
-        for chunk in ToolsProviderFilter::ALL.chunks(2) {
-            let mut row = Flex::row()
-                .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                .with_spacing(6.);
-            for filter in chunk {
-                row.add_child(
-                    Shrinkable::new(
-                        1.,
-                        Self::render_provider_filter_button(
-                            *filter,
-                            self.tools_provider_filter == *filter,
-                            appearance,
-                        ),
-                    )
-                    .finish(),
-                );
-            }
-            column.add_child(row.finish());
+        let mut row = Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_spacing(4.);
+
+        for filter in ToolsProviderFilter::ALL {
+            row.add_child(Self::render_provider_filter_button(
+                filter,
+                self.tools_provider_filter == filter,
+                appearance,
+            ));
         }
 
-        Container::new(column.finish())
-            .with_padding_left(12.)
-            .with_padding_right(12.)
-            .with_padding_top(8.)
-            .with_padding_bottom(8.)
+        Container::new(row.finish())
+            .with_padding_left(10.)
+            .with_padding_right(10.)
+            .with_padding_top(7.)
+            .with_padding_bottom(7.)
             .with_border(
                 Border::bottom(1.).with_border_fill(appearance.theme().nonactive_ui_detail()),
             )
@@ -1518,70 +1498,6 @@ impl LeftPanelView {
             value.to_string()
         };
         format!("{label}: {value}")
-    }
-
-    fn render_metric_chip(
-        label: String,
-        value: usize,
-        icon: Icon,
-        appearance: &Appearance,
-    ) -> Box<dyn Element> {
-        let theme = appearance.theme();
-        Container::new(
-            Flex::row()
-                .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                .with_spacing(5.)
-                .with_child(
-                    ConstrainedBox::new(
-                        icon.to_warpui_icon(theme.sub_text_color(theme.background()))
-                            .finish(),
-                    )
-                    .with_width(12.)
-                    .with_height(12.)
-                    .finish(),
-                )
-                .with_child(
-                    Text::new_inline(
-                        Self::metric_label(label, value),
-                        appearance.ui_font_family(),
-                        11.,
-                    )
-                    .with_color(theme.main_text_color(theme.background()).into())
-                    .with_style(Properties::default().weight(Weight::Semibold))
-                    .with_clip(ClipConfig::ellipsis())
-                    .finish(),
-                )
-                .finish(),
-        )
-        .with_background(internal_colors::fg_overlay_1(theme))
-        .with_border(Border::all(1.).with_border_fill(theme.nonactive_ui_detail()))
-        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(10.)))
-        .with_padding_left(8.)
-        .with_padding_right(8.)
-        .with_padding_top(3.)
-        .with_padding_bottom(3.)
-        .finish()
-    }
-
-    fn render_metric_chip_rows(
-        items: Vec<(String, usize, Icon)>,
-        appearance: &Appearance,
-    ) -> Box<dyn Element> {
-        let mut column = Flex::column().with_spacing(6.);
-        for chunk in items.chunks(3) {
-            let mut row = Flex::row().with_spacing(6.);
-            for (label, value, icon) in chunk {
-                row.add_child(
-                    Shrinkable::new(
-                        1.,
-                        Self::render_metric_chip(label.clone(), *value, *icon, appearance),
-                    )
-                    .finish(),
-                );
-            }
-            column.add_child(row.finish());
-        }
-        column.finish()
     }
 
     fn render_skill_filter_button(
@@ -2230,34 +2146,7 @@ impl LeftPanelView {
             }
         }
 
-        let chips = Self::render_metric_chip_rows(
-            vec![
-                (
-                    "Saved".to_owned(),
-                    Self::prompt_workflows(app).len(),
-                    Icon::Prompt,
-                ),
-                (
-                    "Runtime".to_owned(),
-                    usize::from(active_session_info.is_some()),
-                    Icon::Settings,
-                ),
-                (
-                    "System".to_owned(),
-                    AISettings::cli_agent_builtin_prompt_agents().len(),
-                    Icon::Settings,
-                ),
-            ],
-            appearance,
-        );
-
         let mut content = Flex::column().with_spacing(10.);
-        content.add_child(
-            Container::new(chips)
-                .with_padding_left(12.)
-                .with_padding_right(12.)
-                .finish(),
-        );
         content.add_child(Self::render_tools_section(
             "System Prompts",
             Some("Runtime state and per-agent overrides".to_owned()),
@@ -2306,16 +2195,11 @@ impl LeftPanelView {
             })
             .count();
 
-        let chip_items = vec![
-            ("Managed".to_owned(), installed_count, Icon::Dataflow),
-            ("Detected".to_owned(), detected_count, Icon::Dataflow02),
-            ("Running".to_owned(), running_count, Icon::Play),
-        ];
-        let chips = Self::render_metric_chip_rows(chip_items, appearance);
-
         let gateway_rows = vec![Self::render_tools_management_row(
             "Agentwarp managed MCP layer".to_owned(),
-            "Runtime state, provider configs, and installed servers".to_owned(),
+            format!(
+                "{installed_count} managed - {detected_count} detected - {running_count} running"
+            ),
             Icon::Dataflow,
             Some("Unified".to_owned()),
             None,
@@ -2491,12 +2375,6 @@ impl LeftPanelView {
         }
 
         let mut content = Flex::column().with_spacing(10.);
-        content.add_child(
-            Container::new(chips)
-                .with_padding_left(12.)
-                .with_padding_right(12.)
-                .finish(),
-        );
         content.add_child(Self::render_tools_section(
             "Unified MCP Management",
             Some(
@@ -2564,27 +2442,6 @@ impl LeftPanelView {
                     .matches_skill_provider(skill.provider)
             })
             .count();
-
-        let chips = Self::render_metric_chip_rows(
-            vec![
-                (
-                    "Home".to_owned(),
-                    *scope_counts.get(&SkillScope::Home).unwrap_or(&0),
-                    Icon::Folder,
-                ),
-                (
-                    "Project".to_owned(),
-                    *scope_counts.get(&SkillScope::Project).unwrap_or(&0),
-                    Icon::Folder,
-                ),
-                (
-                    "Bundled".to_owned(),
-                    *scope_counts.get(&SkillScope::Bundled).unwrap_or(&0),
-                    Icon::Warp,
-                ),
-            ],
-            appearance,
-        );
 
         let provider_rows = SKILL_PROVIDER_DEFINITIONS
             .iter()
@@ -2707,12 +2564,6 @@ impl LeftPanelView {
         }
 
         let mut content = Flex::column().with_spacing(10.);
-        content.add_child(
-            Container::new(chips)
-                .with_padding_left(12.)
-                .with_padding_right(12.)
-                .finish(),
-        );
         content.add_child(self.render_skill_filter_bar(
             &scope_counts,
             total_skill_count,

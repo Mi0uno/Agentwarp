@@ -4111,19 +4111,12 @@ impl SshRemoteView {
         let mouse_state = Self::mouse_state(&self.mouse_states.option_states, key);
 
         Hoverable::new(mouse_state, move |state| {
-            let border_fill = if selected {
-                theme.accent()
-            } else if state.is_hovered() && !disabled {
-                theme.active_ui_detail()
-            } else {
-                theme.surface_3()
-            };
             let background = if selected {
-                theme.surface_overlay_2()
+                theme.surface_overlay_1()
             } else if state.is_hovered() && !disabled {
                 theme.surface_overlay_1()
             } else {
-                theme.surface_2()
+                ThemeFill::Solid(ColorU::transparent_black())
             };
             let icon_fill = if selected {
                 theme.accent()
@@ -4175,10 +4168,13 @@ impl SshRemoteView {
                     .finish(),
             )
             .with_background(background)
-            .with_border(Border::all(1.).with_border_fill(border_fill))
-            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
-            .with_horizontal_padding(10.)
-            .with_vertical_padding(9.)
+            .with_border(Border::bottom(1.).with_border_fill(if selected {
+                theme.active_ui_detail()
+            } else {
+                theme.surface_3()
+            }))
+            .with_horizontal_padding(8.)
+            .with_vertical_padding(8.)
             .finish()
         })
         .with_cursor(Cursor::PointingHand)
@@ -4233,24 +4229,10 @@ impl SshRemoteView {
                 .with_cross_axis_alignment(CrossAxisAlignment::Center)
                 .with_spacing(6.)
                 .with_child(
-                    ConstrainedBox::new(
-                        Container::new(Align::new(marker).finish())
-                            .with_background(if is_active {
-                                theme.surface_overlay_2()
-                            } else {
-                                theme.surface_2()
-                            })
-                            .with_border(Border::all(1.).with_border_fill(if is_active {
-                                theme.active_ui_detail()
-                            } else {
-                                theme.surface_3()
-                            }))
-                            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(10.)))
-                            .finish(),
-                    )
-                    .with_width(20.)
-                    .with_height(20.)
-                    .finish(),
+                    ConstrainedBox::new(Container::new(Align::new(marker).finish()).finish())
+                        .with_width(20.)
+                        .with_height(20.)
+                        .finish(),
                 )
                 .with_child(
                     Shrinkable::new(
@@ -4269,19 +4251,19 @@ impl SshRemoteView {
                 )
                 .finish(),
         )
-        .with_horizontal_padding(8.)
-        .with_vertical_padding(7.)
-        .with_border(Border::all(1.).with_border_fill(if is_active {
+        .with_horizontal_padding(6.)
+        .with_vertical_padding(5.)
+        .with_border(Border::bottom(1.).with_border_fill(if is_active {
             theme.active_ui_detail()
         } else {
             theme.surface_3()
         }))
-        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(5.)));
+        .with_corner_radius(CornerRadius::with_all(Radius::Pixels(0.)));
 
         if is_active {
             container = container.with_background(theme.surface_overlay_1());
         } else {
-            container = container.with_background(theme.surface_2());
+            container = container.with_background(ThemeFill::Solid(ColorU::transparent_black()));
         }
 
         container.finish()
@@ -4337,37 +4319,31 @@ impl SshRemoteView {
                     .finish(),
             )
             .with_child(
-                Flex::row()
-                    .with_spacing(10.)
-                    .with_child(Self::fixed_width(
-                        self.render_option_card(
-                            "strategy:upload".to_owned(),
-                            SshRemoteAgentInstallStrategy::LocalUpload.icon(),
-                            SshRemoteAgentInstallStrategy::LocalUpload.as_label(),
-                            SshRemoteAgentInstallStrategy::LocalUpload.description(),
-                            self.install_strategy == SshRemoteAgentInstallStrategy::LocalUpload,
-                            false,
-                            SshRemoteViewAction::SelectInstallStrategy(
-                                SshRemoteAgentInstallStrategy::LocalUpload,
-                            ),
-                            appearance,
+                Flex::column()
+                    .with_spacing(2.)
+                    .with_child(self.render_option_card(
+                        "strategy:upload".to_owned(),
+                        SshRemoteAgentInstallStrategy::LocalUpload.icon(),
+                        SshRemoteAgentInstallStrategy::LocalUpload.as_label(),
+                        SshRemoteAgentInstallStrategy::LocalUpload.description(),
+                        self.install_strategy == SshRemoteAgentInstallStrategy::LocalUpload,
+                        false,
+                        SshRemoteViewAction::SelectInstallStrategy(
+                            SshRemoteAgentInstallStrategy::LocalUpload,
                         ),
-                        (WIZARD_BODY_CONTENT_WIDTH - 10.) / 2.,
+                        appearance,
                     ))
-                    .with_child(Self::fixed_width(
-                        self.render_option_card(
-                            "strategy:remote".to_owned(),
-                            SshRemoteAgentInstallStrategy::RemoteDownload.icon(),
-                            SshRemoteAgentInstallStrategy::RemoteDownload.as_label(),
-                            SshRemoteAgentInstallStrategy::RemoteDownload.description(),
-                            self.install_strategy == SshRemoteAgentInstallStrategy::RemoteDownload,
-                            false,
-                            SshRemoteViewAction::SelectInstallStrategy(
-                                SshRemoteAgentInstallStrategy::RemoteDownload,
-                            ),
-                            appearance,
+                    .with_child(self.render_option_card(
+                        "strategy:remote".to_owned(),
+                        SshRemoteAgentInstallStrategy::RemoteDownload.icon(),
+                        SshRemoteAgentInstallStrategy::RemoteDownload.as_label(),
+                        SshRemoteAgentInstallStrategy::RemoteDownload.description(),
+                        self.install_strategy == SshRemoteAgentInstallStrategy::RemoteDownload,
+                        false,
+                        SshRemoteViewAction::SelectInstallStrategy(
+                            SshRemoteAgentInstallStrategy::RemoteDownload,
                         ),
-                        (WIZARD_BODY_CONTENT_WIDTH - 10.) / 2.,
+                        appearance,
                     ))
                     .finish(),
             )
@@ -4428,34 +4404,41 @@ impl SshRemoteView {
             content.add_child(self.render_input("User", &self.user_editor, appearance));
         }
         content.add_child(
-            Flex::row()
-                .with_spacing(10.)
-                .with_child(Self::fixed_width(
-                    self.render_option_card(
-                        "auth:password".to_owned(),
-                        SshRemoteAuthMethod::PasswordPrompt.icon(),
-                        SshRemoteAuthMethod::PasswordPrompt.label(),
-                        SshRemoteAuthMethod::PasswordPrompt.description(),
-                        self.auth_method == SshRemoteAuthMethod::PasswordPrompt,
-                        false,
-                        SshRemoteViewAction::SelectAuthMethod(SshRemoteAuthMethod::PasswordPrompt),
-                        appearance,
-                    ),
-                    (WIZARD_BODY_CONTENT_WIDTH - 10.) / 2.,
-                ))
-                .with_child(Self::fixed_width(
-                    self.render_option_card(
-                        "auth:key".to_owned(),
-                        SshRemoteAuthMethod::PrivateKey.icon(),
-                        SshRemoteAuthMethod::PrivateKey.label(),
-                        SshRemoteAuthMethod::PrivateKey.description(),
-                        self.auth_method == SshRemoteAuthMethod::PrivateKey,
-                        false,
-                        SshRemoteViewAction::SelectAuthMethod(SshRemoteAuthMethod::PrivateKey),
-                        appearance,
-                    ),
-                    (WIZARD_BODY_CONTENT_WIDTH - 10.) / 2.,
-                ))
+            Flex::column()
+                .with_spacing(7.)
+                .with_child(
+                    Text::new_inline("Authentication", appearance.ui_font_family(), 11.)
+                        .with_color(theme.sub_text_color(theme.background()).into())
+                        .with_style(Properties::default().weight(Weight::Medium))
+                        .finish(),
+                )
+                .with_child(
+                    Flex::column()
+                        .with_spacing(2.)
+                        .with_child(self.render_option_card(
+                            "auth:password".to_owned(),
+                            SshRemoteAuthMethod::PasswordPrompt.icon(),
+                            SshRemoteAuthMethod::PasswordPrompt.label(),
+                            SshRemoteAuthMethod::PasswordPrompt.description(),
+                            self.auth_method == SshRemoteAuthMethod::PasswordPrompt,
+                            false,
+                            SshRemoteViewAction::SelectAuthMethod(
+                                SshRemoteAuthMethod::PasswordPrompt,
+                            ),
+                            appearance,
+                        ))
+                        .with_child(self.render_option_card(
+                            "auth:key".to_owned(),
+                            SshRemoteAuthMethod::PrivateKey.icon(),
+                            SshRemoteAuthMethod::PrivateKey.label(),
+                            SshRemoteAuthMethod::PrivateKey.description(),
+                            self.auth_method == SshRemoteAuthMethod::PrivateKey,
+                            false,
+                            SshRemoteViewAction::SelectAuthMethod(SshRemoteAuthMethod::PrivateKey),
+                            appearance,
+                        ))
+                        .finish(),
+                )
                 .finish(),
         );
         if self.auth_method == SshRemoteAuthMethod::PrivateKey {
@@ -4889,9 +4872,6 @@ impl SshRemoteView {
                         .with_overlayed_scrollbar()
                         .finish(),
                     )
-                    .with_background(theme.background())
-                    .with_border(Border::all(1.).with_border_fill(theme.surface_3()))
-                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
                     .with_horizontal_padding(WIZARD_BODY_INNER_PADDING)
                     .with_vertical_padding(WIZARD_BODY_INNER_PADDING)
                     .finish(),
